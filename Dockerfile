@@ -59,6 +59,10 @@ RUN git clone --depth 1 https://github.com/colmap/colmap.git /opt/colmap_src \
 
 # ============================================================
 # Stage 4: gsplat — CUDA rasterizer compiled against NGC torch
+# Note: nerfstudio in Stage 5 pins gsplat==1.4.0 and will replace
+# this install. Kept for cache efficiency during iteration; the
+# final gsplat 1.4.0 wheel uses JIT compilation that picks up
+# TORCH_CUDA_ARCH_LIST=12.0 at runtime for sm_120 kernels.
 # ============================================================
 FROM colmap AS gsplat
 
