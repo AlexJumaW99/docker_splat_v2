@@ -30,6 +30,7 @@ This repo solves all three problems in a single reproducible Docker build:
 - **Pinned against NGC PyTorch 25.11** (CUDA 13.0, Python 3.12, sm_120 pre-compiled)
 - **Multi-stage Dockerfile** with `--target` support for incremental rebuilds
 - **Compatibility patch included** for the COLMAP `SiftExtraction` → `FeatureExtraction` flag rename that breaks Nerfstudio 1.1.5 out of the box
+- **Real-time training monitoring** via viser (3D preview) + TensorBoard (metrics/eval images) simultaneously
 
 End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M gaussians at 7000 iterations, ~15 minutes on an RTX 5070 Ti.
 
@@ -43,7 +44,8 @@ End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M g
 | **COLMAP** | `4.1.0.dev0` | Built from source (`main` branch) | SfM + GPU SIFT |
 | **gsplat** | `1.4.0` | PyPI (JIT-compiled at runtime) | Gaussian rasterization |
 | **Nerfstudio** | `1.1.5` | PyPI | Training CLI + viewer |
-| **Viser** | `0.2.7` | Pinned by Nerfstudio | Web-based 3D viewer |
+| **Viser** | `0.2.7` | Pinned by Nerfstudio | Web-based 3D viewer (port 7007) |
+| **TensorBoard** | `2.20.0` | Bundled with NGC PyTorch | Metrics + eval image logging (port 6006) |
 | **ffmpeg** | `6.1.1` | apt | Video frame extraction |
 
 ---
@@ -71,11 +73,13 @@ docker create --name splat-ns --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -v ~/Desktop/docker_splat/data:/workspace \
-  -p 7007:7007 -it splat-nerfstudio
+  -p 7007:7007 -p 6006:6006 -it splat-nerfstudio
 
 docker start splat-ns
 docker exec -it splat-ns bash
 ```
+
+**Two ports mapped:** `7007` for the viser 3D viewer, `6006` for TensorBoard metrics. Both are optional but recommended for full visibility during training.
 
 ### 3. Process a video → train → view
 
@@ -87,10 +91,11 @@ ns-process-data video --data /workspace/yourvideo.mp4 \
 
 ns-train splatfacto --data /workspace/processed/yourvideo_splat \
   --output-dir /workspace/outputs --max-num-iterations 7000 \
+  --vis viewer+tensorboard \
   --viewer.websocket-host 0.0.0.0 --viewer.quit-on-train-completion False
 ```
 
-Open `http://localhost:7007` in your browser to watch training live.
+Open `http://localhost:7007` for the 3D view. In a second shell (`docker exec -it splat-ns bash`), run `tensorboard --logdir /workspace/outputs --bind_all --port 6006` and open `http://localhost:6006` for live metrics.
 
 For detailed workflow, troubleshooting, and export instructions, see **[USER_GUIDE.md](USER_GUIDE.md)**.
 
@@ -163,6 +168,8 @@ All three are baked into the v3 Dockerfile and the documented `docker create` co
 | `ns-process-data video` end-to-end | ✅ 98.12% pose recovery on test video |
 | `ns-train splatfacto` full training | ✅ 7000 iterations, ~84M gaussians, ~15 min |
 | Viser viewer reachable from host | ✅ Port 7007 bridged, scene renders live |
+| TensorBoard reachable from host | ✅ Port 6006 bridged, scalars + events logged |
+| `--vis viewer+tensorboard` simultaneous | ✅ Verified — both work in parallel, minor eval stutter |
 
 ---
 
@@ -172,6 +179,7 @@ All three are baked into the v3 Dockerfile and the documented `docker create` co
 - **16 GB VRAM assumption.** Training large scenes (> 500 images at 4K) may OOM on a 5070 Ti. The `PYTORCH_ALLOC_CONF=expandable_segments:True` env var helps, but is not magic. For heavier scenes, use a 5080 (16GB) or 5090 (32GB).
 - **Container runs as root.** Files written to `/workspace/outputs/` will be `root:root` on the host. Run `sudo chown -R $USER:$USER ~/Desktop/docker_splat/data` periodically.
 - **`ns-download-data` is broken upstream.** Nerfstudio's bundled dataset downloader fails due to Google Drive rate-limiting — this is not a bug in this repo, it's a [long-running upstream issue](https://github.com/nerfstudio-project/nerfstudio/issues/3134). Use your own video data.
+- **Viser may stutter briefly during eval steps** when used alongside TensorBoard. Documented upstream; typically a few seconds of laggy viewport every ~1000 iterations. Training metrics are unaffected.
 
 ---
 
@@ -182,11 +190,13 @@ Tagged versions in git mark verified milestones:
 | Tag | Commit | Description |
 |---|---|---|
 | `v3-working` | `349e43e` | First Dockerfile producing a working pipeline from scratch |
+| `v3.1-tensorboard` | (latest) | Adds `EXPOSE 6006` and verified `--vis viewer+tensorboard` workflow |
 
 Commit history (`git log --oneline`):
 
 ```
-v3  — patch nerfstudio for COLMAP SiftExtraction→FeatureExtraction flag rename
+v3.1 — add TensorBoard real-time monitoring support (EXPOSE 6006 + docs)
+v3   — patch nerfstudio for COLMAP SiftExtraction→FeatureExtraction flag rename
 v2.1 — add trailing newline + expand Stage 4 explanatory comment
 v2   — multi-stage refactor + add qt6-svg-dev to fix COLMAP build
 v1   — single-stage build, fails at COLMAP/Qt6Svg (baseline)
@@ -203,6 +213,7 @@ Built on top of excellent open-source work:
 - [**COLMAP**](https://github.com/colmap/colmap) — Structure-from-Motion for camera pose recovery
 - [**NVIDIA NGC**](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) — PyTorch base image with Blackwell support
 - [**Viser**](https://github.com/nerfstudio-project/viser) — the web-based 3D viewer
+- [**TensorBoard**](https://www.tensorflow.org/tensorboard) — training metric visualization
 
 ---
 

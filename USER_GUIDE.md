@@ -19,9 +19,10 @@ From host setup to your first exported Gaussian Splat PLY.
 5. [Processing a video](#processing-a-video)
 6. [Training splatfacto](#training-splatfacto)
 7. [Viewing in viser](#viewing-in-viser)
-8. [Exporting a PLY file](#exporting-a-ply-file)
-9. [Troubleshooting](#troubleshooting)
-10. [Appendix: full command reference](#appendix-full-command-reference)
+8. [Real-time monitoring with TensorBoard](#real-time-monitoring-with-tensorboard)
+9. [Exporting a PLY file](#exporting-a-ply-file)
+10. [Troubleshooting](#troubleshooting)
+11. [Appendix: full command reference](#appendix-full-command-reference)
 
 ---
 
@@ -139,6 +140,7 @@ docker create \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -v ~/Desktop/docker_splat/data:/workspace \
   -p 7007:7007 \
+  -p 6006:6006 \
   -it \
   splat-nerfstudio
 ```
@@ -155,6 +157,7 @@ docker create \
 | `-e PYTORCH_ALLOC_CONF=expandable_segments:True` | Memory allocator config; reduces fragmentation on long training runs |
 | `-v ~/Desktop/docker_splat/data:/workspace` | Bind mount — data persists on host outside the container |
 | `-p 7007:7007` | Viser web viewer port |
+| `-p 6006:6006` | TensorBoard web UI port |
 | `-it` | Interactive TTY |
 
 ### Daily use
@@ -181,7 +184,7 @@ docker rm splat-ns
 # then re-run the `docker create` block above
 ```
 
-Bind-mounted data at `~/Desktop/docker_splat/data` is unaffected — only the container's writable layer is destroyed.
+Bind-mounted data at `~/Desktop/docker_splat/data` is unaffected — only the container's writable layer is destroyed. Note: this will invalidate the gsplat JIT kernel cache at `/root/.cache/torch_extensions/`, so the first training in the new container will pause 60-120 seconds to recompile kernels.
 
 ### File ownership housekeeping
 
@@ -321,6 +324,8 @@ COLMAP found poses for XX.X% of the images.
 
 ## Training splatfacto
 
+### Basic command (viser only)
+
 ```bash
 ns-train splatfacto \
   --data /workspace/processed/yourvideo_splat \
@@ -329,6 +334,22 @@ ns-train splatfacto \
   --viewer.websocket-host 0.0.0.0 \
   --viewer.quit-on-train-completion False
 ```
+
+### With live TensorBoard metrics (recommended)
+
+Add `--vis viewer+tensorboard` to enable simultaneous 3D preview and metric logging:
+
+```bash
+ns-train splatfacto \
+  --data /workspace/processed/yourvideo_splat \
+  --output-dir /workspace/outputs \
+  --max-num-iterations 7000 \
+  --vis viewer+tensorboard \
+  --viewer.websocket-host 0.0.0.0 \
+  --viewer.quit-on-train-completion False
+```
+
+See the [Real-time monitoring section](#real-time-monitoring-with-tensorboard) for launching TensorBoard alongside training.
 
 ### Choosing `--max-num-iterations`
 
@@ -364,9 +385,10 @@ When training completes, your model lands at:
 
 ```
 /workspace/outputs/<dataset_name>/splatfacto/<YYYY-MM-DD_HHMMSS>/
-├── config.yml                  # Training config (needed for ns-viewer and ns-export)
+├── config.yml                          # Training config (needed for ns-viewer and ns-export)
+├── events.out.tfevents.*               # TensorBoard logs (if --vis included tensorboard)
 └── nerfstudio_models/
-    └── step-NNNNNNNNN.ckpt     # Model checkpoint
+    └── step-NNNNNNNNN.ckpt             # Model checkpoint
 ```
 
 Note the timestamp directory — you'll reference it for viewing and exporting.
@@ -395,9 +417,18 @@ Open that URL in any browser on your host. The splat renders live as training pr
 | Reset view | `R` key |
 | Wireframe toggle | In the sidebar |
 
-### Post-training view with ns-viewer
+### Important: the `quit-on-train-completion` flag
 
-If `--viewer.quit-on-train-completion False` was set, viser stays alive after training ends — just keep the terminal open.
+When training finishes, viser's behavior depends on this flag:
+
+| Flag value | Behavior |
+|---|---|
+| `True` | Viser shuts down immediately when training ends; localhost:7007 returns "site can't be reached" |
+| `False` | Viser stays alive after training; you can navigate the finished scene until you Ctrl+C the training process |
+
+**Recommendation:** use `--viewer.quit-on-train-completion False` for interactive sessions where you want to explore the result. Only use `True` for automated/scripted runs.
+
+### Post-training view with ns-viewer
 
 To re-open a completed model in a fresh session:
 
@@ -406,6 +437,99 @@ ns-viewer \
   --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
   --viewer.websocket-host 0.0.0.0
 ```
+
+---
+
+## Real-time monitoring with TensorBoard
+
+TensorBoard gives you live training metrics (loss, PSNR, SSIM, gaussian count) and eval rendered images in a browser dashboard. It runs as a separate process alongside `ns-train` and reads the event files that nerfstudio writes to disk.
+
+### The two-shell workflow
+
+You need two shells into the container: one for training, one for TensorBoard.
+
+**Shell 1 (TensorBoard) — start this first:**
+
+From a host terminal:
+
+```bash
+docker exec -it splat-ns bash
+```
+
+Inside the container:
+
+```bash
+tensorboard --logdir /workspace/outputs --bind_all --port 6006
+```
+
+Expected output (ignore the deprecation warning — it's harmless noise from the library's internals):
+
+```
+TensorBoard 2.20.0 at http://4dfa087b79d2:6006/ (Press CTRL+C to quit)
+```
+
+The URL in the output uses the container's internal hostname; ignore it. Open `http://localhost:6006` in your browser instead — Docker's port forwarding routes this to the container.
+
+**Shell 2 (Training) — open in a new host terminal:**
+
+```bash
+docker exec -it splat-ns bash
+```
+
+Inside the container, kick off training with `--vis viewer+tensorboard`:
+
+```bash
+ns-train splatfacto \
+  --data /workspace/processed/yourvideo_splat \
+  --output-dir /workspace/outputs \
+  --max-num-iterations 7000 \
+  --vis viewer+tensorboard \
+  --viewer.websocket-host 0.0.0.0 \
+  --viewer.quit-on-train-completion False
+```
+
+### What to watch in each tab
+
+**Browser tab 1: `http://localhost:7007` (viser)**
+- Live 3D splat rendering as it trains
+- Camera frustums showing training image positions
+- Densification happening in real time
+
+**Browser tab 2: `http://localhost:6006` (TensorBoard)**
+- **Scalars tab:** loss curves, PSNR, SSIM, gaussian count over time
+- **Images tab:** rendered eval images (appears at eval steps — default every 1000 iterations)
+- **Histograms tab:** distribution of gaussian parameters (scales, opacities)
+
+TensorBoard refreshes automatically as new event data is written. If it feels stale, click the circular arrow icon in the top-right to force a reload.
+
+### Known tradeoff: viser may stutter during eval
+
+The nerfstudio docs note that using the viewer alongside wandb or tensorboard may cause stuttering during evaluation steps. On an RTX 5070 Ti with a moderate scene, this typically manifests as 2–3 seconds of laggy viewport every ~1000 iterations when an eval pass runs. Training metrics are unaffected.
+
+If the stutter bothers you more than the metrics help:
+
+- Switch to `--vis tensorboard` alone and use `ns-viewer` on checkpoints for 3D preview
+- Or switch to `--vis viewer` alone and post-analyze TensorBoard after training ends (event files still exist)
+
+### Harmless warnings you'll see in TensorBoard's console
+
+```
+pkg_resources is deprecated as an API...
+TensorFlow installation not found - running with reduced feature set.
+NOTE: Using experimental fast data loading logic...
+```
+
+All three are noise from tensorboard's import chain. **We don't need or want TensorFlow** — nerfstudio uses PyTorch. TensorBoard's "reduced feature set" without TensorFlow still includes everything we care about (scalars, images, histograms). Ignore all three.
+
+### After training ends
+
+TensorBoard keeps running until you Ctrl+C it in Shell 1. Event files are persistent on disk, so you can re-launch TensorBoard anytime to review past runs:
+
+```bash
+tensorboard --logdir /workspace/outputs --bind_all --port 6006
+```
+
+Multiple training runs appear as separate entries in TensorBoard's left sidebar, making it easy to compare hyperparameter variations.
 
 ---
 
@@ -428,6 +552,12 @@ The PLY will be written as root inside the container. To open it on the host:
 ```bash
 sudo chown -R $USER:$USER ~/Desktop/docker_splat/data/outputs
 ```
+
+### Recommended post-training editor: SuperSplat
+
+For cleaning up stray gaussians, cropping the scene, applying post-processing effects, or publishing to the web:
+
+**[superspl.at/editor](https://superspl.at/editor)** — free, open-source, browser-based editor from PlayCanvas. Drag-and-drop your exported PLY to load it. Features: selection tools (rect/brush/lasso), cropping, timeline animations, WebXR export, and more.
 
 ---
 
@@ -457,14 +587,16 @@ Cause: [long-running upstream nerfstudio bug](https://github.com/nerfstudio-proj
 
 Fix: not a fix for this repo to make. Use your own video data.
 
-### Browser can't connect to `localhost:7007`
+### Browser can't connect to `localhost:7007` or `localhost:6006`
 
 Checklist:
 
-1. Container was created with `-p 7007:7007` flag
-2. Training/viewer was started with `--viewer.websocket-host 0.0.0.0`
-3. No other process on the host is using port 7007 (`sudo lsof -i :7007`)
-4. Firewall isn't blocking localhost (unusual, but check)
+1. Container was created with both `-p 7007:7007` AND `-p 6006:6006` flags (verify with `docker port splat-ns` on host)
+2. For viser: training was started with `--viewer.websocket-host 0.0.0.0` (otherwise viser binds to 127.0.0.1 inside the container and Docker can't route to it)
+3. For viser: training is currently running OR was started with `--viewer.quit-on-train-completion False` (viser dies when training ends if that flag is True)
+4. For TensorBoard: `tensorboard` process is still running (Shell 1 wasn't closed or Ctrl+C'd)
+5. For TensorBoard: command used `--bind_all` flag (otherwise binds to 127.0.0.1 only)
+6. No other process on the host is using the port (`sudo lsof -i :7007` or `sudo lsof -i :6006`)
 
 ### `docker build` fails on Stage 3 (COLMAP)
 
@@ -489,6 +621,10 @@ Fix: rebuild with a different `TORCH_CUDA_ARCH_LIST` value in the Dockerfile:
 
 Multiple architectures can be built simultaneously by separating with semicolons (at the cost of image size and build time).
 
+### "Aborted (core dumped)" at the end of training
+
+Observed occasionally on first-ever training run in a fresh container, specifically at Python process shutdown after the `🎉 Training Finished 🎉` banner. Training completed successfully and all data was written to disk before the crash — checkpoint and TensorBoard logs are intact. Does not reproduce on subsequent runs in the same container. Likely related to first-run JIT compilation timing. Not a blocker; if it happens on a run, simply re-run — subsequent runs are clean.
+
 ---
 
 ## Appendix: full command reference
@@ -504,12 +640,12 @@ docker build --target nerfstudio -t splat-nerfstudio .
 # Verify
 docker images | grep splat-nerfstudio
 
-# Create persistent container
+# Create persistent container (with both viser + tensorboard ports)
 docker create --name splat-ns --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -v ~/Desktop/docker_splat/data:/workspace \
-  -p 7007:7007 -it splat-nerfstudio
+  -p 7007:7007 -p 6006:6006 -it splat-nerfstudio
 
 # Daily lifecycle
 docker start splat-ns
@@ -518,6 +654,9 @@ docker stop splat-ns
 
 # Clean slate (keeps data)
 docker rm splat-ns
+
+# Verify port mappings
+docker port splat-ns
 
 # Fix host ownership
 sudo chown -R $USER:$USER ~/Desktop/docker_splat/data
@@ -533,13 +672,17 @@ ns-process-data video \
   --num-frames-target 250 \
   --matching-method sequential
 
-# Train splatfacto
+# Train splatfacto with viser + TensorBoard monitoring
 ns-train splatfacto \
   --data /workspace/processed/yourvideo_splat \
   --output-dir /workspace/outputs \
   --max-num-iterations 7000 \
+  --vis viewer+tensorboard \
   --viewer.websocket-host 0.0.0.0 \
   --viewer.quit-on-train-completion False
+
+# Launch TensorBoard in a second shell
+tensorboard --logdir /workspace/outputs --bind_all --port 6006
 
 # View a completed model
 ns-viewer \
@@ -551,6 +694,13 @@ ns-export gaussian-splat \
   --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
   --output-dir /workspace/outputs/<dataset>/export
 ```
+
+### Browser URLs (on host)
+
+| URL | Purpose | Required flags |
+|---|---|---|
+| `http://localhost:7007` | Viser 3D viewer | `--viewer.websocket-host 0.0.0.0` on `ns-train` |
+| `http://localhost:6006` | TensorBoard metrics | `--bind_all` on `tensorboard` |
 
 ---
 

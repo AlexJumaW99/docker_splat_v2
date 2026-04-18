@@ -78,6 +78,10 @@ RUN pip install --no-cache-dir --no-build-isolation \
 # ALIKED as a second feature extractor alongside SIFT. Nerfstudio 1.1.5
 # was written against the old flag names and fails with "unrecognised
 # option" during ns-process-data without this patch.
+#
+# v3.1: expose port 6006 for TensorBoard (requires matching -p 6006:6006
+# in `docker create` to be reachable from host). TensorBoard ships with
+# NGC PyTorch and is used via `--vis viewer+tensorboard` in ns-train.
 # ============================================================
 FROM gsplat AS nerfstudio
 
@@ -89,5 +93,5 @@ RUN sed -i \
         /usr/local/lib/python3.12/dist-packages/nerfstudio/process_data/colmap_utils.py
 
 WORKDIR /workspace
-EXPOSE 7007
+EXPOSE 7007 6006
 CMD ["/bin/bash"]
