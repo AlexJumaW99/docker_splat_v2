@@ -71,10 +71,22 @@ RUN pip install --no-cache-dir --no-build-isolation \
 
 # ============================================================
 # Stage 5: nerfstudio — final image with CLI and splatfacto methods
+#
+# v3 fix: patch nerfstudio 1.1.5 colmap_utils.py for COLMAP 4.1.0.dev0
+# flag rename. COLMAP moved --SiftExtraction.use_gpu to
+# --FeatureExtraction.use_gpu (and same for SiftMatching) when it added
+# ALIKED as a second feature extractor alongside SIFT. Nerfstudio 1.1.5
+# was written against the old flag names and fails with "unrecognised
+# option" during ns-process-data without this patch.
 # ============================================================
 FROM gsplat AS nerfstudio
 
 RUN pip install --no-cache-dir nerfstudio
+
+RUN sed -i \
+        -e 's/SiftExtraction\.use_gpu/FeatureExtraction.use_gpu/g' \
+        -e 's/SiftMatching\.use_gpu/FeatureMatching.use_gpu/g' \
+        /usr/local/lib/python3.12/dist-packages/nerfstudio/process_data/colmap_utils.py
 
 WORKDIR /workspace
 EXPOSE 7007
