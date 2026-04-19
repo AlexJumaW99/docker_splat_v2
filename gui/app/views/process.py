@@ -100,12 +100,18 @@ class _Form(QWidget):
         self._store = store
         self._jobs = jobs
         self._project = project
+        self._running_mine = False
         self._probe_signals = _ProbeSignals()
         self._probe_signals.done.connect(self._on_probe_done)
 
         self._build()
         self._load_project()
         self._wire_jobs()
+
+        # Catch up if a job is already running (e.g. user switched projects
+        # mid-run) so our UI reflects reality immediately.
+        if self._jobs.is_running() and self._jobs.current is not None:
+            self._on_job_started(self._jobs.current)
 
     # ---- build ----
     def _build(self) -> None:
@@ -489,14 +495,21 @@ class _Form(QWidget):
 
     def _on_job_started(self, spec: JobSpec) -> None:
         if spec.kind != "process":
+            self._running_mine = False
             self.run_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(False)
             set_pill(self.status_pill, "Other job running", "warning")
             return
+        self._running_mine = True
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         set_pill(self.status_pill, "● Running", "warning")
 
     def _on_job_finished(self, code: int) -> None:
+        if not self._running_mine:
+            self._reset_idle()
+            return
+        self._running_mine = False
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         if code == 0:
@@ -506,14 +519,28 @@ class _Form(QWidget):
             set_pill(self.status_pill, f"Failed · exit {code}", "error")
 
     def _on_job_cancelled(self) -> None:
+        if not self._running_mine:
+            self._reset_idle()
+            return
+        self._running_mine = False
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Cancelled", "error")
 
     def _on_job_failed(self, msg: str) -> None:
+        if not self._running_mine:
+            self._reset_idle()
+            return
+        self._running_mine = False
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Failed to start", "error")
+
+    def _reset_idle(self) -> None:
+        """Another kind's job just ended — restore our idle UI."""
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        set_pill(self.status_pill, "Ready", "neutral")
 
 
 # ---------- top-level view ----------

@@ -3,12 +3,15 @@ Safe Docker wrapper.
 
 This module deliberately exposes a narrow allow-list of subcommands. Mutating
 subcommands — build, create, rm, rmi, commit, run, tag, push, cp — are NOT
-available as methods. The GUI physically cannot call them.
+available as methods. The GUI physically cannot call them. `exec` IS allowed,
+but only through narrow helpers here (port probe, pkill cleanup); long-running
+exec streaming goes through JobManager, not this module.
 """
 from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 
 from app.config import CONTAINER_NAME, IMAGE_NAME
@@ -94,6 +97,77 @@ def start_container(name: str = CONTAINER_NAME) -> None:
         raise DockerError(f"Timeout starting container: {e}") from e
     if r.returncode != 0:
         raise DockerError(f"docker start failed: {r.stderr.strip()}")
+
+
+def container_port_in_use(
+    port: int, name: str = CONTAINER_NAME
+) -> bool | None:
+    """Is anything INSIDE the container bound to `port`?
+
+    This is the question you actually want to ask on a Docker setup — the
+    host-side port is always held by docker-proxy while the container is
+    running, so a host-side probe tells you nothing useful.
+
+    Probe uses bash's built-in /dev/tcp so it works without iproute2/netstat
+    being installed in the image. Exit 0 from bash means the connect to
+    localhost:<port> inside the container succeeded, i.e. something is bound.
+
+    Returns:
+        True  — something inside the container is listening on `port`
+        False — nothing is bound
+        None  — container not running or we couldn't determine
+    """
+    state = container_state(name)
+    if state.status != "running":
+        return None
+    try:
+        r = _run(
+            ["exec", name, "bash", "-c", f"exec 3<>/dev/tcp/127.0.0.1/{port}"],
+            timeout=3.0,
+        )
+    except (subprocess.TimeoutExpired, DockerError):
+        return None
+    return r.returncode == 0
+
+
+def free_container_port(
+    port: int,
+    name: str = CONTAINER_NAME,
+    owners: tuple[str, ...] = ("ns-train", "ns-viewer"),
+    grace: float = 1.5,
+) -> bool:
+    """Free an in-container port by pkill'ing the likely owners.
+
+    Scope is deliberately narrow: only processes matching `owners` (the two
+    things in this stack that bind to viser's port). SIGTERM first, re-probe
+    until `grace` seconds elapse, then SIGKILL stragglers. Returns True iff
+    the port is free when we return.
+    """
+    state = container_state(name)
+    if state.status != "running":
+        return False
+
+    for patt in owners:
+        try:
+            _run(["exec", name, "pkill", "-TERM", "-f", patt], timeout=3.0)
+        except (subprocess.TimeoutExpired, DockerError):
+            pass
+
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if container_port_in_use(port, name) is False:
+            return True
+        time.sleep(0.15)
+
+    for patt in owners:
+        try:
+            _run(["exec", name, "pkill", "-KILL", "-f", patt], timeout=3.0)
+        except (subprocess.TimeoutExpired, DockerError):
+            pass
+
+    # Give the kernel a beat to tear down the socket, then re-check.
+    time.sleep(0.3)
+    return container_port_in_use(port, name) is False
 
 
 def start_daemon_via_polkit() -> tuple[bool, str]:
