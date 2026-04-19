@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# smoke_test.sh — splat-ns container smoke tests
+# Verifies every feature built by the Dockerfile: GPU passthrough, PyTorch +
+# sm_120, cuDNN, COLMAP (with 4.1 flag rename), ffmpeg, gsplat rasterizer,
+# nerfstudio CLI, the colmap_utils.py patch, TensorBoard/viser stack,
+# workspace bind mount, and env vars.
+#
+# Usage:
+#   ./smoke_test.sh                                   # all tests
+#   ./smoke_test.sh --skip-jit                        # skip the slow gsplat JIT compile
+#   CONTAINER=foo IMAGE=foo:latest ./smoke_test.sh    # override defaults
+#
+# Exits non-zero if any test fails. Never stops on failure — runs every
+# test so you see the full picture.
+
+set -u
+
+CONTAINER="${CONTAINER:-splat-ns}"
+IMAGE="${IMAGE:-splat-nerfstudio:latest}"
+HOST_DATA_DIR="${HOST_DATA_DIR:-/home/meroe/Desktop/docker_splat/data}"
+SKIP_JIT=0
+for arg in "$@"; do
+    case "$arg" in
+        --skip-jit) SKIP_JIT=1 ;;
+        -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
+    esac
+done
+
+if [ -t 1 ]; then
+    G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; B=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'
+else
+    G=; R=; Y=; B=; D=; N=
+fi
+
+PASS=0; FAIL=0; WARN=0
+FAILED=()
+
+section() { printf '\n%s=== %s ===%s\n' "$B" "$*" "$N"; }
+pass()    { printf '  %sPASS%s  %s\n' "$G" "$N" "$1"; PASS=$((PASS+1)); }
+fail()    { printf '  %sFAIL%s  %s\n' "$R" "$N" "$1"
+            [ $# -gt 1 ] && printf '        %s%s%s\n' "$D" "$2" "$N"
+            FAIL=$((FAIL+1)); FAILED+=("$1"); }
+warn()    { printf '  %sWARN%s  %s\n' "$Y" "$N" "$1"
+            [ $# -gt 1 ] && printf '        %s%s%s\n' "$D" "$2" "$N"
+            WARN=$((WARN+1)); }
+info()    { printf '        %s%s%s\n' "$D" "$1" "$N"; }
+
+# Run a command in the container and capture stdout+stderr.
+dexec()    { docker exec    "$CONTAINER" "$@" 2>&1; }
+dexec_in() { docker exec -i "$CONTAINER" "$@" 2>&1; }
+
+printf '%sSmoke test for %s (image: %s)%s\n' "$B" "$CONTAINER" "$IMAGE" "$N"
+printf '%sStarted: %s%s\n' "$D" "$(date -Iseconds)" "$N"
+
+# ============================================================================
+# 1. Container runtime + GPU passthrough + published ports
+# ============================================================================
+section "1. Container runtime + GPU passthrough"
+
+if ! docker ps --filter "name=^${CONTAINER}$" --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    fail "$CONTAINER is running" "start it with: docker start $CONTAINER"
+    printf '\n%sAborting remaining tests — container is not running.%s\n' "$R" "$N"
+    exit 1
+fi
+pass "$CONTAINER is running"
+info "$(docker ps --filter "name=^${CONTAINER}$" --format 'status={{.Status}}')"
+
+nvsmi=$(dexec nvidia-smi)
+if [ $? -eq 0 ] && echo "$nvsmi" | grep -q "NVIDIA-SMI"; then
+    pass "nvidia-smi inside container"
+    info "$(echo "$nvsmi" | grep -E '(Driver Version|CUDA Version)' | head -1 | sed 's/^ *//')"
+    info "$(echo "$nvsmi" | grep -E 'NVIDIA .+On' | head -1 | awk -F'|' '{print $2}' | sed 's/^ *//;s/ *$//')"
+else
+    fail "nvidia-smi inside container" "$(echo "$nvsmi" | head -3)"
+fi
+
+ports=$(docker port "$CONTAINER" 2>&1)
+echo "$ports" | grep -q '6006/tcp -> 0.0.0.0:6006' \
+    && pass "port 6006 published (TensorBoard)" \
+    || fail "port 6006 published" "got: $(echo "$ports" | grep 6006 || echo none)"
+echo "$ports" | grep -q '7007/tcp -> 0.0.0.0:7007' \
+    && pass "port 7007 published (nerfstudio viewer)" \
+    || fail "port 7007 published" "got: $(echo "$ports" | grep 7007 || echo none)"
+
+# ============================================================================
+# 2. Dockerfile env vars
+# ============================================================================
+section "2. Dockerfile env vars (TORCH_CUDA_ARCH_LIST=12.0, FORCE_CUDA=1)"
+
+envs=$(dexec sh -c 'echo "$TORCH_CUDA_ARCH_LIST|$FORCE_CUDA|$CUDA_HOME|$PIP_CONSTRAINT"')
+IFS='|' read -r arch force_cuda cuda_home pip_con <<< "$envs"
+[ "$arch"      = "12.0" ]                && pass "TORCH_CUDA_ARCH_LIST=12.0"      || fail "TORCH_CUDA_ARCH_LIST" "got '$arch'"
+[ "$force_cuda" = "1" ]                  && pass "FORCE_CUDA=1"                   || fail "FORCE_CUDA" "got '$force_cuda'"
+[ "$cuda_home" = "/usr/local/cuda" ]     && pass "CUDA_HOME=/usr/local/cuda"      || fail "CUDA_HOME" "got '$cuda_home'"
+[ "$pip_con"   = "/etc/pip/constraint.txt" ] && pass "PIP_CONSTRAINT set"         || warn "PIP_CONSTRAINT" "got '$pip_con'"
+
+# ============================================================================
+# 3. PyTorch + CUDA + sm_120 Blackwell
+# ============================================================================
+section "3. PyTorch + CUDA + sm_120"
+
+out=$(dexec python -c "import torch,json; print(json.dumps({'v':torch.__version__,'cuda':torch.cuda.is_available(),'n':torch.cuda.device_count(),'name':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,'cap':list(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None,'archs':torch.cuda.get_arch_list()}))")
+if echo "$out" | grep -q '"cuda": true'; then
+    pass "torch.cuda.is_available() == True"
+    info "$out"
+else
+    fail "torch + CUDA" "$out"
+fi
+echo "$out" | grep -q '"cap": \[12, 0\]'        && pass "GPU capability (12,0) — Blackwell sm_120" || fail "GPU capability (12,0)" "$(echo "$out" | grep -o '"cap":[^,]*')"
+echo "$out" | grep -Eq '"sm_120"'               && pass "sm_120 in torch arch list"                 || warn "sm_120 in torch arch list" "arch list: $(echo "$out" | grep -o '"archs":[^]]*]')"
+
+# ============================================================================
+# 4. Live GPU compute (catches broken kernels even if import works)
+# ============================================================================
+section "4. Live GPU compute (matmul + conv)"
+
+out=$(dexec python -c "import torch; x=torch.randn(4096,4096,device='cuda'); y=(x@x.T).sum().item(); torch.cuda.synchronize(); print('OK', y)")
+echo "$out" | grep -q '^OK ' \
+    && pass "4096x4096 matmul on GPU" \
+    || fail "GPU matmul" "$(echo "$out" | tail -3)"
+
+out=$(dexec python -c "import torch,torch.nn.functional as F; x=torch.randn(1,3,64,64,device='cuda'); w=torch.randn(8,3,3,3,device='cuda'); y=F.conv2d(x,w); torch.cuda.synchronize(); print('OK', tuple(y.shape))")
+echo "$out" | grep -q '^OK ' \
+    && pass "conv2d on GPU (cuDNN path)" \
+    || fail "cuDNN conv" "$(echo "$out" | tail -3)"
+
+# ============================================================================
+# 5. cuDNN
+# ============================================================================
+section "5. cuDNN"
+
+out=$(dexec python -c "import torch; print('ver',torch.backends.cudnn.version(),'avail',torch.backends.cudnn.is_available())")
+echo "$out" | grep -q 'avail True' \
+    && { pass "cuDNN available"; info "$out"; } \
+    || fail "cuDNN available" "$out"
+
+# ============================================================================
+# 6. COLMAP (built from source with sm_120) + the 4.1 flag
+# ============================================================================
+section "6. COLMAP (sm_120) + 4.1 FeatureExtraction flag"
+
+ver=$(dexec colmap -h 2>&1 | head -1)
+echo "$ver" | grep -qi 'colmap' \
+    && { pass "colmap CLI present"; info "$ver"; } \
+    || fail "colmap CLI present" "$ver"
+
+help=$(dexec colmap feature_extractor --help)
+echo "$help" | grep -q '\-\-FeatureExtraction.use_gpu' \
+    && pass "--FeatureExtraction.use_gpu flag (COLMAP 4.1 new name)" \
+    || fail "--FeatureExtraction.use_gpu flag" "not found in feature_extractor help"
+
+echo "$help" | grep -q '\-\-SiftExtraction.use_gpu' \
+    && warn "old --SiftExtraction.use_gpu still present" "unexpected — should have been replaced" \
+    || pass "old --SiftExtraction.use_gpu flag is gone"
+
+# ============================================================================
+# 7. ffmpeg
+# ============================================================================
+section "7. ffmpeg"
+
+fv=$(dexec ffmpeg -version 2>&1 | head -1)
+echo "$fv" | grep -q '^ffmpeg version' \
+    && { pass "ffmpeg installed"; info "$fv"; } \
+    || fail "ffmpeg installed" "$fv"
+
+hw=$(dexec ffmpeg -hide_banner -hwaccels 2>&1)
+echo "$hw" | grep -q 'cuda' \
+    && pass "ffmpeg has cuda hwaccel" \
+    || warn "ffmpeg cuda hwaccel" "missing; ns-process-data will still work on CPU"
+
+# ============================================================================
+# 8. gsplat
+# ============================================================================
+section "8. gsplat rasterizer"
+
+out=$(dexec python -c "import gsplat; print('gsplat', gsplat.__version__)")
+echo "$out" | grep -q '^gsplat ' \
+    && { pass "gsplat import"; info "$out"; } \
+    || fail "gsplat import" "$out"
+
+out=$(dexec python -c "from gsplat.rendering import rasterization; print('rasterization OK')")
+echo "$out" | grep -q 'rasterization OK' \
+    && pass "gsplat.rendering.rasterization import" \
+    || fail "gsplat.rendering.rasterization import" "$out"
+
+# ============================================================================
+# 9. gsplat JIT kernel (real rasterize on sm_120) — SLOW FIRST RUN
+# ============================================================================
+if [ "$SKIP_JIT" -eq 1 ]; then
+    section "9. gsplat JIT rasterize (skipped --skip-jit)"
+else
+    section "9. gsplat JIT rasterize on GPU (first run may take ~30s to compile)"
+    out=$(dexec_in python - <<'PY'
+import torch
+from gsplat.rendering import rasterization
+N = 100; device = 'cuda'
+means  = torch.randn(N, 3, device=device)
+quats  = torch.randn(N, 4, device=device); quats = quats / quats.norm(dim=-1, keepdim=True)
+scales = torch.rand(N, 3, device=device) * 0.1
+opacs  = torch.rand(N, device=device)
+colors = torch.rand(N, 3, device=device)
+K    = torch.tensor([[[400, 0, 128], [0, 400, 128], [0, 0, 1]]], device=device, dtype=torch.float32)
+view = torch.eye(4, device=device)[None]
+img, alpha, _ = rasterization(means, quats, scales, opacs, colors, view, K, 256, 256)
+torch.cuda.synchronize()
+print('OK', tuple(img.shape), tuple(alpha.shape))
+PY
+)
+    echo "$out" | grep -q '^OK ' \
+        && { pass "gsplat rasterize on GPU"; info "$(echo "$out" | tail -1)"; } \
+        || fail "gsplat rasterize on GPU" "$(echo "$out" | tail -5)"
+fi
+
+# ============================================================================
+# 10. nerfstudio CLI
+# ============================================================================
+section "10. nerfstudio CLI"
+
+out=$(dexec python -c "import nerfstudio; print('nerfstudio', nerfstudio.__version__)")
+echo "$out" | grep -q '^nerfstudio ' \
+    && { pass "nerfstudio import"; info "$out"; } \
+    || fail "nerfstudio import" "$out"
+
+for cmd in ns-train ns-process-data ns-viewer ns-export ns-render; do
+    if dexec which "$cmd" > /dev/null 2>&1; then
+        pass "$cmd on PATH"
+    else
+        fail "$cmd on PATH"
+    fi
+done
+
+# ns-train --help triggers full config loading — catches import errors that
+# the plain `import nerfstudio` won't surface.
+out=$(dexec ns-train --help 2>&1)
+echo "$out" | grep -qi 'usage' \
+    && pass "ns-train --help (loads all method configs)" \
+    || fail "ns-train --help" "$(echo "$out" | tail -5)"
+
+# Check splatfacto method is registered.
+out=$(dexec python -c "from nerfstudio.configs.method_configs import method_configs as m; print([k for k in m if 'splat' in k])")
+echo "$out" | grep -q "splatfacto" \
+    && { pass "splatfacto method registered"; info "$out"; } \
+    || fail "splatfacto method registered" "$out"
+
+# ============================================================================
+# 11. Verify Stage 5 sed patch to colmap_utils.py
+# ============================================================================
+section "11. colmap_utils.py patch (Stage 5 sed)"
+
+pyf='/usr/local/lib/python3.12/dist-packages/nerfstudio/process_data/colmap_utils.py'
+
+if ! dexec test -f "$pyf"; then
+    fail "colmap_utils.py exists at $pyf" "file missing — nerfstudio version may have moved it"
+else
+    pass "colmap_utils.py exists"
+
+    new_count=$(dexec grep -c -E 'FeatureExtraction\.use_gpu|FeatureMatching\.use_gpu' "$pyf" | tr -d '[:space:]')
+    old_count=$(dexec grep -c -E 'SiftExtraction\.use_gpu|SiftMatching\.use_gpu'       "$pyf" | tr -d '[:space:]')
+
+    [ "${new_count:-0}" -ge 1 ] \
+        && pass "new FeatureExtraction/FeatureMatching.use_gpu present ($new_count refs)" \
+        || fail "new flag names present" "patch did not apply"
+
+    [ "${old_count:-0}" = "0" ] \
+        && pass "old SiftExtraction/SiftMatching.use_gpu gone" \
+        || fail "old flag names removed" "$old_count old refs still present — patch is partial"
+fi
+
+# ============================================================================
+# 12. TensorBoard + viser (viewer stack)
+# ============================================================================
+section "12. TensorBoard + viser"
+
+out=$(dexec python -c "import tensorboard; print('tensorboard', tensorboard.__version__)")
+echo "$out" | grep -q '^tensorboard ' \
+    && { pass "tensorboard import"; info "$out"; } \
+    || fail "tensorboard import" "$out"
+
+out=$(dexec python -c "import viser; print('viser', viser.__version__)")
+echo "$out" | grep -q '^viser ' \
+    && { pass "viser import"; info "$out"; } \
+    || fail "viser import" "$out"
+
+dexec which tensorboard > /dev/null 2>&1 \
+    && pass "tensorboard binary on PATH" \
+    || fail "tensorboard binary on PATH"
+
+# ============================================================================
+# 13. Workspace bind mount (RW)
+# ============================================================================
+section "13. Workspace bind mount (/workspace)"
+
+if dexec test -d /workspace; then
+    pass "/workspace exists inside container"
+else
+    fail "/workspace exists" "directory missing"
+fi
+
+token="smoke_$(date +%s)_$$"
+if dexec sh -c "touch /workspace/.${token} && rm /workspace/.${token}" 2>&1 | grep -qv 'denied\|error\|Permission'; then
+    pass "/workspace is writable"
+else
+    fail "/workspace writable"
+fi
+
+# Verify the mount goes back to the host path we expect.
+mount_src=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}')
+if [ -n "$mount_src" ]; then
+    pass "/workspace is a bind mount"
+    info "host path: $mount_src"
+    [ "$mount_src" = "$HOST_DATA_DIR" ] \
+        && pass "mount source == $HOST_DATA_DIR" \
+        || warn "mount source != $HOST_DATA_DIR" "got $mount_src"
+else
+    fail "/workspace bind mount" "no bind mount for /workspace in docker inspect"
+fi
+
+# ============================================================================
+# 14. Verify Stage 5 sed patch for torch.load weights_only=False (v3.2)
+# ============================================================================
+section "14. torch.load weights_only=False patch (Stage 5 sed, v3.2)"
+
+wo_files=(
+    '/usr/local/lib/python3.12/dist-packages/nerfstudio/utils/eval_utils.py'
+    '/usr/local/lib/python3.12/dist-packages/nerfstudio/engine/trainer.py'
+    '/usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/downloads/download_data.py'
+)
+
+for f in "${wo_files[@]}"; do
+    base=$(basename "$f")
+    if ! dexec test -f "$f"; then
+        fail "$base exists" "file missing — nerfstudio version may have moved it"
+        continue
+    fi
+    patched=$(dexec grep -c 'torch\.load([^)]*weights_only=False'   "$f" | tr -d '[:space:]')
+    stale=$(  dexec grep -c 'torch\.load([^)]*map_location="cpu")$' "$f" | tr -d '[:space:]')
+    [ "${patched:-0}" -ge 1 ] \
+        && pass "$base has weights_only=False torch.load ($patched ref(s))" \
+        || fail "$base weights_only patch applied" "no patched torch.load found"
+    [ "${stale:-0}" = "0" ] \
+        && pass "$base has no unpatched torch.load(..., map_location=\"cpu\")" \
+        || fail "$base unpatched torch.load remains" "$stale ref(s) without weights_only"
+done
+
+# ============================================================================
+# Summary
+# ============================================================================
+section "Summary"
+printf '  %sPASS%s: %d   %sFAIL%s: %d   %sWARN%s: %d\n' "$G" "$N" "$PASS" "$R" "$N" "$FAIL" "$Y" "$N" "$WARN"
+
+if [ "$FAIL" -gt 0 ]; then
+    printf '\n%sFailed tests:%s\n' "$R" "$N"
+    for t in "${FAILED[@]}"; do printf '  - %s\n' "$t"; done
+fi
+
+printf '\n%sTo inspect all image layers used by this container, run in another terminal:%s\n' "$B" "$N"
+printf '  docker history %s\n' "$IMAGE"
+printf '  docker history --no-trunc --format '\''table {{.CreatedBy}}\t{{.Size}}'\'' %s\n' "$IMAGE"
+printf '  docker inspect %s --format '\''{{.Config.Image}} parent={{.Parent}}'\''\n' "$IMAGE"
+
+[ "$FAIL" -eq 0 ] && exit 0 || exit 1
