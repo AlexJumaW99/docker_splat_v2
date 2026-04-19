@@ -14,11 +14,18 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from PySide6.QtCore import QObject, Signal
 from pydantic import BaseModel, Field
 
 from app.config import DATA_DIR, PROJECTS_FILE
+
+
+# Nerfstudio dataparser subcommand name. "nerfstudio-data" expects a
+# transforms.json at the dataset root (what ns-process-data produces).
+# "colmap" reads a COLMAP sparse reconstruction directly.
+DataparserKind = Literal["nerfstudio-data", "colmap"]
 
 
 def _slugify(text: str) -> str:
@@ -32,11 +39,52 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Candidate relative paths to the COLMAP model dir (the folder that holds
+# cameras.bin / images.bin / points3D.bin), in preference order. "sparse/0" is
+# the Tanks & Temples / plain-COLMAP layout; "colmap/sparse/0" is what
+# ns-process-data produces and what Nerfstudio's ColmapDataParserConfig
+# defaults to. Order matters when both happen to exist — first hit wins.
+_COLMAP_PATH_CANDIDATES = ("sparse/0", "colmap/sparse/0")
+
+
+def detect_colmap_path(processed_dir: Path) -> str | None:
+    """Return the posix-relative path to the COLMAP model dir inside
+    `processed_dir`, or None if no recognized COLMAP layout is present."""
+    for rel in _COLMAP_PATH_CANDIDATES:
+        if (processed_dir / rel / "cameras.bin").is_file():
+            return rel
+    return None
+
+
+def detect_dataset_format(processed_dir: Path) -> DataparserKind | None:
+    """Identify which Nerfstudio dataparser can train on this folder.
+
+    Returns the dataparser name, or None if the folder holds no format we
+    recognize. Check order matters: transforms.json wins if both are present,
+    since ns-process-data writes it alongside sparse/ for COLMAP-sourced runs.
+    """
+    if (processed_dir / "transforms.json").is_file():
+        return "nerfstudio-data"
+    if detect_colmap_path(processed_dir) is not None:
+        return "colmap"
+    return None
+
+
 class Project(BaseModel):
     id: str
     name: str
-    video_path: str  # absolute host path
-    processed_dir: str  # absolute host path under data/processed/
+    # None for projects imported from an already-processed dataset — there's
+    # no source video to point back at, and the Process tab is gated off.
+    video_path: str | None = None
+    processed_dir: str  # absolute host path, must live under DATA_DIR
+    # Which ns-train dataparser this project's processed_dir uses. Defaults
+    # to nerfstudio-data so legacy records (pre-import-flow) load unchanged.
+    dataparser: DataparserKind = "nerfstudio-data"
+    # Only meaningful when dataparser == "colmap": posix-relative path from
+    # processed_dir to the folder holding cameras.bin (e.g. "sparse/0"). This
+    # gets forwarded as `colmap --colmap-path <colmap_path>` at train time so
+    # Nerfstudio doesn't fall back to its default of "colmap/sparse/0".
+    colmap_path: str | None = None
     created_at: str = Field(default_factory=_iso_now)
     # Per-project parameter presets (form values keyed by preset name)
     presets_process: dict[str, dict] = Field(default_factory=dict)
@@ -58,6 +106,8 @@ class ProjectStore(QObject):
         super().__init__(parent)
         self._path = path
         self._root = self._load()
+        if self._heal():
+            self._save()
 
     # ---- persistence ----
     def _load(self) -> _Root:
@@ -72,6 +122,20 @@ class ProjectStore(QObject):
             except OSError:
                 pass
             return _Root()
+
+    def _heal(self) -> bool:
+        """Migrate records written before newer fields existed. Returns True
+        if anything was changed (the caller then persists). Currently: COLMAP
+        projects missing colmap_path get it back-filled from the filesystem so
+        ns-train's --colmap-path flag can be emitted correctly."""
+        changed = False
+        for p in self._root.projects:
+            if p.dataparser == "colmap" and not p.colmap_path:
+                found = detect_colmap_path(Path(p.processed_dir))
+                if found is not None:
+                    p.colmap_path = found
+                    changed = True
+        return changed
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,9 +169,30 @@ class ProjectStore(QObject):
         self._save()
         self.active_changed.emit(self.active)
 
+    def _reserve_pid(self, name: str) -> str:
+        """Resolve a unique project id for `name`. Raises if the name is taken."""
+        if any(p.name == name for p in self._root.projects):
+            raise ValueError(f"A project named '{name}' already exists.")
+        base = _slugify(name)
+        pid = base
+        i = 2
+        taken = {p.id for p in self._root.projects}
+        while pid in taken:
+            pid = f"{base}_{i}"
+            i += 1
+        return pid
+
+    def _insert(self, project: Project) -> Project:
+        self._root.projects.append(project)
+        self._root.active_project_id = project.id
+        self._save()
+        self.projects_changed.emit()
+        self.active_changed.emit(project)
+        return project
+
     def create(self, name: str, video_path: Path) -> Project:
-        """Creates a project. Raises ValueError if name conflicts or the video
-        is outside the data/ bind mount."""
+        """Creates a project from a source video. Raises ValueError if the name
+        conflicts or the video is outside the data/ bind mount."""
         name = name.strip()
         if not name:
             raise ValueError("Project name can't be empty.")
@@ -120,31 +205,63 @@ class ProjectStore(QObject):
                 "The container only sees that folder (it's bind-mounted as /workspace)."
             ) from None
 
-        base = _slugify(name)
-        pid = base
-        i = 2
-        taken = {p.id for p in self._root.projects}
-        while pid in taken:
-            pid = f"{base}_{i}"
-            i += 1
-
-        if any(p.name == name for p in self._root.projects):
-            raise ValueError(f"A project named '{name}' already exists.")
-
+        pid = self._reserve_pid(name)
         processed_dir = DATA_DIR / "processed" / f"{pid}_splat"
-
-        project = Project(
+        return self._insert(Project(
             id=pid,
             name=name,
             video_path=str(video_path.resolve()),
             processed_dir=str(processed_dir),
-        )
-        self._root.projects.append(project)
-        self._root.active_project_id = project.id
-        self._save()
-        self.projects_changed.emit()
-        self.active_changed.emit(project)
-        return project
+            dataparser="nerfstudio-data",
+        ))
+
+    def create_from_processed(self, name: str, processed_dir: Path) -> Project:
+        """Creates a project from an already-processed dataset folder.
+
+        The folder must live under DATA_DIR (so the container can see it) and
+        hold a recognized dataparser format. No video is recorded — the Process
+        tab will render a read-only "imported" state for these projects.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("Project name can't be empty.")
+
+        resolved = processed_dir.resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Not a directory:\n{resolved}")
+
+        try:
+            resolved.relative_to(DATA_DIR.resolve())
+        except ValueError:
+            raise ValueError(
+                f"Processed folder must live inside {DATA_DIR}.\n\n"
+                "The container only sees that folder (it's bind-mounted as /workspace)."
+            ) from None
+
+        fmt = detect_dataset_format(resolved)
+        if fmt is None:
+            raise ValueError(
+                f"Couldn't detect a supported dataset format in:\n{resolved}\n\n"
+                "Expected either transforms.json (Nerfstudio) "
+                "or sparse/0/cameras.bin (COLMAP)."
+            )
+
+        if any(Path(p.processed_dir).resolve() == resolved for p in self._root.projects):
+            raise ValueError(
+                "Another project is already pointed at this folder."
+            )
+
+        colmap_path = detect_colmap_path(resolved) if fmt == "colmap" else None
+
+        pid = self._reserve_pid(name)
+        return self._insert(Project(
+            id=pid,
+            name=name,
+            video_path=None,
+            processed_dir=str(resolved),
+            dataparser=fmt,
+            colmap_path=colmap_path,
+        ))
 
     def update_video_path(self, project_id: str, video_path: Path) -> None:
         try:

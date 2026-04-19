@@ -42,9 +42,38 @@ def _host_to_container(host_path: str | Path) -> str:
     return f"/workspace/{rel.as_posix()}"
 
 
-def _is_processed(processed_dir: str) -> bool:
-    """A Nerfstudio-ready dataset always has transforms.json at its root."""
-    return (Path(processed_dir) / "transforms.json").is_file()
+def _colmap_rel(project: Project) -> str:
+    """Relative path to the COLMAP model dir for a project. Stored on the
+    project at import time; fall back to Nerfstudio's own default so a
+    corrupted record never silently trains on the wrong folder."""
+    return project.colmap_path or "colmap/sparse/0"
+
+
+def _marker_file(project: Project) -> Path:
+    """The filesystem marker we check to know a dataset is ready for training.
+    Kept in one place so _is_trainable, the dataset-card readout, and any
+    future dataparser all share the same definition."""
+    root = Path(project.processed_dir)
+    if project.dataparser == "colmap":
+        return root / _colmap_rel(project) / "cameras.bin"
+    # nerfstudio-data (the default)
+    return root / "transforms.json"
+
+
+def _is_trainable(project: Project) -> bool:
+    """True if the project's processed folder currently holds the artifacts
+    the project's chosen dataparser requires."""
+    return _marker_file(project).is_file()
+
+
+def _dataset_meta_text(project: Project) -> str:
+    """One-line summary for the DATASET card — format + frame count."""
+    if project.dataparser == "colmap":
+        head = f"✓ COLMAP format ({_colmap_rel(project)}/cameras.bin)"
+    else:
+        head = "✓ Nerfstudio format (transforms.json)"
+    n = _count_frames(project.processed_dir)
+    return f"{head}  ·  {n} frames" if n is not None else head
 
 
 def _count_frames(processed_dir: str) -> int | None:
@@ -94,7 +123,9 @@ class _EmptyState(QWidget):
 # ---------- not-processed gate ----------
 
 class _NotProcessedState(QWidget):
-    """Active project exists but has no transforms.json — push user to Process."""
+    """Active project's processed folder is missing or incomplete. Behaviour
+    differs for imported vs video-sourced projects: an imported project has
+    no source video to re-process, so we don't point the user at Process."""
 
     request_process = Signal()
 
@@ -106,28 +137,40 @@ class _NotProcessedState(QWidget):
         v.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         v.setSpacing(10)
 
-        title = QLabel("Not processed yet")
+        imported = project.video_path is None
+
+        title = QLabel("Imported dataset missing" if imported else "Not processed yet")
         title.setObjectName("PageTitle")
         title.setAlignment(Qt.AlignCenter)
 
-        sub = QLabel(
-            f"'{project.name}' has no processed dataset yet. "
-            "Run it through Process first, then come back."
-        )
+        if imported:
+            msg = (
+                f"'{project.name}' was imported from\n{project.processed_dir}\n"
+                "but that folder is gone or no longer holds the expected files. "
+                "Restore it, or create a new project pointing at a valid folder."
+            )
+        else:
+            msg = (
+                f"'{project.name}' has no processed dataset yet. "
+                "Run it through Process first, then come back."
+            )
+        sub = QLabel(msg)
         sub.setProperty("role", "caption")
         sub.setWordWrap(True)
         sub.setAlignment(Qt.AlignCenter)
-        sub.setMaximumWidth(480)
-
-        btn = QPushButton("Go to Process →")
-        btn.setProperty("role", "primary")
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(self.request_process.emit)
+        sub.setMaximumWidth(520)
 
         v.addWidget(title)
         v.addWidget(sub, 0, Qt.AlignHCenter)
-        v.addSpacing(16)
-        v.addWidget(btn, 0, Qt.AlignHCenter)
+
+        if not imported:
+            v.addSpacing(16)
+            btn = QPushButton("Go to Process →")
+            btn.setProperty("role", "primary")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(self.request_process.emit)
+            v.addWidget(btn, 0, Qt.AlignHCenter)
+
         v.addStretch(1)
 
 
@@ -396,12 +439,7 @@ class _Form(QWidget):
     def _load_project(self) -> None:
         p = self._project
         self.dataset_path.setText(p.processed_dir)
-
-        n = _count_frames(p.processed_dir)
-        meta = "✓ transforms.json present"
-        if n is not None:
-            meta += f"  ·  {n} frames"
-        self.dataset_meta.setText(meta)
+        self.dataset_meta.setText(_dataset_meta_text(p))
 
         self.output_lbl.setText(str(OUTPUTS_DIR / p.id))
 
@@ -492,12 +530,16 @@ class _Form(QWidget):
             )
             return
 
-        if not _is_processed(self._project.processed_dir):
+        if not _is_trainable(self._project):
+            marker = _marker_file(self._project)
             QMessageBox.warning(
                 self, "Missing dataset",
-                "The processed dataset is gone. Re-run Process first.",
+                f"Expected file not found:\n{marker}\n\n"
+                "Restore the dataset folder, or (for video-sourced projects) "
+                "re-run Process.",
             )
-            self.request_process.emit()
+            if self._project.video_path is not None:
+                self.request_process.emit()
             return
 
         params = self._collect_params()
@@ -562,6 +604,19 @@ class _Form(QWidget):
                 QMessageBox.warning(self, "Bad extra flags", str(e))
                 return
             argv.extend(extras)
+
+        # Dataparser subcommand goes last — tyro binds every subsequent flag
+        # to the dataparser, so method/pipeline flags have to precede it. The
+        # default (nerfstudio-data) is implicit when omitted, so we only emit
+        # non-default names to keep the generated command minimal.
+        if self._project.dataparser == "colmap":
+            argv.append("colmap")
+            # Always forward the stored path rather than relying on
+            # ColmapDataParserConfig's default ("colmap/sparse/0"), which
+            # doesn't match the plain-COLMAP ("sparse/0") layout.
+            argv.extend(["--colmap-path", _colmap_rel(self._project)])
+        elif self._project.dataparser != "nerfstudio-data":
+            argv.append(self._project.dataparser)
 
         display = (
             f"docker exec {CONTAINER_NAME} "
@@ -712,7 +767,7 @@ class TrainView(QWidget):
             self.stack.addWidget(_EmptyState(self._store))
             return
 
-        if not _is_processed(active.processed_dir):
+        if not _is_trainable(active):
             gate = _NotProcessedState(active)
             gate.request_process.connect(lambda: self.request_navigate.emit(1))
             self.stack.addWidget(gate)

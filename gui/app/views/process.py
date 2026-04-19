@@ -87,6 +87,49 @@ class _EmptyState(QWidget):
         v.addStretch(1)
 
 
+# ---------- imported state (no video to process) ----------
+
+class _ImportedState(QWidget):
+    """Active project was created from an already-processed folder, so there
+    is nothing for this tab to do. Point the user at Train."""
+
+    request_train = Signal()
+
+    def __init__(self, project: Project):
+        super().__init__()
+        self.setObjectName("Canvas")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(40, 80, 40, 40)
+        v.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        v.setSpacing(10)
+
+        title = QLabel("Imported dataset")
+        title.setObjectName("PageTitle")
+        title.setAlignment(Qt.AlignCenter)
+
+        fmt = "COLMAP" if project.dataparser == "colmap" else "Nerfstudio"
+        sub = QLabel(
+            f"'{project.name}' was imported as a {fmt} dataset from\n"
+            f"{project.processed_dir}\n\n"
+            "There's no video to process — go straight to Train."
+        )
+        sub.setProperty("role", "caption")
+        sub.setWordWrap(True)
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setMaximumWidth(560)
+
+        btn = QPushButton("Go to Train →")
+        btn.setProperty("role", "primary")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(self.request_train.emit)
+
+        v.addWidget(title)
+        v.addWidget(sub, 0, Qt.AlignHCenter)
+        v.addSpacing(16)
+        v.addWidget(btn, 0, Qt.AlignHCenter)
+        v.addStretch(1)
+
+
 # ---------- form ----------
 
 class _Form(QWidget):
@@ -580,6 +623,11 @@ class ProcessView(QWidget):
         active = self._store.active
         if active is None:
             self.stack.addWidget(_EmptyState(self._store))
+            return
+        if active.video_path is None:
+            gate = _ImportedState(active)
+            gate.request_train.connect(lambda: self.request_navigate.emit(2))
+            self.stack.addWidget(gate)
             return
         form = _Form(self._store, self._jobs, active)
         form.request_train.connect(lambda: self.request_navigate.emit(2))  # Train tab idx
