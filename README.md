@@ -99,6 +99,16 @@ Open `http://localhost:7007` for the 3D view. In a second shell (`docker exec -i
 
 For detailed workflow, troubleshooting, and export instructions, see **[USER_GUIDE.md](USER_GUIDE.md)**.
 
+### 4. Optional: desktop GUI
+
+A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns` container without the CLI. It runs the exact `ns-process-data` / `ns-train` invocations you'd run by hand, with per-project state and an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples.
+
+```bash
+cd gui && ./run.sh
+```
+
+First launch creates `.venv/` and installs PySide6 + pydantic. See [gui/README.md](gui/README.md) and the [Desktop GUI section](USER_GUIDE.md#desktop-gui-optional) of the user guide.
+
 ---
 
 ## Architecture
@@ -151,8 +161,9 @@ Three non-obvious issues you'd hit trying to build this yourself:
 | COLMAP CMake fails with `Could NOT find Qt6Svg` | Undocumented new Qt6 Svg dependency in COLMAP 4.1.0.dev0 | `qt6-svg-dev` added to `apt install` list |
 | Nerfstudio `ns-process-data video` fails with `unrecognised option '--SiftExtraction.use_gpu'` | COLMAP renamed SIFT-specific GPU flags to generic `FeatureExtraction.use_gpu` when ALIKED support was added | `sed` patch applied to nerfstudio's `colmap_utils.py` in Stage 5 |
 | `PYTORCH_CUDA_ALLOC_CONF` warning on every invocation | Env var renamed to `PYTORCH_ALLOC_CONF` in PyTorch 2.10 | Use the new name in the `docker run` / `docker create` command |
+| `ns-train` fails to resume from checkpoints with `_pickle.UnpicklingError: Weights only load failed` | PyTorch 2.6 flipped `torch.load`'s `weights_only` default to `True`; nerfstudio's checkpoints include non-tensor state and fail the new safety check | `sed` patch in Stage 5 pins `weights_only=False` in nerfstudio's loader |
 
-All three are baked into the v3 Dockerfile and the documented `docker create` command.
+All four are baked into the v3.2 Dockerfile and the documented `docker create` command.
 
 ---
 
@@ -185,17 +196,17 @@ All three are baked into the v3 Dockerfile and the documented `docker create` co
 
 ## Project history
 
-Tagged versions in git mark verified milestones:
+`v3-working` (commit `349e43e`) is the tagged milestone — the first Dockerfile that produced a working pipeline from scratch. Subsequent versioned commits (v3.1, v3.2) extend it without retagging.
 
-| Tag | Commit | Description |
-|---|---|---|
-| `v3-working` | `349e43e` | First Dockerfile producing a working pipeline from scratch |
-| `v3.1-tensorboard` | (latest) | Adds `EXPOSE 6006` and verified `--vis viewer+tensorboard` workflow |
-
-Commit history (`git log --oneline`):
+Commit history (`git log --oneline`, most recent first):
 
 ```
-v3.1 — add TensorBoard real-time monitoring support (EXPOSE 6006 + docs)
+Add "import processed dataset" flow to skip straight to training (GUI)
+Add Train tab and viser-port safety helpers (GUI)
+Add smoke_test.sh for container verification
+v3.2 — patch nerfstudio torch.load for PyTorch 2.6+ weights_only default
+Add GUI application source
+v3.1 — add TensorBoard monitoring (EXPOSE 6006) + docs
 v3   — patch nerfstudio for COLMAP SiftExtraction→FeatureExtraction flag rename
 v2.1 — add trailing newline + expand Stage 4 explanatory comment
 v2   — multi-stage refactor + add qt6-svg-dev to fix COLMAP build

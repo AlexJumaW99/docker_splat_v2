@@ -15,14 +15,16 @@ From host setup to your first exported Gaussian Splat PLY.
 1. [Host prerequisites](#host-prerequisites)
 2. [Building the image](#building-the-image)
 3. [Container lifecycle](#container-lifecycle)
-4. [Recording videos for splatfacto](#recording-videos-for-splatfacto)
-5. [Processing a video](#processing-a-video)
-6. [Training splatfacto](#training-splatfacto)
-7. [Viewing in viser](#viewing-in-viser)
-8. [Real-time monitoring with TensorBoard](#real-time-monitoring-with-tensorboard)
-9. [Exporting a PLY file](#exporting-a-ply-file)
-10. [Troubleshooting](#troubleshooting)
-11. [Appendix: full command reference](#appendix-full-command-reference)
+4. [Desktop GUI (optional)](#desktop-gui-optional)
+5. [Recording videos for splatfacto](#recording-videos-for-splatfacto)
+6. [Processing a video](#processing-a-video)
+7. [Training splatfacto](#training-splatfacto)
+8. [Training on a pre-processed dataset](#training-on-a-pre-processed-dataset)
+9. [Viewing in viser](#viewing-in-viser)
+10. [Real-time monitoring with TensorBoard](#real-time-monitoring-with-tensorboard)
+11. [Exporting a PLY file](#exporting-a-ply-file)
+12. [Troubleshooting](#troubleshooting)
+13. [Appendix: full command reference](#appendix-full-command-reference)
 
 ---
 
@@ -193,6 +195,44 @@ The container runs as root, so files it writes to `/workspace/` will be root-own
 ```bash
 sudo chown -R $USER:$USER ~/Desktop/docker_splat/data
 ```
+
+---
+
+## Desktop GUI (optional)
+
+A PySide6 app in [`gui/`](gui/) wraps the same `ns-process-data` / `ns-train` commands you'd run by hand. It's a thin, read-mostly front end over `docker exec` — never builds, creates, or removes containers.
+
+### Launch
+
+```bash
+cd gui
+./run.sh
+```
+
+First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subsequent launches are instant.
+
+### What each tab does
+
+| Tab       | State | Behavior                                                                                                                                      |
+|-----------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| Dashboard | live  | Polls Docker + `splat-ns` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
+| Process   | live  | Form-driven `ns-process-data video` with per-project presets, advanced raw-flag passthrough, and live ffprobe readout of the source video.   |
+| Train     | live  | Form-driven `ns-train`. Splatfacto method picker, iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
+| Viewers   | stub  | Placeholder — reach viser / TensorBoard directly in the browser in the meantime.                                                             |
+| Runs      | stub  | Placeholder for a training-run browser over `data/outputs/`.                                                                                  |
+
+### Projects
+
+A project bundles a dataset with its processing/training runs. **+ New project** offers two modes:
+
+- **From video** — point at a video file inside `~/Desktop/docker_splat/data/`. Goes Process → Train like the CLI workflow.
+- **Import processed dataset** — point at an already-processed folder inside `~/Desktop/docker_splat/data/`. The app auto-detects the layout:
+  - `transforms.json` at the root → Nerfstudio dataparser
+  - `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → COLMAP dataparser, with the relative path saved so `ns-train` gets `--colmap-path <rel>` automatically
+
+  Imported projects skip the Process tab and land straight on Train. This is the right flow for Tanks & Temples, MipNeRF360, or anything else already reconstructed with COLMAP.
+
+State persists to `~/.config/docker_splat_gui/projects.json`. Delete that directory to reset.
 
 ---
 
@@ -379,6 +419,16 @@ Step (% Done)
 
 Columns: step, iteration time, remaining time estimate, gaussian count. The gaussian count should grow steadily — doubling roughly every 2000 iterations in the densification phase.
 
+### Splatfacto variants
+
+| Method | When to use |
+|---|---|
+| `splatfacto` | Default — balanced quality and speed. Good starting point for most videos. |
+| `splatfacto-big` | Larger gaussian capacity. Use for detailed scenes where the default caps out. Slower and hungrier on VRAM. |
+| `splatfacto-mcmc` | MCMC-based densification. More stable gaussian counts; sometimes cleaner results on sparse-view scenes. |
+
+Swap the first positional argument of `ns-train` to pick one (e.g. `ns-train splatfacto-big --data …`).
+
 ### Final output location
 
 When training completes, your model lands at:
@@ -392,6 +442,54 @@ When training completes, your model lands at:
 ```
 
 Note the timestamp directory — you'll reference it for viewing and exporting.
+
+---
+
+## Training on a pre-processed dataset
+
+If you already have a reconstructed scene (Tanks & Temples, MipNeRF360, your own prior `ns-process-data` output), you can skip processing entirely and train on it directly.
+
+### Place the dataset under the bind mount
+
+The container only sees `~/Desktop/docker_splat/data/` (it's mounted at `/workspace`). So move or symlink the dataset there:
+
+```bash
+mv /path/to/Ballroom ~/Desktop/docker_splat/data/processed/ballroom_splat
+```
+
+The `_splat` suffix is convention — not required, but matches what `ns-process-data` produces.
+
+### Pick the right dataparser
+
+Nerfstudio's `ns-train` takes a dataparser as a tyro subcommand. Which one depends on the layout of your folder:
+
+| Layout present | Dataparser | Notes |
+|---|---|---|
+| `transforms.json` at the root | `nerfstudio-data` (default) | What `ns-process-data` writes. No extra flags needed. |
+| `sparse/0/cameras.bin` | `colmap` with `--colmap-path sparse/0` | Plain COLMAP layout (Tanks & Temples, hand-run COLMAP). |
+| `colmap/sparse/0/cameras.bin` | `colmap` (defaults work) | Nerfstudio's own COLMAP layout. `ColmapDataParserConfig.colmap_path` defaults to `colmap/sparse/0`. |
+
+### CLI recipe — plain COLMAP folder
+
+For a Tanks & Temples-style folder (`sparse/0/...` at the root):
+
+```bash
+ns-train splatfacto \
+  --data /workspace/processed/ballroom_splat \
+  --output-dir /workspace/outputs \
+  --max-num-iterations 7000 \
+  --vis viewer+tensorboard \
+  --viewer.websocket-host 0.0.0.0 \
+  --viewer.quit-on-train-completion False \
+  colmap \
+  --colmap-path sparse/0
+```
+
+The `colmap` subcommand and its `--colmap-path` flag must come **after** all the `ns-train` method flags. Argument order matters to tyro.
+
+### Via the GUI
+
+Use **+ New project → Import processed dataset** and point at the folder. The app auto-detects the format, records the COLMAP path on the project, and emits the right `ns-train` invocation at train time — no need to remember the subcommand ordering.
 
 ---
 
