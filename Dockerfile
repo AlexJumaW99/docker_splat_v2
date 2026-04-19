@@ -82,6 +82,15 @@ RUN pip install --no-cache-dir --no-build-isolation \
 # v3.1: expose port 6006 for TensorBoard (requires matching -p 6006:6006
 # in `docker create` to be reachable from host). TensorBoard ships with
 # NGC PyTorch and is used via `--vis viewer+tensorboard` in ns-train.
+#
+# v3.2: patch nerfstudio for PyTorch >=2.6 weights_only=True default. NGC
+# PyTorch 25.11 ships torch 2.10, where torch.load defaults to a restricted
+# unpickler that rejects numpy.core.multiarray.scalar (which nerfstudio
+# checkpoints contain). Pass weights_only=False at the four torch.load call
+# sites to restore nerfstudio 1.1.5's expected behavior. Affects ns-render,
+# ns-eval, ns-export, ns-viewer (loading existing models), and ns-train
+# --load-dir/--load-checkpoint (resume). Safe because checkpoints are
+# produced locally by this same install, not untrusted input.
 # ============================================================
 FROM gsplat AS nerfstudio
 
@@ -91,6 +100,11 @@ RUN sed -i \
         -e 's/SiftExtraction\.use_gpu/FeatureExtraction.use_gpu/g' \
         -e 's/SiftMatching\.use_gpu/FeatureMatching.use_gpu/g' \
         /usr/local/lib/python3.12/dist-packages/nerfstudio/process_data/colmap_utils.py
+
+RUN sed -i 's|map_location="cpu")|map_location="cpu", weights_only=False)|g' \
+        /usr/local/lib/python3.12/dist-packages/nerfstudio/utils/eval_utils.py \
+        /usr/local/lib/python3.12/dist-packages/nerfstudio/engine/trainer.py \
+        /usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/downloads/download_data.py
 
 WORKDIR /workspace
 EXPOSE 7007 6006
