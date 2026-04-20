@@ -8,9 +8,10 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QVBoxLayout,
+    QWidget,
 )
 
 from app import docker_service as dock
@@ -29,7 +30,22 @@ def _host_to_container(host_path: str | Path) -> str:
     return f"/workspace/{rel.as_posix()}"
 
 
-MATCH_METHODS = ["sequential", "vocab_tree", "exhaustive", "spatial"]
+# Matching methods that ns-process-data video actually accepts. "spatial" was
+# in this list historically but tyro rejects it ("invalid choice"); leaving it
+# selectable would silently break a saved preset.
+MATCH_METHODS = ["sequential", "vocab_tree", "exhaustive"]
+
+# Camera models supported by ns-process-data --camera-type. Order matches the
+# CLI help so users see the same dropdown order they'd find in the docs.
+CAMERA_TYPES = ["perspective", "fisheye", "equirectangular", "pinhole", "simple_pinhole"]
+
+# Only meaningful when --camera-type=equirectangular. ns-process-data only
+# accepts these two values.
+EQUIRECT_SAMPLES = [8, 14]
+
+# Sentinel for the seed SpinBoxes — Qt renders this value as "random" (via
+# setSpecialValueText) and we treat it as "don't emit a --random-seed flag".
+SEED_RANDOM = -1
 
 
 # ---------- async ffprobe ----------
@@ -285,32 +301,216 @@ class _Form(QWidget):
 
         v.addLayout(grid)
 
-        # Advanced panel
+        # Advanced panel — three structured sub-cards plus a raw-flags fallback.
+        # Hidden by default; the "Advanced mode" header checkbox toggles it.
         self.advanced_wrap = QFrame()
         self.advanced_wrap.setProperty("role", "subcard")
         av = QVBoxLayout(self.advanced_wrap)
-        av.setContentsMargins(0, 8, 0, 0); av.setSpacing(8)
+        av.setContentsMargins(0, 10, 0, 0)
+        av.setSpacing(14)
 
-        adv_title = section_title("ADVANCED · RAW CLI FLAGS")
-        av.addWidget(adv_title)
-
-        self.extra_flags_edit = QLineEdit()
-        self.extra_flags_edit.setPlaceholderText(
-            "--refine-pixsfm --camera-type perspective …"
-        )
-        av.addWidget(self.extra_flags_edit)
-
-        hint = QLabel(
-            "Passed through verbatim to ns-process-data. Use for flags not in the basic form. "
-            "See: docker exec splat-ns-v2 ns-process-data video --help"
-        )
-        hint.setProperty("role", "caption")
-        hint.setWordWrap(True)
-        av.addWidget(hint)
+        av.addWidget(self._adv_camera_subcard())
+        av.addWidget(self._adv_colmap_subcard())
+        av.addWidget(self._adv_extras_subcard())
+        av.addWidget(self._adv_raw_subcard())
 
         self.advanced_wrap.hide()
         v.addWidget(self.advanced_wrap)
         return c
+
+    # ---- advanced sub-cards ----
+
+    def _adv_camera_subcard(self) -> QFrame:
+        sc = QFrame()
+        sc.setProperty("role", "subcard")
+        sv = QVBoxLayout(sc)
+        sv.setContentsMargins(14, 12, 14, 14); sv.setSpacing(10)
+        sv.addWidget(section_title("CAMERA & CROPPING"))
+
+        g = QGridLayout()
+        g.setHorizontalSpacing(14); g.setVerticalSpacing(10)
+        g.setColumnStretch(1, 1)
+
+        # Camera type
+        g.addWidget(QLabel("Camera type"), 0, 0)
+        self.camera_type_combo = QComboBox()
+        self.camera_type_combo.addItems(CAMERA_TYPES)
+        self.camera_type_combo.currentTextChanged.connect(self._on_camera_type_changed)
+        g.addWidget(self.camera_type_combo, 0, 1)
+
+        # Crop factor (top / bottom / left / right)
+        g.addWidget(QLabel("Crop (T B L R)"), 1, 0)
+        crop_row = QHBoxLayout(); crop_row.setSpacing(6)
+        self.crop_spins = []
+        for _ in range(4):
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1.0); sp.setSingleStep(0.05); sp.setDecimals(2)
+            sp.setMaximumWidth(80)
+            self.crop_spins.append(sp)
+            crop_row.addWidget(sp)
+        crop_row.addStretch(1)
+        crop_wrap = QWidget(); crop_wrap.setLayout(crop_row)
+        g.addWidget(crop_wrap, 1, 1)
+
+        # Circle-mask radius
+        g.addWidget(QLabel("Circle-mask radius"), 2, 0)
+        self.radius_crop_spin = QDoubleSpinBox()
+        self.radius_crop_spin.setRange(0.0, 1.0)
+        self.radius_crop_spin.setSingleStep(0.05); self.radius_crop_spin.setDecimals(2)
+        self.radius_crop_spin.setMaximumWidth(100)
+        rc_row = QHBoxLayout(); rc_row.addWidget(self.radius_crop_spin); rc_row.addStretch(1)
+        rc_wrap = QWidget(); rc_wrap.setLayout(rc_row)
+        g.addWidget(rc_wrap, 2, 1)
+
+        # Equirect samples — visible only for camera-type=equirectangular.
+        self.equirect_lbl = QLabel("Frames per equirect view")
+        self.equirect_combo = QComboBox()
+        self.equirect_combo.addItems([str(n) for n in EQUIRECT_SAMPLES])
+        self.equirect_lbl.hide(); self.equirect_combo.hide()
+        g.addWidget(self.equirect_lbl, 3, 0)
+        g.addWidget(self.equirect_combo, 3, 1)
+
+        sv.addLayout(g)
+
+        hint = QLabel(
+            "Crop trims pixels (0–1 fractions of each edge). Circle mask is "
+            "useful for fisheye lenses that vignette the frame corners."
+        )
+        hint.setProperty("role", "caption")
+        hint.setWordWrap(True)
+        sv.addWidget(hint)
+        return sc
+
+    def _adv_colmap_subcard(self) -> QFrame:
+        sc = QFrame()
+        sc.setProperty("role", "subcard")
+        sv = QVBoxLayout(sc)
+        sv.setContentsMargins(14, 12, 14, 14); sv.setSpacing(10)
+        sv.addWidget(section_title("COLMAP TUNING"))
+
+        g = QGridLayout()
+        g.setHorizontalSpacing(14); g.setVerticalSpacing(10)
+        g.setColumnStretch(1, 1)
+
+        self.refine_intrinsics_cb = QCheckBox("Refine intrinsics (recommended)")
+        g.addWidget(self.refine_intrinsics_cb, 0, 0, 1, 2)
+
+        self.same_dimensions_cb = QCheckBox("All frames are same dimensions (faster)")
+        g.addWidget(self.same_dimensions_cb, 1, 0, 1, 2)
+
+        self.no_gpu_cb = QCheckBox("Disable GPU SIFT (diagnostic — much slower)")
+        g.addWidget(self.no_gpu_cb, 2, 0, 1, 2)
+
+        # Reproducibility seeds. -1 displays as "random" via setSpecialValueText
+        # and is the signal that we shouldn't emit the corresponding flag.
+        g.addWidget(QLabel("Train frame-selection seed"), 3, 0)
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(SEED_RANDOM, 2_147_483_647)
+        self.seed_spin.setSpecialValueText("random")
+        self.seed_spin.setMaximumWidth(140)
+        seed_row = QHBoxLayout(); seed_row.addWidget(self.seed_spin); seed_row.addStretch(1)
+        seed_wrap = QWidget(); seed_wrap.setLayout(seed_row)
+        g.addWidget(seed_wrap, 3, 1)
+
+        g.addWidget(QLabel("Eval frame-selection seed"), 4, 0)
+        self.eval_seed_spin = QSpinBox()
+        self.eval_seed_spin.setRange(SEED_RANDOM, 2_147_483_647)
+        self.eval_seed_spin.setSpecialValueText("random")
+        self.eval_seed_spin.setMaximumWidth(140)
+        es_row = QHBoxLayout(); es_row.addWidget(self.eval_seed_spin); es_row.addStretch(1)
+        es_wrap = QWidget(); es_wrap.setLayout(es_row)
+        g.addWidget(es_wrap, 4, 1)
+
+        sv.addLayout(g)
+        return sc
+
+    def _adv_extras_subcard(self) -> QFrame:
+        sc = QFrame()
+        sc.setProperty("role", "subcard")
+        sv = QVBoxLayout(sc)
+        sv.setContentsMargins(14, 12, 14, 14); sv.setSpacing(10)
+        sv.addWidget(section_title("EXTRAS"))
+
+        self.use_sfm_depth_cb = QCheckBox("Export SfM depth maps")
+        sv.addWidget(self.use_sfm_depth_cb)
+
+        # Eval video picker (optional). Stored as host path; converted at run time.
+        sv.addWidget(QLabel("Eval video (optional)"))
+        eval_row = QHBoxLayout(); eval_row.setSpacing(8)
+        self.eval_video_edit = QLineEdit()
+        self.eval_video_edit.setReadOnly(True)
+        self.eval_video_edit.setProperty("role", "readout")
+        self.eval_video_edit.setPlaceholderText("(none)")
+        self.eval_video_browse = QPushButton("Browse…")
+        self.eval_video_browse.setProperty("role", "secondary")
+        self.eval_video_browse.setCursor(Qt.PointingHandCursor)
+        self.eval_video_browse.clicked.connect(self._on_browse_eval_video)
+        self.eval_video_clear = QPushButton("Clear")
+        self.eval_video_clear.setProperty("role", "ghost")
+        self.eval_video_clear.setCursor(Qt.PointingHandCursor)
+        self.eval_video_clear.clicked.connect(lambda: self.eval_video_edit.setText(""))
+        eval_row.addWidget(self.eval_video_edit, 1)
+        eval_row.addWidget(self.eval_video_browse)
+        eval_row.addWidget(self.eval_video_clear)
+        sv.addLayout(eval_row)
+
+        hint = QLabel(
+            "Eval video, if set, is processed alongside the train video and "
+            "held out from training. Must live inside the data/ bind mount."
+        )
+        hint.setProperty("role", "caption")
+        hint.setWordWrap(True)
+        sv.addWidget(hint)
+        return sc
+
+    def _adv_raw_subcard(self) -> QFrame:
+        sc = QFrame()
+        sc.setProperty("role", "subcard")
+        sv = QVBoxLayout(sc)
+        sv.setContentsMargins(14, 12, 14, 14); sv.setSpacing(8)
+        sv.addWidget(section_title("RAW CLI FLAGS"))
+
+        self.extra_flags_edit = QLineEdit()
+        self.extra_flags_edit.setPlaceholderText(
+            "--skip-image-processing  …"
+        )
+        sv.addWidget(self.extra_flags_edit)
+
+        hint = QLabel(
+            "Appended verbatim to ns-process-data after the structured flags above. "
+            "See: docker exec splat-ns-v2 ns-process-data video --help"
+        )
+        hint.setProperty("role", "caption")
+        hint.setWordWrap(True)
+        sv.addWidget(hint)
+        return sc
+
+    # ---- conditional visibility ----
+
+    def _on_camera_type_changed(self, value: str) -> None:
+        is_equirect = (value == "equirectangular")
+        self.equirect_lbl.setVisible(is_equirect)
+        self.equirect_combo.setVisible(is_equirect)
+
+
+    def _on_browse_eval_video(self) -> None:
+        from app.config import DATA_DIR as _DD
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Pick an eval video",
+            str(_DD),
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).resolve().relative_to(_DD.resolve())
+        except ValueError:
+            QMessageBox.warning(
+                self, "Eval video outside data/",
+                f"Eval videos must live inside {_DD} so the container can see them."
+            )
+            return
+        self.eval_video_edit.setText(path)
 
     # ---- output card ----
     def _output_card(self) -> QFrame:
@@ -384,7 +584,16 @@ class _Form(QWidget):
         self.output_lbl.setText(p.processed_dir)
 
         # Populate form from last params or sensible defaults.
-        params = p.last_process_params or {}
+        self._apply_params(p.last_process_params or {})
+
+        self._refresh_presets()
+        self._probe_video(Path(p.video_path))
+
+    def _apply_params(self, params: dict) -> None:
+        """Populate every widget from a params dict. Missing keys fall back to
+        the same defaults ns-process-data would use, so legacy projects (saved
+        before the advanced fields existed) load unchanged."""
+        # --- basic ---
         self.frames_slider.setValue(int(params.get("num_frames_target", 250)))
         self.frames_value.setValue(int(params.get("num_frames_target", 250)))
         method = params.get("matching_method", "sequential")
@@ -394,8 +603,36 @@ class _Form(QWidget):
         self.verbose_cb.setChecked(bool(params.get("verbose", True)))
         self.extra_flags_edit.setText(params.get("extra_flags", ""))
 
-        self._refresh_presets()
-        self._probe_video(Path(p.video_path))
+        # --- camera & cropping ---
+        camera_type = params.get("camera_type", "perspective")
+        if camera_type in CAMERA_TYPES:
+            self.camera_type_combo.setCurrentIndex(CAMERA_TYPES.index(camera_type))
+        self._on_camera_type_changed(self.camera_type_combo.currentText())
+
+        crop_keys = ("crop_top", "crop_bottom", "crop_left", "crop_right")
+        for spin, key in zip(self.crop_spins, crop_keys):
+            spin.setValue(float(params.get(key, 0.0)))
+        self.radius_crop_spin.setValue(float(params.get("percent_radius_crop", 1.0)))
+
+        eq = int(params.get("images_per_equirect", 8))
+        if eq in EQUIRECT_SAMPLES:
+            self.equirect_combo.setCurrentIndex(EQUIRECT_SAMPLES.index(eq))
+
+        # --- COLMAP tuning ---
+        self.refine_intrinsics_cb.setChecked(bool(params.get("refine_intrinsics", True)))
+        self.same_dimensions_cb.setChecked(bool(params.get("same_dimensions", True)))
+        # gpu_enabled is the user-facing concept; the CLI flag is --no-gpu.
+        gpu_enabled = bool(params.get("gpu_enabled", True))
+        self.no_gpu_cb.setChecked(not gpu_enabled)
+
+        seed = params.get("random_seed", None)
+        self.seed_spin.setValue(int(seed) if seed is not None else SEED_RANDOM)
+        eval_seed = params.get("eval_random_seed", None)
+        self.eval_seed_spin.setValue(int(eval_seed) if eval_seed is not None else SEED_RANDOM)
+
+        # --- extras ---
+        self.use_sfm_depth_cb.setChecked(bool(params.get("use_sfm_depth", False)))
+        self.eval_video_edit.setText(params.get("eval_data") or "")
 
     def _refresh_presets(self) -> None:
         self.preset_combo.blockSignals(True)
@@ -411,13 +648,7 @@ class _Form(QWidget):
             return
         preset = self._project.presets_process.get(name, {})
         if preset:
-            self.frames_value.setValue(int(preset.get("num_frames_target", 250)))
-            method = preset.get("matching_method", "sequential")
-            if method in MATCH_METHODS:
-                self.method_combo.setCurrentIndex(MATCH_METHODS.index(method))
-            self.downscales_spin.setValue(int(preset.get("num_downscales", 3)))
-            self.verbose_cb.setChecked(bool(preset.get("verbose", True)))
-            self.extra_flags_edit.setText(preset.get("extra_flags", ""))
+            self._apply_params(preset)
 
     def _on_save_preset(self) -> None:
         name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
@@ -459,13 +690,106 @@ class _Form(QWidget):
 
     # ---- collect + run ----
     def _collect_params(self) -> dict:
+        seed_v = self.seed_spin.value()
+        eval_seed_v = self.eval_seed_spin.value()
         return {
+            # basic
             "num_frames_target": self.frames_value.value(),
             "matching_method": self.method_combo.currentText(),
             "num_downscales": self.downscales_spin.value(),
             "verbose": self.verbose_cb.isChecked(),
             "extra_flags": self.extra_flags_edit.text().strip(),
+            # camera & cropping
+            "camera_type": self.camera_type_combo.currentText(),
+            "crop_top": self.crop_spins[0].value(),
+            "crop_bottom": self.crop_spins[1].value(),
+            "crop_left": self.crop_spins[2].value(),
+            "crop_right": self.crop_spins[3].value(),
+            "percent_radius_crop": self.radius_crop_spin.value(),
+            "images_per_equirect": int(self.equirect_combo.currentText()),
+            # COLMAP tuning
+            "refine_intrinsics": self.refine_intrinsics_cb.isChecked(),
+            "same_dimensions": self.same_dimensions_cb.isChecked(),
+            "gpu_enabled": not self.no_gpu_cb.isChecked(),
+            "random_seed": None if seed_v == SEED_RANDOM else seed_v,
+            "eval_random_seed": None if eval_seed_v == SEED_RANDOM else eval_seed_v,
+            # extras
+            "use_sfm_depth": self.use_sfm_depth_cb.isChecked(),
+            "eval_data": self.eval_video_edit.text().strip() or None,
         }
+
+    def _build_argv(self, params: dict, c_video: str, c_out: str) -> list[str]:
+        """Translate the form's params dict into an ns-process-data invocation.
+
+        Only flags whose values differ from ns-process-data's own defaults are
+        emitted, so the rendered command line stays identical to today's for a
+        user who never touches the advanced panel.
+
+        May raise ValueError when a host-path field can't be mapped into the
+        container's /workspace mount (e.g. eval video stored outside DATA_DIR).
+        """
+        argv = [
+            "ns-process-data", "video",
+            "--data", c_video,
+            "--output-dir", c_out,
+            "--num-frames-target", str(params["num_frames_target"]),
+            "--matching-method", params["matching_method"],
+            "--num-downscales", str(params["num_downscales"]),
+        ]
+        if params.get("verbose"):
+            argv.append("--verbose")
+
+        # Camera & cropping
+        if params.get("camera_type", "perspective") != "perspective":
+            argv.extend(["--camera-type", params["camera_type"]])
+
+        crop = (
+            float(params.get("crop_top", 0.0)),
+            float(params.get("crop_bottom", 0.0)),
+            float(params.get("crop_left", 0.0)),
+            float(params.get("crop_right", 0.0)),
+        )
+        if any(c > 0.0 for c in crop):
+            argv.extend(["--crop-factor", *(f"{c:.4f}" for c in crop)])
+
+        radius = float(params.get("percent_radius_crop", 1.0))
+        if radius < 1.0:
+            argv.extend(["--percent-radius-crop", f"{radius:.4f}"])
+
+        if params.get("camera_type") == "equirectangular":
+            eq = int(params.get("images_per_equirect", 8))
+            if eq != 8:
+                argv.extend(["--images-per-equirect", str(eq)])
+
+        # COLMAP tuning — emit only the negation flags when the user opted out
+        # of a behaviour that's enabled by default.
+        if not params.get("refine_intrinsics", True):
+            argv.append("--no-refine-intrinsics")
+        if not params.get("same_dimensions", True):
+            argv.append("--no-same-dimensions")
+        if not params.get("gpu_enabled", True):
+            argv.append("--no-gpu")
+
+        seed = params.get("random_seed")
+        if seed is not None:
+            argv.extend(["--random-seed", str(int(seed))])
+        eval_seed = params.get("eval_random_seed")
+        if eval_seed is not None:
+            argv.extend(["--eval-random-seed", str(int(eval_seed))])
+
+        # Extras
+        if params.get("use_sfm_depth"):
+            argv.append("--use-sfm-depth")
+
+        eval_data = params.get("eval_data")
+        if eval_data:
+            argv.extend(["--eval-data", _host_to_container(eval_data)])
+
+        # Raw passthrough (last so user flags can override structured ones).
+        extra_flags = params.get("extra_flags") or ""
+        if extra_flags.strip():
+            argv.extend(shlex.split(extra_flags))
+        return argv
 
     def _on_run(self) -> None:
         if self._jobs.is_running():
@@ -497,23 +821,13 @@ class _Form(QWidget):
             QMessageBox.warning(self, "Path outside data/", str(e))
             return
 
-        argv = [
-            "ns-process-data", "video",
-            "--data", c_video,
-            "--output-dir", c_out,
-            "--num-frames-target", str(params["num_frames_target"]),
-            "--matching-method", params["matching_method"],
-            "--num-downscales", str(params["num_downscales"]),
-        ]
-        if params["verbose"]:
-            argv.append("--verbose")
-        if params["extra_flags"]:
-            try:
-                extras = shlex.split(params["extra_flags"])
-            except ValueError as e:
-                QMessageBox.warning(self, "Bad extra flags", str(e))
-                return
-            argv.extend(extras)
+        try:
+            argv = self._build_argv(params, c_video, c_out)
+        except ValueError as e:
+            # Raised by _host_to_container when the eval video lives outside
+            # the bind mount, or by shlex.split on malformed --raw flags.
+            QMessageBox.warning(self, "Bad parameter", str(e))
+            return
 
         display = f"docker exec {CONTAINER_NAME} " + " ".join(shlex.quote(a) for a in argv)
 
