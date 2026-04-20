@@ -15,6 +15,7 @@ so a single Cancel button + status pill covers both.
 """
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from datetime import datetime
@@ -96,6 +97,27 @@ class _Run:
         return _host_to_container(self.config_path)
 
 
+# upstream nerfstudio writes both `splatfacto` and `splatfacto-mcmc` runs under
+# `<experiment>/splatfacto/<timestamp>/` (method_name='splatfacto' for both),
+# differing only by `strategy: mcmc` vs `strategy: default` inside config.yml.
+# We peek at that field so the Exports dropdown labels mcmc runs accurately
+# and .ply filenames derived from `run.method` carry the strategy through.
+_STRATEGY_RE = re.compile(r"^\s*strategy:\s*([A-Za-z_-]+)\s*$", re.MULTILINE)
+
+
+def _method_from_config(dir_method: str, config_path: Path) -> str:
+    if dir_method != "splatfacto":
+        return dir_method
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return dir_method
+    m = _STRATEGY_RE.search(text)
+    if m and m.group(1) == "mcmc":
+        return "splatfacto-mcmc"
+    return dir_method
+
+
 def _discover_runs(project_id: str) -> list[_Run]:
     root = OUTPUTS_DIR / project_id
     if not root.is_dir():
@@ -107,7 +129,7 @@ def _discover_runs(project_id: str) -> list[_Run]:
             if cfg.is_file():
                 runs.append(_Run(
                     project_id=project_id,
-                    method=method_dir.name,
+                    method=_method_from_config(method_dir.name, cfg),
                     timestamp=ts_dir.name,
                     config_path=cfg,
                 ))
