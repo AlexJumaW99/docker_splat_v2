@@ -30,7 +30,10 @@ from app.widgets import ProjectBar, card, pill, section_title, set_pill
 
 OUTPUTS_DIR = DATA_DIR / "outputs"
 
-METHODS = ["splatfacto", "splatfacto-big", "splatfacto-mcmc"]
+METHODS = [
+    "splatfacto", "splatfacto-big", "splatfacto-mcmc",
+    "splatfacto-w", "splatfacto-w-light",
+]
 VIS_MODES = ["viewer+tensorboard", "viewer", "tensorboard"]
 
 

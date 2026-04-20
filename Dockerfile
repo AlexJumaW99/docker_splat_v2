@@ -115,6 +115,16 @@ RUN sed -i 's|map_location="cpu")|map_location="cpu", weights_only=False)|g' \
         /usr/local/lib/python3.12/dist-packages/nerfstudio/engine/trainer.py \
         /usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/downloads/download_data.py
 
+# splatfacto-w (KevinXu02) is listed as an external method by nerfstudio. It
+# registers `splatfacto-w` and `splatfacto-w-light` via the
+# nerfstudio.method_configs entry point. We install with --no-deps because its
+# setup.py pins gsplat/nerfstudio versions that we've already satisfied (and
+# often exceeded) in earlier stages; its real runtime deps (pytorch_msssim,
+# pandas, cv2) are already present in the NGC base + nerfstudio install.
+ARG SPLATFACTOW_COMMIT=119a3bfb3aa03669278e174ff11c4dfdcbcf97d7
+RUN pip install --no-cache-dir --no-deps \
+        "splatfacto-w @ git+https://github.com/KevinXu02/splatfacto-w.git@${SPLATFACTOW_COMMIT}"
+
 WORKDIR /workspace
 EXPOSE 7007 6006
 CMD ["/bin/bash"]
