@@ -15,21 +15,21 @@ from app.nvidia_service import GpuStats, query_gpu
 
 
 DOCKER_CREATE_CMD = """docker create \\
-  --name splat-ns \\
+  --name splat-ns-v2 \\
   --gpus all \\
   --ipc=host \\
   --ulimit memlock=-1 \\
   --ulimit stack=67108864 \\
   --shm-size=16g \\
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \\
-  -v ~/Desktop/docker_splat/data:/workspace \\
+  -v ~/Desktop/docker_splat_v2/data:/workspace \\
   -p 7007:7007 \\
   -p 6006:6006 \\
   -it \\
-  splat-nerfstudio"""
+  splat-nerfstudio-v2"""
 
-DOCKER_BUILD_CMD = ("cd ~/Desktop/docker_splat\n"
-                   "docker build --target nerfstudio -t splat-nerfstudio .")
+DOCKER_BUILD_CMD = ("cd ~/Desktop/docker_splat_v2\n"
+                   "docker build --target nerfstudio -t splat-nerfstudio-v2 .")
 
 
 # ---------- helpers ----------
@@ -109,14 +109,14 @@ class StatusPoller(QObject):
 class GuideDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Create the splat-ns container")
+        self.setWindowTitle("Create the splat-ns-v2 container")
         self.setMinimumSize(640, 520)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(24, 24, 24, 20)
         v.setSpacing(12)
 
-        title = QLabel("Create the splat-ns container")
+        title = QLabel("Create the splat-ns-v2 container")
         title.setObjectName("PageTitle")
         v.addWidget(title)
 
@@ -346,7 +346,7 @@ class DashboardView(QWidget):
             elif s == "paused":
                 self.cont_value.setText("paused")
                 _set_pill(self.cont_pill, "Paused", "warning")
-                self.cont_hint.setText("Container is paused. Run `docker unpause splat-ns` in a terminal.")
+                self.cont_hint.setText("Container is paused. Run `docker unpause splat-ns-v2` in a terminal.")
                 self.cont_btn.hide(); self.cont_help.hide()
             elif s == "missing":
                 if snap.image_exists:

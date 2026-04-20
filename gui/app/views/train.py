@@ -352,7 +352,7 @@ class _Form(QWidget):
 
         hint = QLabel(
             "Passed through verbatim to ns-train. "
-            "See: docker exec splat-ns ns-train splatfacto --help"
+            "See: docker exec splat-ns-v2 ns-train splatfacto --help"
         )
         hint.setProperty("role", "caption")
         hint.setWordWrap(True)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# smoke_test.sh — splat-ns container smoke tests
+# smoke_test.sh — splat-ns-v2 container smoke tests
 # Verifies every feature built by the Dockerfile: GPU passthrough, PyTorch +
 # sm_120, cuDNN, COLMAP (with 4.1 flag rename), ffmpeg, gsplat rasterizer,
 # nerfstudio CLI, the colmap_utils.py patch, TensorBoard/viser stack,
@@ -15,9 +15,9 @@
 
 set -u
 
-CONTAINER="${CONTAINER:-splat-ns}"
-IMAGE="${IMAGE:-splat-nerfstudio:latest}"
-HOST_DATA_DIR="${HOST_DATA_DIR:-/home/meroe/Desktop/docker_splat/data}"
+CONTAINER="${CONTAINER:-splat-ns-v2}"
+IMAGE="${IMAGE:-splat-nerfstudio-v2:latest}"
+HOST_DATA_DIR="${HOST_DATA_DIR:-/home/meroe/Desktop/docker_splat_v2/data}"
 SKIP_JIT=0
 for arg in "$@"; do
     case "$arg" in

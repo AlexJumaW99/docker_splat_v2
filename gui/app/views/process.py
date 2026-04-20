@@ -302,7 +302,7 @@ class _Form(QWidget):
 
         hint = QLabel(
             "Passed through verbatim to ns-process-data. Use for flags not in the basic form. "
-            "See: docker exec splat-ns ns-process-data video --help"
+            "See: docker exec splat-ns-v2 ns-process-data video --help"
         )
         hint.setProperty("role", "caption")
         hint.setWordWrap(True)

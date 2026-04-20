@@ -72,12 +72,13 @@ RUN pip install --no-cache-dir --no-build-isolation \
 # ============================================================
 # Stage 5: nerfstudio — final image with CLI and splatfacto methods
 #
-# v3 fix: patch nerfstudio 1.1.5 colmap_utils.py for COLMAP 4.1.0.dev0
-# flag rename. COLMAP moved --SiftExtraction.use_gpu to
+# v3 fix: patch nerfstudio colmap_utils.py for COLMAP 4.1.0.dev0 flag
+# rename. COLMAP moved --SiftExtraction.use_gpu to
 # --FeatureExtraction.use_gpu (and same for SiftMatching) when it added
-# ALIKED as a second feature extractor alongside SIFT. Nerfstudio 1.1.5
-# was written against the old flag names and fails with "unrecognised
-# option" during ns-process-data without this patch.
+# ALIKED as a second feature extractor alongside SIFT. Nerfstudio's
+# colmap_utils was written against the old flag names and fails with
+# "unrecognised option" during ns-process-data without this patch.
+# Verified still needed against main@50e0e3c.
 #
 # v3.1: expose port 6006 for TensorBoard (requires matching -p 6006:6006
 # in `docker create` to be reachable from host). TensorBoard ships with
@@ -87,14 +88,22 @@ RUN pip install --no-cache-dir --no-build-isolation \
 # PyTorch 25.11 ships torch 2.10, where torch.load defaults to a restricted
 # unpickler that rejects numpy.core.multiarray.scalar (which nerfstudio
 # checkpoints contain). Pass weights_only=False at the four torch.load call
-# sites to restore nerfstudio 1.1.5's expected behavior. Affects ns-render,
-# ns-eval, ns-export, ns-viewer (loading existing models), and ns-train
-# --load-dir/--load-checkpoint (resume). Safe because checkpoints are
-# produced locally by this same install, not untrusted input.
+# sites. Affects ns-render, ns-eval, ns-export, ns-viewer (loading existing
+# models), and ns-train --load-dir/--load-checkpoint (resume). Safe because
+# checkpoints are produced locally by this same install, not untrusted
+# input. Verified still needed against main@50e0e3c.
+#
+# v4 (v2 fork): install nerfstudio from git main (pinned) instead of PyPI.
+# PyPI nerfstudio 1.1.5 doesn't register splatfacto-mcmc; main does.
+# Pinning to a specific commit keeps the image reproducible. Bump
+# NERFSTUDIO_COMMIT to pull newer upstream changes, then re-run
+# smoke_test.sh to confirm the sed patches still find their line patterns.
 # ============================================================
 FROM gsplat AS nerfstudio
 
-RUN pip install --no-cache-dir nerfstudio
+ARG NERFSTUDIO_COMMIT=50e0e3c70c775e89333256213363badbf074f29d
+RUN pip install --no-cache-dir \
+        "nerfstudio @ git+https://github.com/nerfstudio-project/nerfstudio.git@${NERFSTUDIO_COMMIT}"
 
 RUN sed -i \
         -e 's/SiftExtraction\.use_gpu/FeatureExtraction.use_gpu/g' \
