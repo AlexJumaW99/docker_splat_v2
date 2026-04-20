@@ -774,6 +774,6 @@ class TrainView(QWidget):
             return
 
         form = _Form(self._store, self._jobs, active)
-        form.request_viewers.connect(lambda: self.request_navigate.emit(3))
+        form.request_viewers.connect(lambda: self.request_navigate.emit(4))
         form.request_process.connect(lambda: self.request_navigate.emit(1))
         self.stack.addWidget(form)
