@@ -12,6 +12,33 @@ from PySide6.QtWidgets import (
 from app import docker_service as dock
 from app.config import CONTAINER_NAME, IMAGE_NAME
 from app.nvidia_service import GpuStats, query_gpu
+from app.widgets import HelpBadge
+
+
+_DOCKER_HELP = (
+    "Docker engine",
+    "Nerfstudio runs inside a Docker container, so the daemon must be up "
+    "before anything else works. This card polls <code>docker version</code> "
+    "every 1.5 s. If the daemon is offline, the button uses polkit to run "
+    "<code>systemctl start docker</code> \u2014 you'll see a password prompt "
+    "once."
+)
+_CONTAINER_HELP = (
+    "splat-ns container",
+    f"The <code>{CONTAINER_NAME}</code> container ships ns-process-data, "
+    "COLMAP, and ns-train. The GUI never creates or builds it \u2014 it only "
+    "attaches to one you've made yourself. Click <b>Show create "
+    "instructions</b> if it's missing; the dialog has the exact "
+    "<code>docker create</code> command."
+)
+_GPU_HELP = (
+    "GPU",
+    "Live telemetry from <code>nvidia-smi --query-gpu</code>. <b>Utilization</b> "
+    "is compute load (SM activity); <b>memory</b> is VRAM used / total; "
+    "<b>mem I/O</b> is the memory controller's load. A training step that "
+    "keeps utilization pegged and mem I/O low means you're compute-bound \u2014 "
+    "lower resolution or fewer gaussians to speed up."
+)
 
 
 DOCKER_CREATE_CMD = """docker create \\
@@ -221,6 +248,8 @@ class DashboardView(QWidget):
         v = QVBoxLayout(f); v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
 
         title = QLabel("DOCKER ENGINE"); title.setProperty("role", "cardTitle")
+        title_row = QHBoxLayout(); title_row.setSpacing(6); title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addWidget(title); title_row.addWidget(HelpBadge(*_DOCKER_HELP)); title_row.addStretch(1)
         row = QHBoxLayout()
         self.docker_value = QLabel("checking…")
         self.docker_value.setProperty("role", "cardValue")
@@ -236,7 +265,7 @@ class DashboardView(QWidget):
         self.docker_btn.clicked.connect(self._on_start_daemon)
         self.docker_btn.hide()
 
-        v.addWidget(title); v.addLayout(row); v.addWidget(self.docker_hint)
+        v.addLayout(title_row); v.addLayout(row); v.addWidget(self.docker_hint)
         v.addWidget(self.docker_btn, 0, Qt.AlignLeft)
         return f
 
@@ -245,6 +274,8 @@ class DashboardView(QWidget):
         v = QVBoxLayout(f); v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
 
         title = QLabel(f"CONTAINER · {CONTAINER_NAME}"); title.setProperty("role", "cardTitle")
+        title_row = QHBoxLayout(); title_row.setSpacing(6); title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addWidget(title); title_row.addWidget(HelpBadge(*_CONTAINER_HELP)); title_row.addStretch(1)
         row = QHBoxLayout()
         self.cont_value = QLabel("checking…")
         self.cont_value.setProperty("role", "cardValue")
@@ -271,7 +302,7 @@ class DashboardView(QWidget):
         btn_row.addWidget(self.cont_help)
         btn_row.addStretch(1)
 
-        v.addWidget(title); v.addLayout(row); v.addWidget(self.cont_hint); v.addLayout(btn_row)
+        v.addLayout(title_row); v.addLayout(row); v.addWidget(self.cont_hint); v.addLayout(btn_row)
         return f
 
     def _build_gpu_card(self) -> QFrame:
@@ -279,6 +310,8 @@ class DashboardView(QWidget):
         v = QVBoxLayout(f); v.setContentsMargins(20, 16, 20, 18); v.setSpacing(10)
 
         title = QLabel("GPU"); title.setProperty("role", "cardTitle")
+        title_row = QHBoxLayout(); title_row.setSpacing(6); title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addWidget(title); title_row.addWidget(HelpBadge(*_GPU_HELP)); title_row.addStretch(1)
         self.gpu_name = QLabel("checking…"); self.gpu_name.setProperty("role", "cardValue")
 
         grid = QGridLayout(); grid.setHorizontalSpacing(42); grid.setVerticalSpacing(2)
@@ -300,7 +333,7 @@ class DashboardView(QWidget):
             grid.addWidget(cap, 0, col)
             grid.addWidget(val, 1, col)
 
-        v.addWidget(title); v.addWidget(self.gpu_name); v.addLayout(grid)
+        v.addLayout(title_row); v.addWidget(self.gpu_name); v.addLayout(grid)
         return f
 
     # ---- update ----

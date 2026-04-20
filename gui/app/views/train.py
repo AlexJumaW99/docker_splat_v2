@@ -23,7 +23,97 @@ from app import docker_service as dock
 from app.config import CONTAINER_NAME, DATA_DIR, VISER_PORT
 from app.jobs import JobManager, JobSpec
 from app.store import Project, ProjectStore
-from app.widgets import ProjectBar, card, pill, section_title, set_pill
+from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
+
+
+# ---------- help copy ----------
+_HELP = {
+    "dataset": (
+        "Processed dataset",
+        "The host-side folder containing the ns-process-data output for this "
+        "project. Inside the container it's bind-mounted read-only at "
+        "<code>/workspace/processed/&lt;project&gt;_splat/</code> and passed "
+        "to ns-train via <code>--data</code>. The marker file "
+        "(<code>transforms.json</code> for nerfstudio-data, "
+        "<code>cameras.bin</code> for colmap) is what gates training."
+    ),
+    "preset": (
+        "Training presets",
+        "Named snapshots of every field on this form, stored per-project in "
+        "<code>presets_train</code>. Switching presets overwrites the form; "
+        "use 'Save as preset\u2026' to capture the current values."
+    ),
+    "method": (
+        "Method",
+        "Which Nerfstudio model ns-train optimizes.<br><br>"
+        "<b>splatfacto</b> \u00b7 default 3D Gaussian Splatting recipe \u2014 fast, "
+        "quality scales with iterations.<br>"
+        "<b>splatfacto-big</b> \u00b7 higher gaussian budget; better detail, more "
+        "VRAM.<br>"
+        "<b>splatfacto-mcmc</b> \u00b7 MCMC-based densification; often "
+        "higher-quality but slower.<br>"
+        "<b>splatfacto-w / -w-light</b> \u00b7 variants tuned for in-the-wild "
+        "captures with variable exposure."
+    ),
+    "iters": (
+        "Max iterations",
+        "Total ns-train optimization steps.<br><br>"
+        "<b>1k\u20133k</b> \u00b7 quick smoke test \u2014 verify the data before committing.<br>"
+        "<b>7k</b> \u00b7 default \u2014 decent quality on most captures.<br>"
+        "<b>15k\u201330k</b> \u00b7 production quality; diminishing returns past "
+        "\u224830k for splatfacto."
+    ),
+    "save_step": (
+        "Steps per save",
+        "Interval between checkpoint dumps. Each checkpoint is a full "
+        ".ckpt under the run's <code>nerfstudio_models/</code> folder \u2014 "
+        "smaller values = more disk but finer-grained recovery if training "
+        "crashes. Default 2000 is a reasonable trade-off."
+    ),
+    "vis": (
+        "Visualization",
+        "Where training telemetry goes while ns-train runs.<br><br>"
+        "<b>viewer+tensorboard</b> \u00b7 default \u2014 live viser viewer on "
+        f":{VISER_PORT} <i>and</i> TB event files on disk.<br>"
+        "<b>viewer</b> \u00b7 viser only, no TB logs.<br>"
+        "<b>tensorboard</b> \u00b7 no live viewer (headless runs, lowest "
+        "overhead)."
+    ),
+    "quit_on_completion": (
+        "Quit viewer when training finishes",
+        "Passes <code>--viewer.quit-on-train-completion True</code>. By "
+        "default the viser server keeps running after the last iteration so "
+        "you can explore the scene; enable this for unattended / batch runs "
+        "so the process exits cleanly when done."
+    ),
+    "advanced_mode": (
+        "Advanced mode",
+        "Reveals the <b>Raw CLI flags</b> box at the bottom of the form. "
+        "Everything the GUI doesn't expose as a field goes there — any token "
+        "you type is appended verbatim to <code>ns-train</code> before the "
+        "dataparser subcommand. Leave off unless you have a specific flag "
+        "in mind; the defaults above are already sensible."
+    ),
+    "extra_flags": (
+        "Raw CLI flags",
+        "Appended verbatim to <code>ns-train</code> before the dataparser "
+        "subcommand. Use for model / pipeline flags the GUI doesn't "
+        "surface, e.g. <code>--pipeline.model.cull-alpha-thresh 0.005</code>. "
+        "Inspect full options with:<br>"
+        "<code>docker exec splat-ns-v2 ns-train splatfacto --help</code>"
+    ),
+    "output": (
+        "Output run",
+        "Host folder where ns-train writes this project's runs. Each "
+        "launch creates a new <code>&lt;method&gt;/&lt;timestamp&gt;/</code> "
+        "subfolder so concurrent or repeated runs never clobber each other."
+    ),
+}
+
+
+def _hb(key: str) -> HelpBadge:
+    title, body = _HELP[key]
+    return HelpBadge(title, body)
 
 
 # ---------- constants ----------
@@ -232,10 +322,15 @@ class _Form(QWidget):
         self.advanced_cb = QCheckBox("Advanced mode")
         self.advanced_cb.toggled.connect(self._on_advanced)
 
+        adv_row = QHBoxLayout(); adv_row.setSpacing(6); adv_row.setContentsMargins(0, 0, 0, 0)
+        adv_row.addWidget(self.advanced_cb)
+        adv_row.addWidget(_hb("advanced_mode"))
+        adv_wrap = QWidget(); adv_wrap.setLayout(adv_row)
+
         header_col = QVBoxLayout(); header_col.setSpacing(2)
         header_col.addWidget(title); header_col.addWidget(sub)
         header_row.addLayout(header_col, 1)
-        header_row.addWidget(self.advanced_cb, 0, Qt.AlignBottom | Qt.AlignRight)
+        header_row.addWidget(adv_wrap, 0, Qt.AlignBottom | Qt.AlignRight)
         bl.addLayout(header_row)
 
         bl.addWidget(self._dataset_card())
@@ -252,7 +347,12 @@ class _Form(QWidget):
         c = card()
         v = QVBoxLayout(c)
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
-        v.addWidget(section_title("DATASET"))
+        ds_hdr = QHBoxLayout(); ds_hdr.setSpacing(6); ds_hdr.setContentsMargins(0, 0, 0, 0)
+        ds_hdr.addWidget(section_title("DATASET"))
+        ds_hdr.addWidget(_hb("dataset"))
+        ds_hdr.addStretch(1)
+        ds_wrap = QWidget(); ds_wrap.setLayout(ds_hdr)
+        v.addWidget(ds_wrap)
 
         self.dataset_path = QLineEdit()
         self.dataset_path.setReadOnly(True)
@@ -284,6 +384,7 @@ class _Form(QWidget):
         self.save_preset_btn.clicked.connect(self._on_save_preset)
 
         top.addWidget(QLabel("Preset"))
+        top.addWidget(_hb("preset"))
         top.addWidget(self.preset_combo)
         top.addWidget(self.save_preset_btn)
         v.addLayout(top)
@@ -293,13 +394,13 @@ class _Form(QWidget):
         grid.setColumnStretch(1, 1)
 
         # Method
-        grid.addWidget(QLabel("Method"), 0, 0)
+        grid.addWidget(labeled("Method", *_HELP["method"]), 0, 0)
         self.method_combo = QComboBox()
         self.method_combo.addItems(METHODS)
         grid.addWidget(self.method_combo, 0, 1)
 
         # Max iterations
-        grid.addWidget(QLabel("Max iterations"), 1, 0)
+        grid.addWidget(labeled("Max iterations", *_HELP["iters"]), 1, 0)
         it_row = QHBoxLayout(); it_row.setSpacing(10)
         self.iters_slider = QSlider(Qt.Horizontal)
         self.iters_slider.setRange(1000, 30000)
@@ -317,7 +418,7 @@ class _Form(QWidget):
         grid.addWidget(it_wrap, 1, 1)
 
         # Steps per save
-        grid.addWidget(QLabel("Steps per save"), 2, 0)
+        grid.addWidget(labeled("Steps per save", *_HELP["save_step"]), 2, 0)
         self.save_step_spin = QSpinBox()
         self.save_step_spin.setRange(100, 10000)
         self.save_step_spin.setSingleStep(100)
@@ -327,14 +428,17 @@ class _Form(QWidget):
         grid.addWidget(ss_wrap, 2, 1)
 
         # Visualization
-        grid.addWidget(QLabel("Visualization"), 3, 0)
+        grid.addWidget(labeled("Visualization", *_HELP["vis"]), 3, 0)
         self.vis_combo = QComboBox()
         self.vis_combo.addItems(VIS_MODES)
         grid.addWidget(self.vis_combo, 3, 1)
 
         # Quit on completion
+        qc_row = QHBoxLayout(); qc_row.setSpacing(6); qc_row.setContentsMargins(0, 0, 0, 0)
         self.quit_on_completion_cb = QCheckBox("Quit viewer when training finishes")
-        grid.addWidget(self.quit_on_completion_cb, 4, 1)
+        qc_row.addWidget(self.quit_on_completion_cb); qc_row.addWidget(_hb("quit_on_completion")); qc_row.addStretch(1)
+        qc_wrap = QWidget(); qc_wrap.setLayout(qc_row)
+        grid.addWidget(qc_wrap, 4, 1)
 
         v.addLayout(grid)
 
@@ -344,8 +448,12 @@ class _Form(QWidget):
         av = QVBoxLayout(self.advanced_wrap)
         av.setContentsMargins(0, 8, 0, 0); av.setSpacing(8)
 
-        adv_title = section_title("ADVANCED · RAW CLI FLAGS")
-        av.addWidget(adv_title)
+        adv_hdr = QHBoxLayout(); adv_hdr.setSpacing(6); adv_hdr.setContentsMargins(0, 0, 0, 0)
+        adv_hdr.addWidget(section_title("ADVANCED · RAW CLI FLAGS"))
+        adv_hdr.addWidget(_hb("extra_flags"))
+        adv_hdr.addStretch(1)
+        adv_wrap = QWidget(); adv_wrap.setLayout(adv_hdr)
+        av.addWidget(adv_wrap)
 
         self.extra_flags_edit = QLineEdit()
         self.extra_flags_edit.setPlaceholderText(
@@ -370,7 +478,12 @@ class _Form(QWidget):
         c = card()
         v = QVBoxLayout(c)
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
-        v.addWidget(section_title("OUTPUT RUN"))
+        out_hdr = QHBoxLayout(); out_hdr.setSpacing(6); out_hdr.setContentsMargins(0, 0, 0, 0)
+        out_hdr.addWidget(section_title("OUTPUT RUN"))
+        out_hdr.addWidget(_hb("output"))
+        out_hdr.addStretch(1)
+        out_wrap = QWidget(); out_wrap.setLayout(out_hdr)
+        v.addWidget(out_wrap)
         self.output_lbl = QLineEdit()
         self.output_lbl.setReadOnly(True)
         self.output_lbl.setProperty("role", "readout")

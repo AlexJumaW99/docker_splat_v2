@@ -1,13 +1,13 @@
-"""Shared small widgets: cards, section titles, project bar, new-project dialog."""
+"""Shared small widgets: cards, section titles, help badges, project bar, new-project dialog."""
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from app.config import DATA_DIR
@@ -39,6 +39,85 @@ def set_pill(lbl: QLabel, text: str, kind: str) -> None:
     lbl.setText(text)
     lbl.setProperty("pill", kind)
     lbl.style().unpolish(lbl); lbl.style().polish(lbl)
+
+
+# ---------- help badge + popup ----------
+
+class HelpPopup(QFrame):
+    """Floating explanation popup anchored to a HelpBadge."""
+
+    def __init__(self, title: str, body: str, parent: QWidget | None = None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setObjectName("HelpPopup")
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setMinimumWidth(340)
+        self.setMaximumWidth(420)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(8)
+
+        t = QLabel(title)
+        t.setObjectName("HelpPopupTitle")
+        t.setWordWrap(True)
+
+        b = QLabel(body)
+        b.setObjectName("HelpPopupBody")
+        b.setWordWrap(True)
+        b.setTextFormat(Qt.RichText)
+
+        v.addWidget(t)
+        v.addWidget(b)
+
+
+class HelpBadge(QPushButton):
+    """Tiny circular '?' next to a setting. Click shows a HelpPopup below it."""
+
+    def __init__(self, title: str, body: str, parent: QWidget | None = None):
+        super().__init__("?", parent)
+        self.setProperty("role", "help")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setFlat(True)
+        self.setFixedSize(16, 16)
+        self.setToolTip("What does this do?")
+        self._title = title
+        self._body = body
+        self.clicked.connect(self._show_popup)
+
+    def _show_popup(self) -> None:
+        pop = HelpPopup(self._title, self._body, self.window())
+        global_pos = self.mapToGlobal(QPoint(0, self.height() + 6))
+        pop.adjustSize()
+        screen = self.screen().availableGeometry() if self.screen() else None
+        x, y = global_pos.x(), global_pos.y()
+        if screen is not None:
+            w = pop.sizeHint().width()
+            h = pop.sizeHint().height()
+            if x + w > screen.right() - 8:
+                x = screen.right() - w - 8
+            if x < screen.left() + 8:
+                x = screen.left() + 8
+            if y + h > screen.bottom() - 8:
+                # Flip above the badge.
+                y = self.mapToGlobal(QPoint(0, 0)).y() - h - 6
+        pop.move(x, y)
+        pop.show()
+
+
+def labeled(text: str, help_title: str | None = None, help_body: str | None = None) -> QWidget:
+    """A form-row label with an optional inline HelpBadge."""
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(6)
+    lbl = QLabel(text)
+    h.addWidget(lbl)
+    if help_title and help_body:
+        h.addWidget(HelpBadge(help_title, help_body))
+    h.addStretch(1)
+    w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+    return w
 
 
 # ---------- project bar ----------

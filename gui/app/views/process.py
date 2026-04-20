@@ -19,7 +19,181 @@ from app.config import CONTAINER_NAME, DATA_DIR
 from app.ffprobe import VideoInfo, probe
 from app.jobs import JobManager, JobSpec
 from app.store import Project, ProjectStore
-from app.widgets import ProjectBar, card, pill, section_title, set_pill
+from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
+
+
+# ---------- help copy ----------
+# Kept together so reviewers can audit the wording in one place. Each entry is
+# (title, html-body) and describes what the setting does + how its range
+# affects the downstream ns-process-data / COLMAP / ns-train pipeline.
+
+_HELP = {
+    "video": (
+        "Source video",
+        "The raw footage ns-process-data will extract frames from.<br><br>"
+        "<b>Must live inside</b> the <code>data/</code> folder — that's the only "
+        "path bind-mounted into the container. Steady handheld or drone orbits "
+        "with plenty of overlap give the best reconstructions; fast shakes or "
+        "rolling-shutter artifacts weaken COLMAP's feature matching."
+    ),
+    "preset": (
+        "Parameter presets",
+        "Save the current form values under a name, then recall them later for "
+        "this same project. Useful when you're iterating on a single scene and "
+        "want to try two or three parameter combinations without re-typing them. "
+        "Switching presets overwrites all fields on the form."
+    ),
+    "frames": (
+        "Target frames",
+        "How many frames ns-process-data will evenly sample from the video.<br><br>"
+        "<b>50–150</b> · fastest COLMAP, OK for short orbits with wide overlap.<br>"
+        "<b>200–300</b> · balanced default for most handheld / drone clips.<br>"
+        "<b>300–500</b> · denser coverage, slower COLMAP, better for long paths "
+        "or fine detail.<br><br>"
+        "More frames → longer feature-matching + bundle-adjust, but more "
+        "supervision during training."
+    ),
+    "matching": (
+        "Matching method",
+        "How COLMAP decides which frame pairs to feature-match.<br><br>"
+        "<b>sequential</b> · matches each frame to its neighbors in time. "
+        "Fastest, assumes a roughly ordered video — correct default for "
+        "continuous captures.<br>"
+        "<b>vocab_tree</b> · uses a pretrained visual vocabulary to find loop "
+        "closures. Slower, but recovers when the video revisits the same "
+        "viewpoint.<br>"
+        "<b>exhaustive</b> · matches every pair. Only use on tiny captures "
+        "(&lt;100 frames); cost is O(N²)."
+    ),
+    "downscales": (
+        "Downscale levels",
+        "Number of half-resolution mipmap levels Nerfstudio writes alongside "
+        "the full-size images.<br><br>"
+        "<b>0</b> · full resolution only (fastest processing).<br>"
+        "<b>3</b> · default — 1/2, 1/4, 1/8 levels available for multi-scale "
+        "training.<br>"
+        "<b>5</b> · adds 1/16, 1/32 — useful if you plan to train at "
+        "deliberately low resolution to save memory."
+    ),
+    "verbose": (
+        "Verbose output",
+        "Enables <code>--verbose</code> on ns-process-data. Prints COLMAP's "
+        "per-stage progress and the full feature-matching / mapper output to "
+        "the log drawer. Leave on while you're still dialing in a scene; "
+        "turn off once the pipeline is reliable."
+    ),
+    "camera_type": (
+        "Camera type",
+        "Lens model COLMAP calibrates against.<br><br>"
+        "<b>perspective</b> · default pinhole + radial distortion. Use for "
+        "most phone / DSLR / drone footage.<br>"
+        "<b>fisheye</b> · wide-FOV lenses (GoPro, action cams).<br>"
+        "<b>equirectangular</b> · 360° video; samples virtual perspective "
+        "views from each frame.<br>"
+        "<b>pinhole / simple_pinhole</b> · simpler calibrations when "
+        "distortion is already removed."
+    ),
+    "crop": (
+        "Crop factor (Top Bottom Left Right)",
+        "Fraction of each edge to trim from every frame before COLMAP sees "
+        "it. Values are 0.00–1.00.<br><br>"
+        "<b>0.00</b> · no cropping (default).<br>"
+        "<b>0.05–0.15</b> · removes dashboards, rig, timestamp overlays, or "
+        "rolling-shutter artifacts at the edges.<br>"
+        "<b>&gt; 0.3</b> · rarely useful; you'll throw away most of the image."
+    ),
+    "radius_crop": (
+        "Circle-mask radius",
+        "Fraction of the frame diagonal kept inside a circular mask. "
+        "Pixels outside the circle are ignored.<br><br>"
+        "<b>1.00</b> · no mask (default).<br>"
+        "<b>0.85–0.95</b> · hides the vignetted / blurred corners typical of "
+        "fisheye or ultra-wide lenses.<br>"
+        "<b>&lt; 0.7</b> · very aggressive; keep only the sharp center."
+    ),
+    "equirect_samples": (
+        "Frames per equirectangular view",
+        "For 360° video, how many virtual perspective crops to sample from "
+        "each source frame. ns-process-data only accepts 8 or 14.<br><br>"
+        "<b>8</b> · 8 views per frame — default, lower feature-match cost.<br>"
+        "<b>14</b> · denser sampling — stronger reconstruction, slower COLMAP."
+    ),
+    "refine_intrinsics": (
+        "Refine intrinsics",
+        "Lets COLMAP's bundle adjuster tweak focal length and distortion "
+        "during optimization. <b>Recommended on</b> for any uncalibrated "
+        "camera. Turn off only when you've measured the intrinsics yourself "
+        "and want COLMAP to trust them verbatim."
+    ),
+    "same_dimensions": (
+        "All frames same dimensions",
+        "Tells COLMAP every extracted image shares the same width/height, "
+        "so it can skip per-image metadata reads during feature matching. "
+        "Leave on for video-sourced datasets — ns-process-data resizes every "
+        "frame identically. Turn off only if you're feeding a mixed folder."
+    ),
+    "no_gpu": (
+        "Disable GPU SIFT",
+        "Forces COLMAP to run feature extraction on the CPU. A diagnostic "
+        "switch — <b>much slower</b> (often 10–30×). Only enable to rule out "
+        "a CUDA / driver issue when GPU SIFT crashes or produces empty "
+        "feature sets."
+    ),
+    "seed": (
+        "Train frame-selection seed",
+        "Integer seed for the random subsample that picks train frames out "
+        "of the video. <b>Leave as 'random'</b> for normal use. Set a fixed "
+        "value when you need bit-for-bit reproducibility between runs on the "
+        "same video."
+    ),
+    "eval_seed": (
+        "Eval frame-selection seed",
+        "Seed for the held-out eval split. Same guidance as the train seed: "
+        "fix only when you need identical train/eval splits across runs."
+    ),
+    "use_sfm_depth": (
+        "Export SfM depth maps",
+        "Writes COLMAP's sparse 3D points as per-frame depth maps next to "
+        "the images. Adds 10–30 s per frame during processing and extra disk "
+        "space. Useful when you plan to train with a depth-supervised "
+        "method; ignored by vanilla splatfacto."
+    ),
+    "eval_video": (
+        "Eval video (optional)",
+        "A second video processed alongside the main one and held out from "
+        "training — used to compute PSNR / SSIM on unseen viewpoints. "
+        "Must live inside <code>data/</code>. Leave empty to let "
+        "ns-process-data pick eval frames from the main video instead."
+    ),
+    "advanced_mode": (
+        "Advanced mode",
+        "Expands the form to show COLMAP-level controls: camera model, "
+        "edge / circle cropping, equirect samples, intrinsic refinement, "
+        "GPU-SIFT toggles, seeds, SfM depth, and the raw-CLI-flags escape "
+        "hatch. Leave off for typical video captures — the defaults are "
+        "already tuned for handheld / drone footage."
+    ),
+    "extra_flags_proc": (
+        "Raw CLI flags",
+        "Appended verbatim to <code>ns-process-data</code> after every "
+        "structured flag above. Use it when the GUI doesn't expose a flag "
+        "you need. Anything you type here overrides the fields above if it "
+        "names the same flag. Inspect the full option list with:<br>"
+        "<code>docker exec splat-ns-v2 ns-process-data video --help</code>"
+    ),
+    "output": (
+        "Output dataset",
+        "Where the processed dataset lands on the host. This is automatically "
+        "placed under <code>data/processed/&lt;project&gt;_splat/</code>. "
+        "The container sees it as <code>/workspace/processed/…</code>; "
+        "ns-train will read from the container-side path."
+    ),
+}
+
+
+def _hb(key: str) -> HelpBadge:
+    title, body = _HELP[key]
+    return HelpBadge(title, body)
 
 
 # ---------- helpers ----------
@@ -197,10 +371,15 @@ class _Form(QWidget):
         self.advanced_cb = QCheckBox("Advanced mode")
         self.advanced_cb.toggled.connect(self._on_advanced)
 
+        adv_row = QHBoxLayout(); adv_row.setSpacing(6); adv_row.setContentsMargins(0, 0, 0, 0)
+        adv_row.addWidget(self.advanced_cb)
+        adv_row.addWidget(_hb("advanced_mode"))
+        adv_wrap = QWidget(); adv_wrap.setLayout(adv_row)
+
         header_col = QVBoxLayout(); header_col.setSpacing(2)
         header_col.addWidget(title); header_col.addWidget(sub)
         header_row.addLayout(header_col, 1)
-        header_row.addWidget(self.advanced_cb, 0, Qt.AlignBottom | Qt.AlignRight)
+        header_row.addWidget(adv_wrap, 0, Qt.AlignBottom | Qt.AlignRight)
         bl.addLayout(header_row)
 
         bl.addWidget(self._video_card())
@@ -223,6 +402,7 @@ class _Form(QWidget):
         self.video_path_edit = QLineEdit()
         self.video_path_edit.setReadOnly(True)
         self.video_path_edit.setProperty("role", "readout")
+        row.addWidget(_hb("video"))
         self.browse_btn = QPushButton("Browse…")
         self.browse_btn.setProperty("role", "secondary")
         self.browse_btn.setCursor(Qt.PointingHandCursor)
@@ -256,6 +436,7 @@ class _Form(QWidget):
         self.save_preset_btn.clicked.connect(self._on_save_preset)
 
         top.addWidget(QLabel("Preset"))
+        top.addWidget(_hb("preset"))
         top.addWidget(self.preset_combo)
         top.addWidget(self.save_preset_btn)
         v.addLayout(top)
@@ -265,7 +446,7 @@ class _Form(QWidget):
         grid.setColumnStretch(1, 1)
 
         # Target frames
-        grid.addWidget(QLabel("Target frames"), 0, 0)
+        grid.addWidget(labeled("Target frames", *_HELP["frames"]), 0, 0)
         frames_row = QHBoxLayout(); frames_row.setSpacing(10)
         self.frames_slider = QSlider(Qt.Horizontal)
         self.frames_slider.setRange(50, 500); self.frames_slider.setSingleStep(10)
@@ -281,13 +462,13 @@ class _Form(QWidget):
         grid.addWidget(w, 0, 1)
 
         # Matching method
-        grid.addWidget(QLabel("Matching method"), 1, 0)
+        grid.addWidget(labeled("Matching method", *_HELP["matching"]), 1, 0)
         self.method_combo = QComboBox()
         self.method_combo.addItems(MATCH_METHODS)
         grid.addWidget(self.method_combo, 1, 1)
 
         # Downscale levels
-        grid.addWidget(QLabel("Downscale levels"), 2, 0)
+        grid.addWidget(labeled("Downscale levels", *_HELP["downscales"]), 2, 0)
         self.downscales_spin = QSpinBox()
         self.downscales_spin.setRange(0, 5)
         self.downscales_spin.setMaximumWidth(80)
@@ -296,8 +477,13 @@ class _Form(QWidget):
         grid.addWidget(ds_wrap, 2, 1)
 
         # Verbose
+        verbose_row = QHBoxLayout(); verbose_row.setSpacing(6); verbose_row.setContentsMargins(0, 0, 0, 0)
         self.verbose_cb = QCheckBox("Verbose output")
-        grid.addWidget(self.verbose_cb, 3, 1)
+        verbose_row.addWidget(self.verbose_cb)
+        verbose_row.addWidget(_hb("verbose"))
+        verbose_row.addStretch(1)
+        vw = QWidget(); vw.setLayout(verbose_row)
+        grid.addWidget(vw, 3, 1)
 
         v.addLayout(grid)
 
@@ -332,14 +518,14 @@ class _Form(QWidget):
         g.setColumnStretch(1, 1)
 
         # Camera type
-        g.addWidget(QLabel("Camera type"), 0, 0)
+        g.addWidget(labeled("Camera type", *_HELP["camera_type"]), 0, 0)
         self.camera_type_combo = QComboBox()
         self.camera_type_combo.addItems(CAMERA_TYPES)
         self.camera_type_combo.currentTextChanged.connect(self._on_camera_type_changed)
         g.addWidget(self.camera_type_combo, 0, 1)
 
         # Crop factor (top / bottom / left / right)
-        g.addWidget(QLabel("Crop (T B L R)"), 1, 0)
+        g.addWidget(labeled("Crop (T B L R)", *_HELP["crop"]), 1, 0)
         crop_row = QHBoxLayout(); crop_row.setSpacing(6)
         self.crop_spins = []
         for _ in range(4):
@@ -353,7 +539,7 @@ class _Form(QWidget):
         g.addWidget(crop_wrap, 1, 1)
 
         # Circle-mask radius
-        g.addWidget(QLabel("Circle-mask radius"), 2, 0)
+        g.addWidget(labeled("Circle-mask radius", *_HELP["radius_crop"]), 2, 0)
         self.radius_crop_spin = QDoubleSpinBox()
         self.radius_crop_spin.setRange(0.0, 1.0)
         self.radius_crop_spin.setSingleStep(0.05); self.radius_crop_spin.setDecimals(2)
@@ -363,7 +549,7 @@ class _Form(QWidget):
         g.addWidget(rc_wrap, 2, 1)
 
         # Equirect samples — visible only for camera-type=equirectangular.
-        self.equirect_lbl = QLabel("Frames per equirect view")
+        self.equirect_lbl = labeled("Frames per equirect view", *_HELP["equirect_samples"])
         self.equirect_combo = QComboBox()
         self.equirect_combo.addItems([str(n) for n in EQUIRECT_SAMPLES])
         self.equirect_lbl.hide(); self.equirect_combo.hide()
@@ -392,18 +578,23 @@ class _Form(QWidget):
         g.setHorizontalSpacing(14); g.setVerticalSpacing(10)
         g.setColumnStretch(1, 1)
 
+        def _cb_row(cb: QCheckBox, help_key: str) -> QWidget:
+            r = QHBoxLayout(); r.setSpacing(6); r.setContentsMargins(0, 0, 0, 0)
+            r.addWidget(cb); r.addWidget(_hb(help_key)); r.addStretch(1)
+            w = QWidget(); w.setLayout(r); return w
+
         self.refine_intrinsics_cb = QCheckBox("Refine intrinsics (recommended)")
-        g.addWidget(self.refine_intrinsics_cb, 0, 0, 1, 2)
+        g.addWidget(_cb_row(self.refine_intrinsics_cb, "refine_intrinsics"), 0, 0, 1, 2)
 
         self.same_dimensions_cb = QCheckBox("All frames are same dimensions (faster)")
-        g.addWidget(self.same_dimensions_cb, 1, 0, 1, 2)
+        g.addWidget(_cb_row(self.same_dimensions_cb, "same_dimensions"), 1, 0, 1, 2)
 
         self.no_gpu_cb = QCheckBox("Disable GPU SIFT (diagnostic — much slower)")
-        g.addWidget(self.no_gpu_cb, 2, 0, 1, 2)
+        g.addWidget(_cb_row(self.no_gpu_cb, "no_gpu"), 2, 0, 1, 2)
 
         # Reproducibility seeds. -1 displays as "random" via setSpecialValueText
         # and is the signal that we shouldn't emit the corresponding flag.
-        g.addWidget(QLabel("Train frame-selection seed"), 3, 0)
+        g.addWidget(labeled("Train frame-selection seed", *_HELP["seed"]), 3, 0)
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(SEED_RANDOM, 2_147_483_647)
         self.seed_spin.setSpecialValueText("random")
@@ -412,7 +603,7 @@ class _Form(QWidget):
         seed_wrap = QWidget(); seed_wrap.setLayout(seed_row)
         g.addWidget(seed_wrap, 3, 1)
 
-        g.addWidget(QLabel("Eval frame-selection seed"), 4, 0)
+        g.addWidget(labeled("Eval frame-selection seed", *_HELP["eval_seed"]), 4, 0)
         self.eval_seed_spin = QSpinBox()
         self.eval_seed_spin.setRange(SEED_RANDOM, 2_147_483_647)
         self.eval_seed_spin.setSpecialValueText("random")
@@ -431,11 +622,14 @@ class _Form(QWidget):
         sv.setContentsMargins(14, 12, 14, 14); sv.setSpacing(10)
         sv.addWidget(section_title("EXTRAS"))
 
+        sfm_row = QHBoxLayout(); sfm_row.setSpacing(6); sfm_row.setContentsMargins(0, 0, 0, 0)
         self.use_sfm_depth_cb = QCheckBox("Export SfM depth maps")
-        sv.addWidget(self.use_sfm_depth_cb)
+        sfm_row.addWidget(self.use_sfm_depth_cb); sfm_row.addWidget(_hb("use_sfm_depth")); sfm_row.addStretch(1)
+        sfm_wrap = QWidget(); sfm_wrap.setLayout(sfm_row)
+        sv.addWidget(sfm_wrap)
 
         # Eval video picker (optional). Stored as host path; converted at run time.
-        sv.addWidget(QLabel("Eval video (optional)"))
+        sv.addWidget(labeled("Eval video (optional)", *_HELP["eval_video"]))
         eval_row = QHBoxLayout(); eval_row.setSpacing(8)
         self.eval_video_edit = QLineEdit()
         self.eval_video_edit.setReadOnly(True)
@@ -468,7 +662,12 @@ class _Form(QWidget):
         sc.setProperty("role", "subcard")
         sv = QVBoxLayout(sc)
         sv.setContentsMargins(14, 12, 14, 14); sv.setSpacing(8)
-        sv.addWidget(section_title("RAW CLI FLAGS"))
+        raw_hdr = QHBoxLayout(); raw_hdr.setSpacing(6); raw_hdr.setContentsMargins(0, 0, 0, 0)
+        raw_hdr.addWidget(section_title("RAW CLI FLAGS"))
+        raw_hdr.addWidget(_hb("extra_flags_proc"))
+        raw_hdr.addStretch(1)
+        raw_wrap = QWidget(); raw_wrap.setLayout(raw_hdr)
+        sv.addWidget(raw_wrap)
 
         self.extra_flags_edit = QLineEdit()
         self.extra_flags_edit.setPlaceholderText(
@@ -517,7 +716,12 @@ class _Form(QWidget):
         c = card()
         v = QVBoxLayout(c)
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
-        v.addWidget(section_title("OUTPUT DATASET"))
+        out_hdr = QHBoxLayout(); out_hdr.setSpacing(6); out_hdr.setContentsMargins(0, 0, 0, 0)
+        out_hdr.addWidget(section_title("OUTPUT DATASET"))
+        out_hdr.addWidget(_hb("output"))
+        out_hdr.addStretch(1)
+        out_wrap = QWidget(); out_wrap.setLayout(out_hdr)
+        v.addWidget(out_wrap)
         self.output_lbl = QLineEdit()
         self.output_lbl.setReadOnly(True)
         self.output_lbl.setProperty("role", "readout")

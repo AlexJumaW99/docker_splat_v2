@@ -31,7 +31,45 @@ from app import docker_service as dock
 from app.config import CONTAINER_NAME, DATA_DIR
 from app.jobs import JobManager, JobSpec
 from app.store import Project, ProjectStore
-from app.widgets import ProjectBar, card, pill, section_title, set_pill
+from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
+
+
+_HELP = {
+    "run": (
+        "Training run",
+        "A finished ns-train run under "
+        "<code>data/outputs/&lt;project&gt;/&lt;method&gt;/&lt;timestamp&gt;/</code>. "
+        "Each run has its own <code>config.yml</code> + checkpoints; pick the "
+        "run you want to export a .ply from or render a video of. Latest "
+        "runs appear first."
+    ),
+    "ply_name": (
+        "Export filename",
+        "Name for the exported <code>.ply</code> under "
+        "<code>data/exports/splat/</code>. Don't include the extension. "
+        "If the name already exists, the GUI appends <code>_2</code>, "
+        "<code>_3</code>\u2026 automatically \u2014 nothing is ever overwritten."
+    ),
+    "camera_path": (
+        "Camera path",
+        "A keyframe path saved from viser's keyframe editor, stored as "
+        "<code>&lt;processed_dir&gt;/camera_paths/*.json</code>. Open the run "
+        "in viser, build a path, click <b>Save</b>, then hit \u21bb here to "
+        "rescan. The render uses the path's keyframes + easing verbatim."
+    ),
+    "video_name": (
+        "Render filename",
+        "Name for the rendered <code>.mp4</code> under "
+        "<code>data/renders/&lt;project&gt;/</code>. Don't include the "
+        "extension; duplicates auto-suffix with <code>_2</code>, "
+        "<code>_3</code>\u2026 so nothing is overwritten."
+    ),
+}
+
+
+def _hb(key: str) -> HelpBadge:
+    title, body = _HELP[key]
+    return HelpBadge(title, body)
 
 
 OUTPUTS_DIR = DATA_DIR / "outputs"
@@ -306,7 +344,12 @@ class _Form(QWidget):
         c = card()
         v = QVBoxLayout(c)
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
-        v.addWidget(section_title("TRAINING RUN"))
+        run_hdr = QHBoxLayout(); run_hdr.setSpacing(6); run_hdr.setContentsMargins(0, 0, 0, 0)
+        run_hdr.addWidget(section_title("TRAINING RUN"))
+        run_hdr.addWidget(_hb("run"))
+        run_hdr.addStretch(1)
+        run_wrap = QWidget(); run_wrap.setLayout(run_hdr)
+        v.addWidget(run_wrap)
 
         row = QHBoxLayout(); row.setSpacing(10)
         self.run_combo = QComboBox()
@@ -337,7 +380,12 @@ class _Form(QWidget):
         c = card()
         v = QVBoxLayout(c)
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
-        v.addWidget(section_title("EXPORT .PLY"))
+        ply_hdr = QHBoxLayout(); ply_hdr.setSpacing(6); ply_hdr.setContentsMargins(0, 0, 0, 0)
+        ply_hdr.addWidget(section_title("EXPORT .PLY"))
+        ply_hdr.addWidget(_hb("ply_name"))
+        ply_hdr.addStretch(1)
+        ply_wrap = QWidget(); ply_wrap.setLayout(ply_hdr)
+        v.addWidget(ply_wrap)
 
         name_row = QHBoxLayout(); name_row.setSpacing(8)
         self.ply_name_edit = QLineEdit()
@@ -374,7 +422,12 @@ class _Form(QWidget):
         c = card()
         v = QVBoxLayout(c)
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
-        v.addWidget(section_title("RENDER VIDEO"))
+        vid_hdr = QHBoxLayout(); vid_hdr.setSpacing(6); vid_hdr.setContentsMargins(0, 0, 0, 0)
+        vid_hdr.addWidget(section_title("RENDER VIDEO"))
+        vid_hdr.addWidget(_hb("camera_path"))
+        vid_hdr.addStretch(1)
+        vid_wrap = QWidget(); vid_wrap.setLayout(vid_hdr)
+        v.addWidget(vid_wrap)
 
         cp_row = QHBoxLayout(); cp_row.setSpacing(8)
         self.cp_combo = QComboBox()

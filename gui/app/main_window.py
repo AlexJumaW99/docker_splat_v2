@@ -90,7 +90,9 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
 
         title = QLabel("docker_splat", objectName="AppTitle")
+        subtitle = QLabel("NERFSTUDIO GUI", objectName="AppTitleSub")
         v.addWidget(title)
+        v.addWidget(subtitle)
 
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
