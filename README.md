@@ -104,7 +104,7 @@ For detailed workflow, troubleshooting, and export instructions, see **[USER_GUI
 
 ### 4. Optional: desktop GUI
 
-A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, and an **Exports tab** for PLY export and camera-path video rendering.
+A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, and an **Exports tab** for PLY export (auto-routed to the splatfacto-w-aware exporter when applicable) and camera-path video rendering.
 
 ```bash
 cd gui && ./run.sh
@@ -166,8 +166,9 @@ Three non-obvious issues you'd hit trying to build this yourself:
 | Nerfstudio `ns-process-data video` fails with `unrecognised option '--SiftExtraction.use_gpu'` | COLMAP renamed SIFT-specific GPU flags to generic `FeatureExtraction.use_gpu` when ALIKED support was added | `sed` patch applied to nerfstudio's `colmap_utils.py` in Stage 5 |
 | `PYTORCH_CUDA_ALLOC_CONF` warning on every invocation | Env var renamed to `PYTORCH_ALLOC_CONF` in PyTorch 2.10 | Use the new name in the `docker run` / `docker create` command |
 | `ns-train` fails to resume from checkpoints with `_pickle.UnpicklingError: Weights only load failed` | PyTorch 2.6 flipped `torch.load`'s `weights_only` default to `True`; nerfstudio's checkpoints include non-tensor state and fail the new safety check | `sed` patch in Stage 5 pins `weights_only=False` in nerfstudio's loader |
+| `ns-export gaussian-splat` crashes with `AssertionError` on splatfacto-w runs | Upstream exporter hard-asserts `isinstance(pipeline.model, SplatfactoModel)`, but `SplatfactoWModel` inherits from `Model` directly — and splatfacto-w computes SH coefficients per-frame from an appearance MLP rather than storing them as tensors | Image ships a custom `ns-export-splatfactow` CLI that bakes one appearance embedding (average of training cameras by default) into per-gaussian SH coefficients and writes an inria-format `.ply` with the same layout as `ns-export gaussian-splat`. The GUI Exports tab auto-routes to it for splatfacto-w/-light. |
 
-All four are baked into the v3.2 Dockerfile and the documented `docker create` command.
+All five are baked into the Dockerfile and the documented `docker create` command.
 
 ---
 
@@ -181,6 +182,7 @@ All four are baked into the v3.2 Dockerfile and the documented `docker create` c
 | gsplat rasterization on `cuda:0` | ✅ Verified — `RASTERIZATION SUCCESS` smoke test |
 | Nerfstudio CLI available | ✅ Built-in methods including splatfacto, splatfacto-big, splatfacto-mcmc |
 | External method: splatfacto-w | ✅ Registers `splatfacto-w` + `splatfacto-w-light` via nerfstudio entry points |
+| `.ply` export for splatfacto-w / -light | ✅ Custom `ns-export-splatfactow` CLI baked into the image; GUI routes automatically |
 | `ns-process-data video` end-to-end | ✅ 98.12% pose recovery on test video |
 | `ns-train splatfacto` full training | ✅ 7000 iterations, ~84M gaussians, ~15 min |
 | Viser viewer reachable from host | ✅ Port 7007 bridged, scene renders live |

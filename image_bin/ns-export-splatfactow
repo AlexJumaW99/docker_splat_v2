@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""
+ns-export-splatfactow — export a splatfacto-w / splatfacto-w-light checkpoint
+as an inria-format .ply.
+
+Upstream `ns-export gaussian-splat` hard-asserts pipeline.model is a
+SplatfactoModel. splatfacto-w's SplatfactoWModel inherits from Model directly,
+so that assertion trips before any .ply is written. splatfacto-w also does not
+store spherical-harmonic coefficients as trainable parameters — it stores a
+per-gaussian `appearance_features` vector and a per-training-image embedding,
+and computes SH coefficients on the fly via a small MLP (`color_nn`) at render
+time.
+
+To produce a static .ply that downstream 3DGS viewers can consume, we pick one
+appearance embedding (average over all training images by default) and bake
+the resulting SH coefficients into each gaussian. The output layout matches
+nerfstudio's ExportGaussianSplat exactly:
+
+  x y z | nx ny nz | f_dc_{0..2} | f_rest_{0..3*(K-1)-1} | opacity | scale_{0..2} | rot_{0..3}
+
+where K = (sh_degree + 1)**2.
+"""
+from __future__ import annotations
+
+import sys
+from collections import OrderedDict
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
+import torch
+import tyro
+
+from nerfstudio.scripts.exporter import ExportGaussianSplat
+from nerfstudio.utils.eval_utils import eval_setup
+from splatfactow.splatfactow_model import SplatfactoWModel
+
+
+def _pick_embedding(
+    model: SplatfactoWModel,
+    mode: Literal["avg", "first", "camera"],
+    camera_idx: int,
+) -> torch.Tensor:
+    w = model.appearance_embeds.weight  # (num_train_cameras, embed_dim)
+    if mode == "avg":
+        return w.mean(dim=0)
+    if mode == "first":
+        return w[0]
+    if mode == "camera":
+        if not (0 <= camera_idx < w.shape[0]):
+            raise SystemExit(
+                f"--camera-idx {camera_idx} out of range [0, {w.shape[0]})"
+            )
+        return w[camera_idx]
+    raise AssertionError(mode)
+
+
+def main(
+    load_config: Path,
+    output_dir: Path = Path("exports/splat"),
+    output_filename: str = "splat.ply",
+    appearance_mode: Literal["avg", "first", "camera"] = "avg",
+    camera_idx: int = 0,
+) -> None:
+    """Export a splatfacto-w / splatfacto-w-light checkpoint to .ply.
+
+    Args:
+        load_config: Path to the run's config.yml.
+        output_dir: Directory to write `output_filename` into; created if missing.
+        output_filename: Name of the .ply file to write.
+        appearance_mode: Which appearance embedding to bake in.
+            avg    — mean of all training embeddings (stable, default).
+            first  — training-camera index 0.
+            camera — training-camera at --camera-idx.
+        camera_idx: Only used when appearance_mode="camera".
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _, pipeline, _, _ = eval_setup(load_config, test_mode="inference")
+    model = pipeline.model
+    if not isinstance(model, SplatfactoWModel):
+        raise SystemExit(
+            f"Expected SplatfactoWModel, got {type(model).__name__}. "
+            "For built-in splatfacto methods use `ns-export gaussian-splat`."
+        )
+
+    sh_degree = int(model.config.sh_degree)
+    sh_dim = (sh_degree + 1) ** 2
+    map_to_tensors: OrderedDict[str, np.ndarray] = OrderedDict()
+
+    with torch.no_grad():
+        positions = model.means.detach().cpu().numpy().astype(np.float32)
+        n = positions.shape[0]
+        map_to_tensors["x"] = positions[:, 0].copy()
+        map_to_tensors["y"] = positions[:, 1].copy()
+        map_to_tensors["z"] = positions[:, 2].copy()
+        map_to_tensors["nx"] = np.zeros(n, dtype=np.float32)
+        map_to_tensors["ny"] = np.zeros(n, dtype=np.float32)
+        map_to_tensors["nz"] = np.zeros(n, dtype=np.float32)
+
+        device = model.device
+        appearance_features = model.appearance_features
+        embed = _pick_embedding(model, appearance_mode, camera_idx).to(device)
+        embed_rep = embed.unsqueeze(0).expand(n, -1)
+
+        shs_0 = (
+            model.color_nn.shs_0(
+                appearance_embed=embed_rep,
+                appearance_features=appearance_features,
+            )
+            .contiguous()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+        for i in range(3):
+            map_to_tensors[f"f_dc_{i}"] = shs_0[:, i].copy()
+
+        if sh_degree > 0:
+            shs_rest = model.color_nn.shs_rest(
+                appearance_embed=embed_rep,
+                appearance_features=appearance_features,
+            )  # (N, sh_dim - 1, 3)
+            # Match nerfstudio's inria layout: transpose (1,2) then flatten so
+            # all R coefficients come first, then G, then B.
+            shs_rest = (
+                shs_rest.transpose(1, 2)
+                .contiguous()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+                .reshape(n, -1)
+            )
+            for i in range(shs_rest.shape[-1]):
+                map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i].copy()
+
+        opacities = (
+            model.opacities.detach().cpu().numpy().astype(np.float32).reshape(n)
+        )
+        map_to_tensors["opacity"] = opacities
+
+        scales = model.scales.detach().cpu().numpy().astype(np.float32)
+        for i in range(3):
+            map_to_tensors[f"scale_{i}"] = scales[:, i].copy()
+
+        quats = model.quats.detach().cpu().numpy().astype(np.float32)
+        for i in range(4):
+            map_to_tensors[f"rot_{i}"] = quats[:, i].copy()
+
+    select = np.ones(n, dtype=bool)
+    for t in map_to_tensors.values():
+        finite = np.isfinite(t)
+        if finite.ndim > 1:
+            finite = finite.all(axis=-1)
+        select &= finite
+    nan_drop = n - int(select.sum())
+
+    # logit(1/255) ≈ -5.5373 — mirrors ns-export's cutoff for gaussians the
+    # rasterizer would skip anyway.
+    low_opa = map_to_tensors["opacity"] < -5.5373
+    low_drop = int(low_opa.sum())
+    select &= ~low_opa
+    kept = int(select.sum())
+
+    if kept < n:
+        print(
+            f"Dropped {nan_drop} NaN/Inf and {low_drop} low-opacity gaussians; "
+            f"keeping {kept}/{n}.",
+            file=sys.stderr,
+        )
+        for k in list(map_to_tensors.keys()):
+            map_to_tensors[k] = map_to_tensors[k][select]
+
+    filename = output_dir / output_filename
+    ExportGaussianSplat.write_ply(str(filename), kept, map_to_tensors)
+    print(
+        f"Wrote {filename}  ({kept} gaussians, sh_degree={sh_degree}, "
+        f"appearance_mode={appearance_mode}, sh_dim={sh_dim})"
+    )
+
+
+def entrypoint() -> None:
+    tyro.cli(main)
+
+
+if __name__ == "__main__":
+    entrypoint()

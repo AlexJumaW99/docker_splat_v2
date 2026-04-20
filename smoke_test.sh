@@ -371,6 +371,29 @@ for f in "${wo_files[@]}"; do
 done
 
 # ============================================================================
+# 15. ns-export-splatfactow (custom PLY exporter for splatfacto-w/-light)
+# ============================================================================
+section "15. ns-export-splatfactow CLI"
+
+if dexec which ns-export-splatfactow > /dev/null 2>&1; then
+    pass "ns-export-splatfactow on PATH"
+else
+    fail "ns-export-splatfactow on PATH" "custom exporter missing — was image_bin/ copied in the Dockerfile?"
+fi
+
+# --help loads the script + its imports (nerfstudio.scripts.exporter,
+# splatfactow.splatfactow_model). Catches import-time regressions before
+# anyone tries a real export.
+help_out=$(dexec ns-export-splatfactow --help 2>&1)
+echo "$help_out" | grep -q 'ns-export-splatfactow \[-h\]' \
+    && pass "ns-export-splatfactow --help loads (imports clean)" \
+    || fail "ns-export-splatfactow --help" "$(echo "$help_out" | tail -5)"
+
+echo "$help_out" | grep -q '\-\-appearance-mode' \
+    && pass "ns-export-splatfactow exposes --appearance-mode" \
+    || fail "ns-export-splatfactow --appearance-mode flag" "flag missing from --help"
+
+# ============================================================================
 # Summary
 # ============================================================================
 section "Summary"

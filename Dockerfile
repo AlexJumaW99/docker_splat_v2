@@ -125,6 +125,15 @@ ARG SPLATFACTOW_COMMIT=119a3bfb3aa03669278e174ff11c4dfdcbcf97d7
 RUN pip install --no-cache-dir --no-deps \
         "splatfacto-w @ git+https://github.com/KevinXu02/splatfacto-w.git@${SPLATFACTOW_COMMIT}"
 
+# v4.1: splatfacto-w-aware .ply exporter. Upstream `ns-export gaussian-splat`
+# hard-asserts `isinstance(pipeline.model, SplatfactoModel)`; SplatfactoWModel
+# inherits from Model directly, and splatfacto-w stores SH coefficients as an
+# MLP over per-image appearance embeddings rather than as trainable tensors.
+# This script bakes one chosen embedding (average of training cameras by
+# default) into per-gaussian SH coefficients and writes an inria-format .ply.
+COPY image_bin/ns-export-splatfactow /usr/local/bin/ns-export-splatfactow
+RUN chmod +x /usr/local/bin/ns-export-splatfactow
+
 WORKDIR /workspace
 EXPOSE 7007 6006
 CMD ["/bin/bash"]

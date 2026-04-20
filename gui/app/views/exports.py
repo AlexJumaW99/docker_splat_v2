@@ -37,6 +37,13 @@ OUTPUTS_DIR = DATA_DIR / "outputs"
 EXPORTS_DIR = DATA_DIR / "exports" / "splat"
 RENDERS_DIR = DATA_DIR / "renders"
 
+# splatfacto-w / -light need a different exporter because SplatfactoWModel
+# doesn't subclass SplatfactoModel and computes SH coefficients per-frame
+# from a learned appearance embedding. The image ships a custom CLI
+# `ns-export-splatfactow` that bakes the average appearance embedding into
+# each gaussian and writes an inria-format .ply in the same splat.ply layout.
+_SPLATFACTOW_METHODS = frozenset({"splatfacto-w", "splatfacto-w-light"})
+
 
 # ---------- path helpers ----------
 
@@ -576,31 +583,47 @@ class _Form(QWidget):
         host_target = _unique_path(EXPORTS_DIR, stem, ".ply")
         final_name = host_target.name
 
-        # ns-export writes `splat.ply` into its --output-dir, so we export
-        # into a private tmp subdir and rename. A trap cleans the tmp on
-        # success, cancel, or error so nothing stale accumulates.
+        # Both exporters write `splat.ply` into their --output-dir, so we
+        # export into a private tmp subdir and rename. A trap cleans the tmp
+        # on success, cancel, or error so nothing stale accumulates.
         tmp_tag = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         c_exports = "/workspace/exports/splat"
         c_tmp = f"{c_exports}/.tmp_{tmp_tag}"
         c_final = f"{c_exports}/{final_name}"
         c_config = run.container_config
 
+        if run.method in _SPLATFACTOW_METHODS:
+            exporter_cmd = (
+                "ns-export-splatfactow "
+                f"--load-config {shlex.quote(c_config)} "
+                "--output-dir \"$TMP\""
+            )
+            display_cmd = (
+                f"ns-export-splatfactow "
+                f"--load-config {shlex.quote(c_config)} "
+                f"--output-dir {shlex.quote(c_exports)}"
+            )
+        else:
+            exporter_cmd = (
+                "ns-export gaussian-splat "
+                f"--load-config {shlex.quote(c_config)} "
+                "--output-dir \"$TMP\""
+            )
+            display_cmd = (
+                f"ns-export gaussian-splat "
+                f"--load-config {shlex.quote(c_config)} "
+                f"--output-dir {shlex.quote(c_exports)}"
+            )
+
         shell_cmd = (
             "set -e; "
             f"TMP={shlex.quote(c_tmp)}; "
             "trap 'rm -rf \"$TMP\"' EXIT; "
             f"mkdir -p {shlex.quote(c_exports)} \"$TMP\"; "
-            "ns-export gaussian-splat "
-            f"--load-config {shlex.quote(c_config)} "
-            "--output-dir \"$TMP\"; "
+            f"{exporter_cmd}; "
             f"mv \"$TMP/splat.ply\" {shlex.quote(c_final)}"
         )
-        display = (
-            f"docker exec {CONTAINER_NAME} ns-export gaussian-splat "
-            f"--load-config {shlex.quote(c_config)} "
-            f"--output-dir {shlex.quote(c_exports)}   "
-            f"# → {final_name}"
-        )
+        display = f"docker exec {CONTAINER_NAME} {display_cmd}   # → {final_name}"
 
         self._jobs.start(JobSpec(
             kind="export",

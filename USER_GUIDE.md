@@ -219,7 +219,7 @@ First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subseque
 | Dashboard | live  | Polls Docker + `splat-ns-v2` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
 | Process   | live  | Form-driven `ns-process-data video` with per-project presets, advanced raw-flag passthrough, and live ffprobe readout of the source video.   |
 | Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
-| Exports   | live  | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (video from viser keyframe JSON). Auto-suffixes duplicate filenames to prevent overwrites. |
+| Exports   | live  | Form-driven PLY export and `ns-render camera-path` (video from viser keyframe JSON). Auto-routes to `ns-export-splatfactow` for `splatfacto-w` / `splatfacto-w-light` runs (upstream `ns-export gaussian-splat` doesn't handle them) and to `ns-export gaussian-splat` for everything else. Auto-suffixes duplicate filenames (`_2`, `_3`, …) to prevent overwrites. |
 | Viewers   | stub  | Placeholder — reach viser / TensorBoard directly in the browser in the meantime.                                                             |
 | Runs      | stub  | Placeholder for a training-run browser over `data/outputs/`.                                                                                  |
 
@@ -641,9 +641,9 @@ Once trained, export to a portable PLY that can be opened in any Gaussian Splatt
 
 ### Via the GUI Exports tab (recommended)
 
-Open the **Exports** tab, pick a project + run from the dropdown, and click **Export .ply**. The GUI writes each PLY under `data/exports/splat/` with a unique filename derived from the run (`<project>_<method>_<timestamp>.ply`) and auto-suffixes (`_2`, `_3`, …) on collision so repeat exports never overwrite.
+Open the **Exports** tab, pick a project + run from the dropdown, and click **Export .ply**. The GUI writes each PLY under `data/exports/splat/` with a unique filename derived from the run (`<project>_<method>_<timestamp>.ply`) and auto-suffixes (`_2`, `_3`, …) on collision so repeat exports never overwrite. The right exporter is picked automatically based on the run's training method, so you never need to think about `splatfacto-w` vs. built-in splatfacto.
 
-### Via the CLI
+### Via the CLI — built-in splatfacto / -big / -mcmc
 
 ```bash
 ns-export gaussian-splat \
@@ -652,6 +652,26 @@ ns-export gaussian-splat \
 ```
 
 Output: `splat.ply` in the specified directory. File size is typically 100–500 MB for a 7000-iteration model with ~80M gaussians. Note: running the raw CLI twice into the same `--output-dir` overwrites `splat.ply`; the GUI's Exports tab avoids this.
+
+### Via the CLI — `splatfacto-w` / `splatfacto-w-light`
+
+Upstream `ns-export gaussian-splat` hard-asserts `isinstance(pipeline.model, SplatfactoModel)` and crashes on splatfacto-w runs (its model inherits from `Model` directly). The image ships a splatfacto-w-aware exporter that bakes a chosen appearance embedding into per-gaussian SH coefficients and writes the same inria-format PLY:
+
+```bash
+ns-export-splatfactow \
+  --load-config /workspace/outputs/<dataset>/splatfacto-w-light/<timestamp>/config.yml \
+  --output-dir /workspace/exports/splat
+```
+
+Key flag: `--appearance-mode` controls which appearance embedding is baked in.
+
+| Value | Behavior |
+|---|---|
+| `avg` (default) | Mean of all training-camera embeddings. Most stable for arbitrary viewpoints. |
+| `first` | Training-camera index 0. |
+| `camera` | Training camera at `--camera-idx N`. Use when you want to reproduce a specific training image's lighting. |
+
+Output: `splat.ply` in the specified directory; same 62-property layout (`x y z · nx ny nz · f_dc_{0..2} · f_rest_{0..44} · opacity · scale_{0..2} · rot_{0..3}`) as `ns-export gaussian-splat`, so downstream 3DGS viewers (SuperSplat, Blender 3DGS Render, etc.) open it identically.
 
 ### Fixing host-side ownership
 
@@ -824,10 +844,15 @@ ns-viewer \
   --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
   --viewer.websocket-host 0.0.0.0
 
-# Export to PLY
+# Export to PLY (built-in splatfacto / -big / -mcmc)
 ns-export gaussian-splat \
   --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
   --output-dir /workspace/outputs/<dataset>/export
+
+# Export to PLY (splatfacto-w / splatfacto-w-light)
+ns-export-splatfactow \
+  --load-config /workspace/outputs/<dataset>/splatfacto-w-light/<timestamp>/config.yml \
+  --output-dir /workspace/exports/splat
 
 # Render a viser camera-path JSON to MP4
 ns-render camera-path \
