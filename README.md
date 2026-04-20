@@ -1,6 +1,6 @@
 <div align="center">
 
-# docker_splat
+# docker_splat_v2
 
 ### Blackwell-native Docker pipeline for 3D Gaussian Splatting
 
@@ -43,7 +43,8 @@ End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M g
 | **Base image** | `nvcr.io/nvidia/pytorch:25.11-py3` | NGC | CUDA 13.0 + PyTorch 2.10 + sm_120 |
 | **COLMAP** | `4.1.0.dev0` | Built from source (`main` branch) | SfM + GPU SIFT |
 | **gsplat** | `1.4.0` | PyPI (JIT-compiled at runtime) | Gaussian rasterization |
-| **Nerfstudio** | `1.1.5` | PyPI | Training CLI + viewer |
+| **Nerfstudio** | `1.1.5` (git `50e0e3c`) | git main, pinned | Training CLI + viewer |
+| **splatfacto-w** | `0.1.5` (git `119a3bf`) | [KevinXu02/splatfacto-w](https://github.com/KevinXu02/splatfacto-w) | `splatfacto-w` / `splatfacto-w-light` methods |
 | **Viser** | `0.2.7` | Pinned by Nerfstudio | Web-based 3D viewer (port 7007) |
 | **TensorBoard** | `2.20.0` | Bundled with NGC PyTorch | Metrics + eval image logging (port 6006) |
 | **ffmpeg** | `6.1.1` | apt | Video frame extraction |
@@ -57,9 +58,9 @@ End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M g
 ### 1. Clone and build
 
 ```bash
-git clone https://github.com/AlexJumaW99/docker_splat.git
-cd docker_splat
-docker build --target nerfstudio -t splat-nerfstudio .
+git clone https://github.com/AlexJumaW99/docker_splat_v2.git
+cd docker_splat_v2
+docker build --target nerfstudio -t splat-nerfstudio-v2 .
 ```
 
 Build takes **25–40 minutes** on first run (COLMAP compile is the bottleneck, ~10 min). Subsequent rebuilds leverage Docker's layer cache for near-instant iteration.
@@ -67,16 +68,16 @@ Build takes **25–40 minutes** on first run (COLMAP compile is the bottleneck, 
 ### 2. Create and start the persistent container
 
 ```bash
-mkdir -p ~/Desktop/docker_splat/data
+mkdir -p ~/Desktop/docker_splat_v2/data
 
-docker create --name splat-ns --gpus all --ipc=host \
+docker create --name splat-ns-v2 --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -v ~/Desktop/docker_splat/data:/workspace \
-  -p 7007:7007 -p 6006:6006 -it splat-nerfstudio
+  -v ~/Desktop/docker_splat_v2/data:/workspace \
+  -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2
 
-docker start splat-ns
-docker exec -it splat-ns bash
+docker start splat-ns-v2
+docker exec -it splat-ns-v2 bash
 ```
 
 **Two ports mapped:** `7007` for the viser 3D viewer, `6006` for TensorBoard metrics. Both are optional but recommended for full visibility during training.
@@ -84,7 +85,7 @@ docker exec -it splat-ns bash
 ### 3. Process a video → train → view
 
 ```bash
-# Inside the container — drop your video at ~/Desktop/docker_splat/data/ first
+# Inside the container — drop your video at ~/Desktop/docker_splat_v2/data/ first
 ns-process-data video --data /workspace/yourvideo.mp4 \
   --output-dir /workspace/processed/yourvideo_splat \
   --num-frames-target 250 --matching-method sequential
@@ -95,13 +96,15 @@ ns-train splatfacto --data /workspace/processed/yourvideo_splat \
   --viewer.websocket-host 0.0.0.0 --viewer.quit-on-train-completion False
 ```
 
-Open `http://localhost:7007` for the 3D view. In a second shell (`docker exec -it splat-ns bash`), run `tensorboard --logdir /workspace/outputs --bind_all --port 6006` and open `http://localhost:6006` for live metrics.
+Open `http://localhost:7007` for the 3D view. In a second shell (`docker exec -it splat-ns-v2 bash`), run `tensorboard --logdir /workspace/outputs --bind_all --port 6006` and open `http://localhost:6006` for live metrics.
+
+Available training methods: `splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`.
 
 For detailed workflow, troubleshooting, and export instructions, see **[USER_GUIDE.md](USER_GUIDE.md)**.
 
 ### 4. Optional: desktop GUI
 
-A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns` container without the CLI. It runs the exact `ns-process-data` / `ns-train` invocations you'd run by hand, with per-project state and an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples.
+A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, and an **Exports tab** for PLY export and camera-path video rendering.
 
 ```bash
 cd gui && ./run.sh
@@ -144,9 +147,10 @@ The Dockerfile uses a 5-stage build. Each stage is independently buildable with 
                              │
 ┌────────────────────────────▼────────────────────────────────┐
 │  Stage 5: nerfstudio                                        │
-│  pip install nerfstudio + COLMAP compatibility patch        │
+│  pip install nerfstudio (git pin) + COLMAP/torch.load       │
+│  patches + splatfacto-w (KevinXu02, pinned commit)          │
 │  ──────────────────────────────────────────────             │
-│  ns-train, ns-process-data, ns-viewer, ns-export            │
+│  ns-train, ns-process-data, ns-viewer, ns-export, ns-render │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -175,7 +179,8 @@ All four are baked into the v3.2 Dockerfile and the documented `docker create` c
 | apt dependency install (Stage 2) | ✅ Verified |
 | COLMAP source build with sm_120 | ✅ Verified — binary reports "with CUDA" |
 | gsplat rasterization on `cuda:0` | ✅ Verified — `RASTERIZATION SUCCESS` smoke test |
-| Nerfstudio CLI available | ✅ 17 built-in methods including splatfacto |
+| Nerfstudio CLI available | ✅ Built-in methods including splatfacto, splatfacto-big, splatfacto-mcmc |
+| External method: splatfacto-w | ✅ Registers `splatfacto-w` + `splatfacto-w-light` via nerfstudio entry points |
 | `ns-process-data video` end-to-end | ✅ 98.12% pose recovery on test video |
 | `ns-train splatfacto` full training | ✅ 7000 iterations, ~84M gaussians, ~15 min |
 | Viser viewer reachable from host | ✅ Port 7007 bridged, scene renders live |
@@ -188,7 +193,7 @@ All four are baked into the v3.2 Dockerfile and the documented `docker create` c
 
 - **Blackwell-only by design.** `TORCH_CUDA_ARCH_LIST=12.0` targets `sm_120` exclusively. To run on an Ada or Ampere card, change to `8.9` or `8.6` respectively in the Dockerfile (and rebuild).
 - **16 GB VRAM assumption.** Training large scenes (> 500 images at 4K) may OOM on a 5070 Ti. The `PYTORCH_ALLOC_CONF=expandable_segments:True` env var helps, but is not magic. For heavier scenes, use a 5080 (16GB) or 5090 (32GB).
-- **Container runs as root.** Files written to `/workspace/outputs/` will be `root:root` on the host. Run `sudo chown -R $USER:$USER ~/Desktop/docker_splat/data` periodically.
+- **Container runs as root.** Files written to `/workspace/outputs/` will be `root:root` on the host. Run `sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data` periodically.
 - **`ns-download-data` is broken upstream.** Nerfstudio's bundled dataset downloader fails due to Google Drive rate-limiting — this is not a bug in this repo, it's a [long-running upstream issue](https://github.com/nerfstudio-project/nerfstudio/issues/3134). Use your own video data.
 - **Viser may stutter briefly during eval steps** when used alongside TensorBoard. Documented upstream; typically a few seconds of laggy viewport every ~1000 iterations. Training metrics are unaffected.
 
@@ -201,6 +206,9 @@ All four are baked into the v3.2 Dockerfile and the documented `docker create` c
 Commit history (`git log --oneline`, most recent first):
 
 ```
+Bake splatfacto-w into image and expose in Train dropdown (GUI)
+Add Exports tab with .ply export and camera-path video render (GUI)
+Fork naming to v2 and pin nerfstudio to git main (enables splatfacto-mcmc)
 Add "import processed dataset" flow to skip straight to training (GUI)
 Add Train tab and viser-port safety helpers (GUI)
 Add smoke_test.sh for container verification
@@ -221,6 +229,7 @@ Built on top of excellent open-source work:
 
 - [**Nerfstudio**](https://github.com/nerfstudio-project/nerfstudio) — the training framework and CLI
 - [**gsplat**](https://github.com/nerfstudio-project/gsplat) — the CUDA Gaussian rasterizer
+- [**splatfacto-w**](https://github.com/KevinXu02/splatfacto-w) — in-the-wild splatfacto variants (KevinXu02)
 - [**COLMAP**](https://github.com/colmap/colmap) — Structure-from-Motion for camera pose recovery
 - [**NVIDIA NGC**](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) — PyTorch base image with Blackwell support
 - [**Viser**](https://github.com/nerfstudio-project/viser) — the web-based 3D viewer

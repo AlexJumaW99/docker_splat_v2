@@ -3,7 +3,7 @@
 # Verifies every feature built by the Dockerfile: GPU passthrough, PyTorch +
 # sm_120, cuDNN, COLMAP (with 4.1 flag rename), ffmpeg, gsplat rasterizer,
 # nerfstudio CLI, the colmap_utils.py patch, TensorBoard/viser stack,
-# workspace bind mount, and env vars.
+# the splatfacto-w external method, workspace bind mount, and env vars.
 #
 # Usage:
 #   ./smoke_test.sh                                   # all tests
@@ -216,7 +216,10 @@ fi
 # ============================================================================
 section "10. nerfstudio CLI"
 
-out=$(dexec python -c "import nerfstudio; print('nerfstudio', nerfstudio.__version__)")
+# Import nerfstudio and probe its installed version via importlib.metadata.
+# Git-pinned nerfstudio main doesn't expose a `__version__` attribute, so we
+# can't use `nerfstudio.__version__` like we could with the PyPI 1.1.5 build.
+out=$(dexec python -c "import nerfstudio; from importlib.metadata import version; print('nerfstudio', version('nerfstudio'))")
 echo "$out" | grep -q '^nerfstudio ' \
     && { pass "nerfstudio import"; info "$out"; } \
     || fail "nerfstudio import" "$out"
@@ -236,11 +239,35 @@ echo "$out" | grep -qi 'usage' \
     && pass "ns-train --help (loads all method configs)" \
     || fail "ns-train --help" "$(echo "$out" | tail -5)"
 
-# Check splatfacto method is registered.
-out=$(dexec python -c "from nerfstudio.configs.method_configs import method_configs as m; print([k for k in m if 'splat' in k])")
-echo "$out" | grep -q "splatfacto" \
+# Check registered methods. `all_methods` is the merged dict of built-ins +
+# external entry-point methods; `method_configs` is built-ins only, so use
+# `all_methods` here to cover splatfacto-w as well.
+out=$(dexec python -c "from nerfstudio.configs.method_configs import all_methods; print(sorted([k for k in all_methods if 'splat' in k]))")
+echo "$out" | grep -q "splatfacto'" \
     && { pass "splatfacto method registered"; info "$out"; } \
     || fail "splatfacto method registered" "$out"
+
+# splatfacto-mcmc needs the git-pinned nerfstudio main (Stage 5); PyPI 1.1.5
+# does not ship it. If it's missing, the Dockerfile's NERFSTUDIO_COMMIT drifted.
+echo "$out" | grep -q "splatfacto-mcmc" \
+    && pass "splatfacto-mcmc method registered (git-pinned nerfstudio)" \
+    || fail "splatfacto-mcmc method registered" "not in all_methods — check NERFSTUDIO_COMMIT"
+
+# splatfacto-w (external, KevinXu02) registers splatfacto-w and
+# splatfacto-w-light via the nerfstudio.method_configs entry point.
+echo "$out" | grep -q "splatfacto-w'" \
+    && pass "splatfacto-w method registered (KevinXu02 external)" \
+    || fail "splatfacto-w method registered" "not in all_methods — check SPLATFACTOW_COMMIT"
+echo "$out" | grep -q "splatfacto-w-light" \
+    && pass "splatfacto-w-light method registered" \
+    || fail "splatfacto-w-light method registered" "not in all_methods"
+
+# Smoke-import the splatfacto-w package itself (catches runtime import failures
+# that the method_configs registry won't surface until training starts).
+out=$(dexec python -c "from splatfactow.splatfactow_config import splatfactow_config, splatfactow_light_config; print(splatfactow_config.config.method_name, splatfactow_light_config.config.method_name)")
+echo "$out" | grep -q 'splatfacto-w splatfacto-w-light' \
+    && { pass "splatfactow config objects importable"; info "$out"; } \
+    || fail "splatfactow config import" "$out"
 
 # ============================================================================
 # 11. Verify Stage 5 sed patch to colmap_utils.py
@@ -297,10 +324,11 @@ else
 fi
 
 token="smoke_$(date +%s)_$$"
-if dexec sh -c "touch /workspace/.${token} && rm /workspace/.${token}" 2>&1 | grep -qv 'denied\|error\|Permission'; then
+wr_out=$(dexec sh -c "touch /workspace/.${token} && rm /workspace/.${token}" 2>&1)
+if [ $? -eq 0 ]; then
     pass "/workspace is writable"
 else
-    fail "/workspace writable"
+    fail "/workspace writable" "$wr_out"
 fi
 
 # Verify the mount goes back to the host path we expect.

@@ -1,9 +1,9 @@
-# docker_splat · GUI
+# docker_splat_v2 · GUI
 
-A PySide6 desktop app that drives the `splat-ns` container without touching
+A PySide6 desktop app that drives the `splat-ns-v2` container without touching
 the CLI. It's a thin, read-mostly front end over `docker exec` — the same
-`ns-process-data` / `ns-train` invocations you'd run by hand, wrapped in a
-form with sensible defaults and per-project state.
+`ns-process-data` / `ns-train` / `ns-export` / `ns-render` invocations you'd
+run by hand, wrapped in a form with sensible defaults and per-project state.
 
 ## Run
 
@@ -18,9 +18,10 @@ Subsequent launches are instant.
 
 | Tab       | State    | What it does                                                                                                                                 |
 |-----------|----------|----------------------------------------------------------------------------------------------------------------------------------------------|
-| Dashboard | live     | Polls the Docker daemon, `splat-ns` container, and GPU (via `nvidia-smi`). Shows the exact `docker build` / `docker create` commands if the container is missing, with copy buttons — never runs them for you. |
+| Dashboard | live     | Polls the Docker daemon, `splat-ns-v2` container, and GPU (via `nvidia-smi`). Shows the exact `docker build` / `docker create` commands if the container is missing, with copy buttons — never runs them for you. |
 | Process   | live     | Form-driven `ns-process-data video`. Per-project presets, advanced raw-flag passthrough, live ffprobe readout of the source video.           |
-| Train     | live     | Form-driven `ns-train`. Method picker (splatfacto / splatfacto-big / splatfacto-mcmc), iteration slider, viser + TensorBoard toggle, advanced raw-flag passthrough. Detects when the viser port becomes live and deep-links to `http://localhost:7007`. |
+| Train     | live     | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle, advanced raw-flag passthrough. Detects when the viser port becomes live and deep-links to `http://localhost:7007`. |
+| Exports   | live     | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (MP4 from viser keyframe JSON). Writes to `data/exports/splat/` and `data/renders/<project>/`; auto-suffixes on filename collisions so repeat exports never overwrite. |
 | Viewers   | stub     | Placeholder — viser + TensorBoard are reachable directly in the browser in the meantime.                                                     |
 | Runs      | stub     | Placeholder for a training-run browser over `data/outputs/`.                                                                                 |
 
@@ -29,10 +30,10 @@ Subsequent launches are instant.
 A project bundles a dataset with its processing/training runs. Two ways to
 create one (**+ New project**):
 
-- **From video** — point at a video file inside `~/Desktop/docker_splat/data/`.
+- **From video** — point at a video file inside `~/Desktop/docker_splat_v2/data/`.
   The project goes through Process → Train like the CLI workflow.
 - **Import processed dataset** — point at an already-processed folder inside
-  `~/Desktop/docker_splat/data/`. The app auto-detects the layout:
+  `~/Desktop/docker_splat_v2/data/`. The app auto-detects the layout:
   - `transforms.json` at the root → Nerfstudio dataparser
   - `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → COLMAP dataparser,
     with the relative path recorded on the project so `ns-train` gets
@@ -55,13 +56,14 @@ subcommands:
   long-running `ns-process-data` / `ns-train` runs.
 
 It **cannot** build, create, remove, commit, tag, push, rename, stop, kill,
-or run containers. Your `splat-nerfstudio` image and `splat-ns` container are
-safe. If the container is missing, the Dashboard surfaces the `docker create`
-command from `USER_GUIDE.md` with a copy button — it never runs it for you.
+or run containers. Your `splat-nerfstudio-v2` image and `splat-ns-v2` container
+are safe. If the container is missing, the Dashboard surfaces the `docker
+create` command from `USER_GUIDE.md` with a copy button — it never runs it for
+you.
 
 ## Config
 
-State lives in `~/.config/docker_splat_gui/`:
+State lives in `~/.config/docker_splat_v2_gui/`:
 
 - `projects.json` — project list, active project, presets, last-used params.
 

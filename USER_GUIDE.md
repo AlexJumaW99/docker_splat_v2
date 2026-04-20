@@ -2,7 +2,7 @@
 
 # User Guide
 
-### Complete walkthrough for `docker_splat`
+### Complete walkthrough for `docker_splat_v2`
 
 From host setup to your first exported Gaussian Splat PLY.
 
@@ -23,8 +23,9 @@ From host setup to your first exported Gaussian Splat PLY.
 9. [Viewing in viser](#viewing-in-viser)
 10. [Real-time monitoring with TensorBoard](#real-time-monitoring-with-tensorboard)
 11. [Exporting a PLY file](#exporting-a-ply-file)
-12. [Troubleshooting](#troubleshooting)
-13. [Appendix: full command reference](#appendix-full-command-reference)
+12. [Rendering a camera-path video](#rendering-a-camera-path-video)
+13. [Troubleshooting](#troubleshooting)
+14. [Appendix: full command reference](#appendix-full-command-reference)
 
 ---
 
@@ -86,9 +87,9 @@ Should show your RTX 50-series GPU. If this fails, fix it before proceeding — 
 ### Full build (first time)
 
 ```bash
-git clone https://github.com/AlexJumaW99/docker_splat.git
-cd docker_splat
-docker build --target nerfstudio -t splat-nerfstudio .
+git clone https://github.com/AlexJumaW99/docker_splat_v2.git
+cd docker_splat_v2
+docker build --target nerfstudio -t splat-nerfstudio-v2 .
 ```
 
 **Expected duration:** 25–40 minutes on first run. Breakdown:
@@ -112,13 +113,13 @@ docker build --target system-deps -t splat:sysdeps .
 docker build --target colmap -t splat:colmap .
 
 # Full build (default target)
-docker build --target nerfstudio -t splat-nerfstudio .
+docker build --target nerfstudio -t splat-nerfstudio-v2 .
 ```
 
 ### Verify the built image
 
 ```bash
-docker images | grep splat-nerfstudio
+docker images | grep splat-nerfstudio-v2
 ```
 
 Expected: one line showing the image with size around **26 GB**. The size is large because NGC PyTorch is ~20 GB on its own; COLMAP, nerfstudio, and dependencies add the rest.
@@ -130,34 +131,34 @@ Expected: one line showing the image with size around **26 GB**. The size is lar
 ### Create the persistent container (once)
 
 ```bash
-mkdir -p ~/Desktop/docker_splat/data
+mkdir -p ~/Desktop/docker_splat_v2/data
 
 docker create \
-  --name splat-ns \
+  --name splat-ns-v2 \
   --gpus all \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
   --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -v ~/Desktop/docker_splat/data:/workspace \
+  -v ~/Desktop/docker_splat_v2/data:/workspace \
   -p 7007:7007 \
   -p 6006:6006 \
   -it \
-  splat-nerfstudio
+  splat-nerfstudio-v2
 ```
 
 **What each flag does:**
 
 | Flag | Purpose |
 |---|---|
-| `--name splat-ns` | Names the container for easy reference |
+| `--name splat-ns-v2` | Names the container for easy reference |
 | `--gpus all` | GPU passthrough |
 | `--ipc=host` | Shared memory for PyTorch multi-worker dataloaders |
 | `--ulimit memlock=-1 --ulimit stack=67108864` | Required by NGC PyTorch for proper memory management |
 | `--shm-size=16g` | Shared memory size for large tensors |
 | `-e PYTORCH_ALLOC_CONF=expandable_segments:True` | Memory allocator config; reduces fragmentation on long training runs |
-| `-v ~/Desktop/docker_splat/data:/workspace` | Bind mount — data persists on host outside the container |
+| `-v ~/Desktop/docker_splat_v2/data:/workspace` | Bind mount — data persists on host outside the container |
 | `-p 7007:7007` | Viser web viewer port |
 | `-p 6006:6006` | TensorBoard web UI port |
 | `-it` | Interactive TTY |
@@ -166,34 +167,34 @@ docker create \
 
 ```bash
 # Start a previously created container
-docker start splat-ns
+docker start splat-ns-v2
 
 # Attach a shell
-docker exec -it splat-ns bash
+docker exec -it splat-ns-v2 bash
 
 # Exit the shell (container keeps running)
 exit
 
 # Stop the container (state preserved)
-docker stop splat-ns
+docker stop splat-ns-v2
 ```
 
 ### When you need a clean slate
 
 ```bash
-docker stop splat-ns
-docker rm splat-ns
+docker stop splat-ns-v2
+docker rm splat-ns-v2
 # then re-run the `docker create` block above
 ```
 
-Bind-mounted data at `~/Desktop/docker_splat/data` is unaffected — only the container's writable layer is destroyed. Note: this will invalidate the gsplat JIT kernel cache at `/root/.cache/torch_extensions/`, so the first training in the new container will pause 60-120 seconds to recompile kernels.
+Bind-mounted data at `~/Desktop/docker_splat_v2/data` is unaffected — only the container's writable layer is destroyed. Note: this will invalidate the gsplat JIT kernel cache at `/root/.cache/torch_extensions/`, so the first training in the new container will pause 60-120 seconds to recompile kernels.
 
 ### File ownership housekeeping
 
 The container runs as root, so files it writes to `/workspace/` will be root-owned on the host. Every so often:
 
 ```bash
-sudo chown -R $USER:$USER ~/Desktop/docker_splat/data
+sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data
 ```
 
 ---
@@ -215,9 +216,10 @@ First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subseque
 
 | Tab       | State | Behavior                                                                                                                                      |
 |-----------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| Dashboard | live  | Polls Docker + `splat-ns` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
+| Dashboard | live  | Polls Docker + `splat-ns-v2` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
 | Process   | live  | Form-driven `ns-process-data video` with per-project presets, advanced raw-flag passthrough, and live ffprobe readout of the source video.   |
-| Train     | live  | Form-driven `ns-train`. Splatfacto method picker, iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
+| Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
+| Exports   | live  | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (video from viser keyframe JSON). Auto-suffixes duplicate filenames to prevent overwrites. |
 | Viewers   | stub  | Placeholder — reach viser / TensorBoard directly in the browser in the meantime.                                                             |
 | Runs      | stub  | Placeholder for a training-run browser over `data/outputs/`.                                                                                  |
 
@@ -225,14 +227,14 @@ First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subseque
 
 A project bundles a dataset with its processing/training runs. **+ New project** offers two modes:
 
-- **From video** — point at a video file inside `~/Desktop/docker_splat/data/`. Goes Process → Train like the CLI workflow.
-- **Import processed dataset** — point at an already-processed folder inside `~/Desktop/docker_splat/data/`. The app auto-detects the layout:
+- **From video** — point at a video file inside `~/Desktop/docker_splat_v2/data/`. Goes Process → Train like the CLI workflow.
+- **Import processed dataset** — point at an already-processed folder inside `~/Desktop/docker_splat_v2/data/`. The app auto-detects the layout:
   - `transforms.json` at the root → Nerfstudio dataparser
   - `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → COLMAP dataparser, with the relative path saved so `ns-train` gets `--colmap-path <rel>` automatically
 
   Imported projects skip the Process tab and land straight on Train. This is the right flow for Tanks & Temples, MipNeRF360, or anything else already reconstructed with COLMAP.
 
-State persists to `~/.config/docker_splat_gui/projects.json`. Delete that directory to reset.
+State persists to `~/.config/docker_splat_v2_gui/projects.json`. Delete that directory to reset.
 
 ---
 
@@ -284,7 +286,7 @@ Phone video straight out of the camera is fine. No editing needed.
 
 ## Processing a video
 
-Place your video at `~/Desktop/docker_splat/data/yourvideo.mp4` on the host. This becomes `/workspace/yourvideo.mp4` inside the container.
+Place your video at `~/Desktop/docker_splat_v2/data/yourvideo.mp4` on the host. This becomes `/workspace/yourvideo.mp4` inside the container.
 
 Inside the container:
 
@@ -425,7 +427,9 @@ Columns: step, iteration time, remaining time estimate, gaussian count. The gaus
 |---|---|
 | `splatfacto` | Default — balanced quality and speed. Good starting point for most videos. |
 | `splatfacto-big` | Larger gaussian capacity. Use for detailed scenes where the default caps out. Slower and hungrier on VRAM. |
-| `splatfacto-mcmc` | MCMC-based densification. More stable gaussian counts; sometimes cleaner results on sparse-view scenes. |
+| `splatfacto-mcmc` | MCMC-based densification. More stable gaussian counts; sometimes cleaner results on sparse-view scenes. Requires the git-pinned nerfstudio from Stage 5. |
+| `splatfacto-w` | ["In the wild" splatfacto](https://github.com/KevinXu02/splatfacto-w) — handles scenes with transient occluders and varying appearance/lighting across captures. Good for outdoor or crowd-tourism-style datasets. |
+| `splatfacto-w-light` | Lighter-weight variant of `splatfacto-w` with a smaller appearance MLP. Faster and less VRAM-hungry; trade-off is appearance modeling fidelity. |
 
 Swap the first positional argument of `ns-train` to pick one (e.g. `ns-train splatfacto-big --data …`).
 
@@ -451,10 +455,10 @@ If you already have a reconstructed scene (Tanks & Temples, MipNeRF360, your own
 
 ### Place the dataset under the bind mount
 
-The container only sees `~/Desktop/docker_splat/data/` (it's mounted at `/workspace`). So move or symlink the dataset there:
+The container only sees `~/Desktop/docker_splat_v2/data/` (it's mounted at `/workspace`). So move or symlink the dataset there:
 
 ```bash
-mv /path/to/Ballroom ~/Desktop/docker_splat/data/processed/ballroom_splat
+mv /path/to/Ballroom ~/Desktop/docker_splat_v2/data/processed/ballroom_splat
 ```
 
 The `_splat` suffix is convention — not required, but matches what `ns-process-data` produces.
@@ -551,7 +555,7 @@ You need two shells into the container: one for training, one for TensorBoard.
 From a host terminal:
 
 ```bash
-docker exec -it splat-ns bash
+docker exec -it splat-ns-v2 bash
 ```
 
 Inside the container:
@@ -571,7 +575,7 @@ The URL in the output uses the container's internal hostname; ignore it. Open `h
 **Shell 2 (Training) — open in a new host terminal:**
 
 ```bash
-docker exec -it splat-ns bash
+docker exec -it splat-ns-v2 bash
 ```
 
 Inside the container, kick off training with `--vis viewer+tensorboard`:
@@ -635,20 +639,26 @@ Multiple training runs appear as separate entries in TensorBoard's left sidebar,
 
 Once trained, export to a portable PLY that can be opened in any Gaussian Splatting viewer or imported into Blender (with a plugin like [3DGS Render](https://github.com/ReshotAI/gaussian-splatting-blender-addon)).
 
+### Via the GUI Exports tab (recommended)
+
+Open the **Exports** tab, pick a project + run from the dropdown, and click **Export .ply**. The GUI writes each PLY under `data/exports/splat/` with a unique filename derived from the run (`<project>_<method>_<timestamp>.ply`) and auto-suffixes (`_2`, `_3`, …) on collision so repeat exports never overwrite.
+
+### Via the CLI
+
 ```bash
 ns-export gaussian-splat \
   --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
   --output-dir /workspace/outputs/<dataset>/export
 ```
 
-Output: `splat.ply` in the specified directory. File size is typically 100–500 MB for a 7000-iteration model with ~80M gaussians.
+Output: `splat.ply` in the specified directory. File size is typically 100–500 MB for a 7000-iteration model with ~80M gaussians. Note: running the raw CLI twice into the same `--output-dir` overwrites `splat.ply`; the GUI's Exports tab avoids this.
 
 ### Fixing host-side ownership
 
 The PLY will be written as root inside the container. To open it on the host:
 
 ```bash
-sudo chown -R $USER:$USER ~/Desktop/docker_splat/data/outputs
+sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data/outputs
 ```
 
 ### Recommended post-training editor: SuperSplat
@@ -656,6 +666,33 @@ sudo chown -R $USER:$USER ~/Desktop/docker_splat/data/outputs
 For cleaning up stray gaussians, cropping the scene, applying post-processing effects, or publishing to the web:
 
 **[superspl.at/editor](https://superspl.at/editor)** — free, open-source, browser-based editor from PlayCanvas. Drag-and-drop your exported PLY to load it. Features: selection tools (rect/brush/lasso), cropping, timeline animations, WebXR export, and more.
+
+---
+
+## Rendering a camera-path video
+
+Viser lets you record a camera path by placing keyframes along a flythrough of your trained scene, then exporting the path as a JSON file (lands under `processed/<project>/camera_paths/<timestamp>.json`). Turn that JSON into an MP4 with `ns-render`.
+
+### Via the GUI Exports tab
+
+Same tab as PLY export. Below the PLY card is a **Render camera-path video** card:
+
+1. Pick the project + run (same dropdown as PLY export).
+2. Pick a camera-path JSON from the project's `camera_paths/` folder (auto-populated).
+3. Click **Render video**.
+
+Output lands under `data/renders/<project>/<camera-path-stem>.mp4`, auto-suffixed on collision.
+
+### Via the CLI
+
+```bash
+ns-render camera-path \
+  --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
+  --camera-path-filename /workspace/processed/<project>/camera_paths/<timestamp>.json \
+  --output-path /workspace/renders/<project>/<camera-path-stem>.mp4
+```
+
+Rendering time scales with video length and scene gaussian count. A 10-second 1080p path from an 80M-gaussian scene takes a few minutes on an RTX 5070 Ti.
 
 ---
 
@@ -671,7 +708,7 @@ Fix: already in the v2+ Dockerfile. If you see this, you're building from an out
 
 Cause: COLMAP renamed this flag to `--FeatureExtraction.use_gpu`; nerfstudio 1.1.5 still uses the old name.
 
-Fix: already patched in Stage 5 of the v3 Dockerfile. If you hit this, your image was built from a pre-v3 Dockerfile. Rebuild with `docker build --target nerfstudio -t splat-nerfstudio .`
+Fix: already patched in Stage 5 of the v3 Dockerfile. If you hit this, your image was built from a pre-v3 Dockerfile. Rebuild with `docker build --target nerfstudio -t splat-nerfstudio-v2 .`
 
 ### Training appears to hang for 1–2 minutes on first run
 
@@ -689,7 +726,7 @@ Fix: not a fix for this repo to make. Use your own video data.
 
 Checklist:
 
-1. Container was created with both `-p 7007:7007` AND `-p 6006:6006` flags (verify with `docker port splat-ns` on host)
+1. Container was created with both `-p 7007:7007` AND `-p 6006:6006` flags (verify with `docker port splat-ns-v2` on host)
 2. For viser: training was started with `--viewer.websocket-host 0.0.0.0` (otherwise viser binds to 127.0.0.1 inside the container and Docker can't route to it)
 3. For viser: training is currently running OR was started with `--viewer.quit-on-train-completion False` (viser dies when training ends if that flag is True)
 4. For TensorBoard: `tensorboard` process is still running (Shell 1 wasn't closed or Ctrl+C'd)
@@ -731,36 +768,36 @@ Observed occasionally on first-ever training run in a fresh container, specifica
 
 ```bash
 # Clone and build
-git clone https://github.com/AlexJumaW99/docker_splat.git
-cd docker_splat
-docker build --target nerfstudio -t splat-nerfstudio .
+git clone https://github.com/AlexJumaW99/docker_splat_v2.git
+cd docker_splat_v2
+docker build --target nerfstudio -t splat-nerfstudio-v2 .
 
 # Verify
-docker images | grep splat-nerfstudio
+docker images | grep splat-nerfstudio-v2
 
 # Create persistent container (with both viser + tensorboard ports)
-docker create --name splat-ns --gpus all --ipc=host \
+docker create --name splat-ns-v2 --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -v ~/Desktop/docker_splat/data:/workspace \
-  -p 7007:7007 -p 6006:6006 -it splat-nerfstudio
+  -v ~/Desktop/docker_splat_v2/data:/workspace \
+  -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2
 
 # Daily lifecycle
-docker start splat-ns
-docker exec -it splat-ns bash
-docker stop splat-ns
+docker start splat-ns-v2
+docker exec -it splat-ns-v2 bash
+docker stop splat-ns-v2
 
 # Clean slate (keeps data)
-docker rm splat-ns
+docker rm splat-ns-v2
 
 # Verify port mappings
-docker port splat-ns
+docker port splat-ns-v2
 
 # Fix host ownership
-sudo chown -R $USER:$USER ~/Desktop/docker_splat/data
+sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data
 ```
 
-### Container-side (inside `docker exec -it splat-ns bash`)
+### Container-side (inside `docker exec -it splat-ns-v2 bash`)
 
 ```bash
 # Process video into dataset
@@ -791,6 +828,12 @@ ns-viewer \
 ns-export gaussian-splat \
   --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
   --output-dir /workspace/outputs/<dataset>/export
+
+# Render a viser camera-path JSON to MP4
+ns-render camera-path \
+  --load-config /workspace/outputs/<dataset>/splatfacto/<timestamp>/config.yml \
+  --camera-path-filename /workspace/processed/<project>/camera_paths/<timestamp>.json \
+  --output-path /workspace/renders/<project>/<camera-path-stem>.mp4
 ```
 
 ### Browser URLs (on host)
