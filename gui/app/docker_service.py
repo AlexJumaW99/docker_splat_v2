@@ -9,6 +9,7 @@ exec streaming goes through JobManager, not this module.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -168,6 +169,38 @@ def free_container_port(
     # Give the kernel a beat to tear down the socket, then re-check.
     time.sleep(0.3)
     return container_port_in_use(port, name) is False
+
+
+_REG_IMAGES_RE = re.compile(r"Registered images:\s*(\d+)")
+
+
+def colmap_registered_image_count(
+    container_model_path: str,
+    name: str = CONTAINER_NAME,
+) -> int | None:
+    """Count registered images in a COLMAP sparse model via model_analyzer.
+
+    Read-only probe used by the Process tab's splinter-detection after a run
+    completes. Returns None when the container isn't running, the path
+    doesn't exist, or the output can't be parsed — callers treat that as
+    "no signal" and stay silent rather than surfacing a false warning.
+    """
+    state = container_state(name)
+    if state.status != "running":
+        return None
+    try:
+        r = _run(
+            ["exec", name, "colmap", "model_analyzer",
+             "--path", container_model_path],
+            timeout=20.0,
+        )
+    except (subprocess.TimeoutExpired, DockerError):
+        return None
+    if r.returncode != 0:
+        return None
+    text = (r.stdout or "") + (r.stderr or "")
+    m = _REG_IMAGES_RE.search(text)
+    return int(m.group(1)) if m else None
 
 
 def start_daemon_via_polkit() -> tuple[bool, str]:

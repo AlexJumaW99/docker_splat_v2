@@ -773,8 +773,28 @@ class _Form(QWidget):
         rtt.addWidget(train_btn)
         self.ready_to_train.hide()
 
+        # Splinter warning — populated by _check_sparse_splinter() on success.
+        # COLMAP's incremental mapper occasionally produces multiple disjoint
+        # submaps (sparse/0, sparse/1, …); ns-process-data always exports from
+        # sparse/0, so if that one is the tiny dangling submap the dataset
+        # silently ends up with only a handful of frames. We surface that here.
+        self.splinter_warn = QFrame()
+        self.splinter_warn.setProperty("role", "subcard")
+        sw = QVBoxLayout(self.splinter_warn)
+        sw.setContentsMargins(14, 10, 14, 10); sw.setSpacing(4)
+        self.splinter_title = QLabel("Warning: COLMAP split into multiple submaps")
+        self.splinter_title.setStyleSheet("color: #F59E0B; font-weight: 600;")
+        self.splinter_body = QLabel("")
+        self.splinter_body.setWordWrap(True)
+        self.splinter_body.setProperty("role", "caption")
+        self.splinter_body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        sw.addWidget(self.splinter_title)
+        sw.addWidget(self.splinter_body)
+        self.splinter_warn.hide()
+
         v.addLayout(row)
         v.addWidget(self.ready_to_train)
+        v.addWidget(self.splinter_warn)
         return c
 
     # ---- advanced toggle ----
@@ -1042,6 +1062,7 @@ class _Form(QWidget):
             kill_pattern="ns-process-data",
         )
         self.ready_to_train.hide()
+        self.splinter_warn.hide()
         self._jobs.start(spec)
 
     def _on_cancel(self) -> None:
@@ -1076,6 +1097,7 @@ class _Form(QWidget):
         if code == 0:
             set_pill(self.status_pill, "Done", "success")
             self.ready_to_train.show()
+            self._check_sparse_splinter()
         else:
             set_pill(self.status_pill, f"Failed · exit {code}", "error")
 
@@ -1102,6 +1124,66 @@ class _Form(QWidget):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Ready", "neutral")
+
+    # ---- splinter detection ----
+    def _check_sparse_splinter(self) -> None:
+        """After a successful run, warn when ns-process-data exported the
+        wrong COLMAP submap.
+
+        ns-process-data always writes transforms.json from `colmap/sparse/0`,
+        but COLMAP's incremental mapper can split a reconstruction into
+        multiple disjoint submaps when the scene has repeated near-duplicate
+        views (e.g. several similar vehicles in one hangar) or when vocab_tree
+        matching pairs up visually similar but geometrically unrelated frames.
+        If sparse/0 happens to be the tiny splinter, transforms.json silently
+        ends up with only a handful of frames while the real reconstruction
+        sits unused in sparse/1+.
+
+        We stay silent on any probe failure — a false warning is worse than
+        none, and a genuinely splintered dataset will also fail visibly in
+        viser the moment the user tries to train.
+        """
+        sparse_dir = Path(self._project.processed_dir) / "colmap" / "sparse"
+        if not sparse_dir.is_dir():
+            return
+        try:
+            subs = sorted(
+                p for p in sparse_dir.iterdir()
+                if p.is_dir() and p.name.isdigit()
+            )
+        except OSError:
+            return
+        if len(subs) < 2:
+            return
+
+        counts: dict[str, int] = {}
+        for p in subs:
+            try:
+                c_path = _host_to_container(p)
+            except ValueError:
+                return
+            n = dock.colmap_registered_image_count(c_path)
+            if n is None:
+                return  # probe failed — stay silent
+            counts[p.name] = n
+
+        largest = max(counts, key=counts.get)
+        if largest == "0":
+            return
+
+        parts = ", ".join(f"sparse/{k}={v}" for k, v in sorted(counts.items()))
+        fix_cmd = (
+            f"cd {sparse_dir} && mv 0 _tiny && mv {largest} 0  "
+            f"# then re-run processing with --skip-colmap --skip-image-processing"
+        )
+        self.splinter_body.setText(
+            f"COLMAP produced {len(subs)} disjoint submaps ({parts}).\n"
+            f"ns-process-data exported transforms.json from sparse/0, but "
+            f"sparse/{largest} is larger — only sparse/0's {counts['0']} "
+            f"frames are in the dataset. To promote the larger submap:\n"
+            f"  {fix_cmd}"
+        )
+        self.splinter_warn.show()
 
 
 # ---------- top-level view ----------
