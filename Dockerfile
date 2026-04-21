@@ -134,6 +134,33 @@ RUN pip install --no-cache-dir --no-deps \
 COPY image_bin/ns-export-splatfactow /usr/local/bin/ns-export-splatfactow
 RUN chmod +x /usr/local/bin/ns-export-splatfactow
 
+# v4.2: pre-place a faiss-format vocabulary tree for vocab_tree_matcher.
+# In May 2025 COLMAP migrated its vocab_tree_matcher backend from FLANN to
+# faiss (colmap/colmap#3486). The legacy file nerfstudio downloads from
+# demuc.de/colmap/vocab_tree_flickr100K_words32K.bin is still FLANN-format
+# and makes our sm_120 COLMAP build abort with
+#   Check failed: file_version == 1 || file_version == 2
+#   Failed to read faiss index. ... COLMAP switched from flann to faiss...
+# at pairing.cc while indexing the first image, so ns-process-data
+# --matching-method vocab_tree never completes (nerfstudio#3664, #3520).
+#
+# Nerfstudio's get_vocab_tree() only downloads when the target file is
+# absent, so pre-placing a valid faiss-format tree at the exact expected
+# path short-circuits the broken download without patching nerfstudio.
+# File comes from a pinned commit of a community repo whose sole content
+# is faiss-converted versions of the official COLMAP vocab trees. SHA-256
+# is verified so a silent upstream swap would fail the build.
+# Verified end-to-end inside a live container: COLMAP 4.1.0.dev0 loads
+# the tree and completes vocab_tree matching on 253 images in ~45s.
+ARG VOCAB_TREE_COMMIT=b88921d40767bef9cfd9d67126f58848e7ca59d4
+ARG VOCAB_TREE_SHA256=818de625d3ed285fa9a78117700e86e956dd7b64c3efa6ab984b483060f45581
+RUN mkdir -p /root/.local/share/nerfstudio \
+    && curl -fsSL \
+        "https://raw.githubusercontent.com/ZachMckennedyFWig/ColmapFaissVocabTrees/${VOCAB_TREE_COMMIT}/vocab_tree_flickr100K_words32K.bin" \
+        -o /root/.local/share/nerfstudio/vocab_tree.fbow \
+    && echo "${VOCAB_TREE_SHA256}  /root/.local/share/nerfstudio/vocab_tree.fbow" \
+        | sha256sum -c -
+
 WORKDIR /workspace
 EXPOSE 7007 6006
 CMD ["/bin/bash"]
