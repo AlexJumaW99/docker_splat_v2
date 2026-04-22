@@ -1,0 +1,110 @@
+# ============================================================
+# docker-compose.yml — the "how you run it" half of the recipe.
+#
+# The Dockerfile captures how the image is built. This file
+# captures the runtime flags that would otherwise be typed after
+# `docker run` every time and become tribal knowledge:
+# --gpus, --ipc, --shm-size, --ulimit, env overrides, port
+# bindings, bind mounts, and the cache volumes that keep
+# training startup fast across container rebuilds.
+#
+# Verified against the README `docker create` command (lines
+# 74-78) and against `docker inspect splat-ns-v2` on this host.
+#
+# ------------------------------------------------------------
+# Typical workflow
+# ------------------------------------------------------------
+#   docker compose build                     # first-time image build (~25–40 min, COLMAP is the bottleneck)
+#   docker compose up -d                     # create + start the container detached
+#   docker compose exec nerfstudio bash      # interactive shell at /workspace
+#   docker compose down                      # stop + remove the container (named volumes survive)
+#   docker compose down -v                   # also wipe the cache volumes (forces JIT recompile + LPIPS re-download next run)
+#
+# If you change the Dockerfile, force a rebuild on next up:
+#   docker compose up -d --build
+#
+# ------------------------------------------------------------
+# First-time migration from the legacy `docker create` container
+# ------------------------------------------------------------
+# If `splat-ns-v2` already exists from the documented
+# `docker create` flow, remove it before the first
+# `docker compose up` so the container_name: below can be used:
+#
+#   docker rm -f splat-ns-v2
+#   docker compose up -d
+#
+# The bind mount points at the same host ./data directory, so no
+# dataset migration is needed. Existing processed/ and outputs/
+# subdirectories carry over as-is.
+# ============================================================
+
+services:
+  nerfstudio:
+    image: splat-nerfstudio-v2:latest
+    container_name: splat-ns-v2
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: nerfstudio
+
+    # bash would exit on EOF in a detached container. sleep is the
+    # canonical idle process for a persistent dev container; you
+    # always attach to it via `docker compose exec nerfstudio bash`.
+    command: ["sleep", "infinity"]
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+
+    # --- Runtime flags from the documented `docker create` -------
+    ipc: host                         # --ipc=host
+    shm_size: 16g                     # --shm-size=16g (PyTorch DataLoader needs real /dev/shm)
+    ulimits:
+      memlock:                        # --ulimit memlock=-1   (pinned GPU memory, uncapped)
+        soft: -1
+        hard: -1
+      stack: 67108864                 # --ulimit stack=67108864 (64 MiB; NCCL/CUDA need big stacks)
+
+    environment:
+      # Renamed from PYTORCH_CUDA_ALLOC_CONF in PyTorch 2.10. Without
+      # this, every nerfstudio invocation prints a deprecation warning
+      # and falls back to the default allocator, which fragments badly
+      # on long splatfacto runs.
+      PYTORCH_ALLOC_CONF: "expandable_segments:True"
+
+    ports:
+      - "7007:7007"                   # viser 3D viewer (web UI served by ns-train)
+      - "6006:6006"                   # TensorBoard (started manually with `tensorboard --bind_all`)
+
+    volumes:
+      # --- Bind mount: datasets + results, visible on host --------
+      # Matches the documented `-v ~/Desktop/docker_splat_v2/data:/workspace`.
+      # ./data resolves relative to this compose file, so cloning
+      # the repo to any host path still Just Works.
+      - ./data:/workspace
+
+      # --- Named volumes: runtime-generated caches ---------------
+      # None of these exist in the image; they're populated on first
+      # use and survive `docker compose down`. PyTorch's extension
+      # loader detects version mismatch on image rebuild and
+      # recompiles, so stale caches are self-healing — but if one
+      # ever gets genuinely corrupted, nuke it with:
+      #   docker volume rm docker_splat_v2_torch-extensions
+      - torch-extensions:/root/.cache/torch_extensions   # gsplat sm_120 JIT kernels (~27 MB, several minutes to recompile)
+      - torch-hub:/root/.cache/torch                     # LPIPS / AlexNet weights (~234 MB, one-time network download)
+      - nv-compute:/root/.nv                             # NVIDIA PTX→cubin JIT cache (warm CUDA startup)
+      - triton:/root/.triton                             # Triton kernel cache
+
+    # --- GPU access (the Compose-spec equivalent of --gpus all) --
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  torch-extensions:
+  torch-hub:
+  nv-compute:
+  triton:

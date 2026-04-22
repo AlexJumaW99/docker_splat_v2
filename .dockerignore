@@ -1,0 +1,77 @@
+# ============================================================
+# .dockerignore — trim the build context to what the Dockerfile
+# actually needs. The Dockerfile only COPY's files under image_bin/
+# everything else in the repo (datasets, docs, the host-side PySide
+# GUI and its venv, git history) is dead weight that would otherwise
+# be tar'd up and sent to the daemon on every build.
+# ============================================================
+
+# ------------------------------------------------------------
+# Host-only state / dev-environment artifacts
+# ------------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+.claude
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------
+# Documentation and dev scripts — not referenced by any COPY
+# ------------------------------------------------------------
+README.md
+USER_GUIDE.md
+smoke_test.sh
+
+# ------------------------------------------------------------
+# Desktop GUI runs on the host (its own venv, its own run.sh).
+# The container has no Qt runtime and never imports this code.
+# ------------------------------------------------------------
+gui
+
+# ------------------------------------------------------------
+# Datasets and training artifacts — the #1 way a build context
+# balloons. data/ already holds 20+ GB of videos on this machine.
+# ------------------------------------------------------------
+data
+outputs
+processed
+exports
+renders
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.ply
+*.splat
+*.ckpt
+*.pth
+
+# ------------------------------------------------------------
+# Python byproducts (anywhere in the tree)
+# ------------------------------------------------------------
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/.venv
+venv
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# ------------------------------------------------------------
+# Tarballs, env/secret files, orchestration files
+# ------------------------------------------------------------
+*.tar
+*.tar.gz
+.env
+.env.local
+.env.*.local
+docker-compose.yml
+docker-compose.*.yml
+compose.yml
+compose.*.yml
+.dockerignore
