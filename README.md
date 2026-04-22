@@ -30,6 +30,7 @@ This repo solves all three problems in a single reproducible Docker build:
 - **Pinned against NGC PyTorch 25.11** (CUDA 13.0, Python 3.12, sm_120 pre-compiled)
 - **Multi-stage Dockerfile** with `--target` support for incremental rebuilds
 - **Compatibility patch included** for the COLMAP `SiftExtraction` → `FeatureExtraction` flag rename that breaks Nerfstudio 1.1.5 out of the box
+- **COLMAP multi-submap auto-fix** via a PATH-shim that promotes the largest submap into `sparse/0` so `ns-process-data` doesn't silently export a 2-frame bootstrap stub
 - **Real-time training monitoring** via viser (3D preview) + TensorBoard (metrics/eval images) simultaneously
 
 End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M gaussians at 7000 iterations, ~15 minutes on an RTX 5070 Ti.
@@ -167,8 +168,9 @@ Three non-obvious issues you'd hit trying to build this yourself:
 | `PYTORCH_CUDA_ALLOC_CONF` warning on every invocation | Env var renamed to `PYTORCH_ALLOC_CONF` in PyTorch 2.10 | Use the new name in the `docker run` / `docker create` command |
 | `ns-train` fails to resume from checkpoints with `_pickle.UnpicklingError: Weights only load failed` | PyTorch 2.6 flipped `torch.load`'s `weights_only` default to `True`; nerfstudio's checkpoints include non-tensor state and fail the new safety check | `sed` patch in Stage 5 pins `weights_only=False` in nerfstudio's loader |
 | `ns-export gaussian-splat` crashes with `AssertionError` on splatfacto-w runs | Upstream exporter hard-asserts `isinstance(pipeline.model, SplatfactoModel)`, but `SplatfactoWModel` inherits from `Model` directly — and splatfacto-w computes SH coefficients per-frame from an appearance MLP rather than storing them as tensors | Image ships a custom `ns-export-splatfactow` CLI that bakes one appearance embedding (average of training cameras by default) into per-gaussian SH coefficients and writes an inria-format `.ply` with the same layout as `ns-export gaussian-splat`. The GUI Exports tab auto-routes to it for splatfacto-w/-light. |
+| `ns-process-data` silently exports a 2-frame `transforms.json` on longer videos | COLMAP 4.1's `incremental_pipeline` seeds a 2-image bootstrap as `sparse/0` before growing the main reconstruction into `sparse/1`. Nerfstudio's converter hardcodes `colmap_model_path = Path("colmap/sparse/0")`, so it reads the bootstrap stub and the real 200+-frame model sits unused on disk. | Image ships a PATH-shim (`/opt/colmap-shim/colmap`) that transparently wraps `colmap mapper`. After a successful mapper run it probes every numeric submap with `model_analyzer`, name-swaps the largest into `sparse/0`, and preserves the original `sparse/0` under its old name for inspection. Also injects `--Mapper.snapshot_path` so viser can watch incremental progress. Non-mapper subcommands pass through untouched. |
 
-All five are baked into the Dockerfile and the documented `docker create` command.
+All six are baked into the Dockerfile and the documented `docker create` command.
 
 ---
 
@@ -184,6 +186,7 @@ All five are baked into the Dockerfile and the documented `docker create` comman
 | External method: splatfacto-w | ✅ Registers `splatfacto-w` + `splatfacto-w-light` via nerfstudio entry points |
 | `.ply` export for splatfacto-w / -light | ✅ Custom `ns-export-splatfactow` CLI baked into the image; GUI routes automatically |
 | `ns-process-data video` end-to-end | ✅ 98.12% pose recovery on test video |
+| COLMAP multi-submap promotion shim | ✅ Largest submap swapped into `sparse/0` automatically on splintered runs |
 | `ns-train splatfacto` full training | ✅ 7000 iterations, ~84M gaussians, ~15 min |
 | Viser viewer reachable from host | ✅ Port 7007 bridged, scene renders live |
 | TensorBoard reachable from host | ✅ Port 6006 bridged, scalars + events logged |
@@ -208,6 +211,12 @@ All five are baked into the Dockerfile and the documented `docker create` comman
 Commit history (`git log --oneline`, most recent first):
 
 ```
+Add colmap-shim to auto-promote largest submap into sparse/0
+Warn on Process tab when COLMAP splinters into multiple submaps
+Pre-place faiss-format vocab tree for vocab_tree matcher
+Add help-badge tooltips across GUI and retheme to light palette
+Add advanced controls to Process tab and drop broken depth-debug flag
+Label splatfacto-mcmc runs distinctly in Exports tab
 Bake splatfacto-w into image and expose in Train dropdown (GUI)
 Add Exports tab with .ply export and camera-path video render (GUI)
 Fork naming to v2 and pin nerfstudio to git main (enables splatfacto-mcmc)

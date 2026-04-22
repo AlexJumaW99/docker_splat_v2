@@ -336,10 +336,14 @@ On an RTX 5070 Ti with a 30-second 1080p video at 250 frames:
 ├── images_4/            # Quarter resolution
 ├── images_8/            # 1/8 resolution
 ├── colmap/
-│   └── sparse/0/        # COLMAP sparse model (binary format)
+│   ├── sparse/0/        # COLMAP sparse model that ns-process-data exported from
+│   ├── sparse/1/        # Present iff COLMAP splintered; preserved for inspection
+│   └── snapshots/       # Incremental mapper snapshots (viser-watchable)
 ├── sparse_pc.ply        # Sparse point cloud (seed for splatfacto)
 └── transforms.json      # Nerfstudio camera poses (the key file)
 ```
+
+> On longer videos, COLMAP 4.1's `incremental_pipeline` sometimes seeds a 2-image bootstrap as `sparse/0` and grows the real model into `sparse/1`. The image ships a `colmap` PATH-shim (`/opt/colmap-shim/colmap`) that detects this after the mapper exits, probes each numeric submap with `colmap model_analyzer`, and name-swaps the largest into `sparse/0` (the original `sparse/0` is preserved under its old index). The result: `ns-process-data` always reads the largest reconstruction, never the bootstrap stub. You'll see `colmap-shim: promoting sparse/N (M registered images) -> sparse/0` on stderr when promotion happens. The shim is transparent and only touches `colmap mapper` — every other subcommand passes straight through.
 
 ### Success criteria
 
@@ -775,6 +779,19 @@ Fix: rebuild with a different `TORCH_CUDA_ARCH_LIST` value in the Dockerfile:
 | Blackwell (RTX 50xx) | `12.0` |
 
 Multiple architectures can be built simultaneously by separating with semicolons (at the cost of image size and build time).
+
+### `transforms.json` only contains 2 frames despite a long input video
+
+Cause: COLMAP 4.1's `incremental_pipeline` splintered the reconstruction — it seeded a 2-image bootstrap as `sparse/0` and grew the real model into `sparse/1`, `sparse/2`, etc. Nerfstudio's converter hardcodes `colmap_model_path = Path("colmap/sparse/0")`, so it exports the bootstrap stub and leaves the real reconstruction unused on disk.
+
+Fix: already handled by the `colmap-shim` baked into the image (`/opt/colmap-shim/colmap`, prepended to `PATH`). After the mapper exits, the shim probes every numeric submap with `colmap model_analyzer`, name-swaps the largest into `sparse/0`, and preserves the original `sparse/0` under its old index. You'll see `colmap-shim: promoting sparse/N (M registered images) -> sparse/0` on stderr when it kicks in.
+
+If you still see a 2-frame `transforms.json`:
+
+1. Confirm the shim is active: `docker exec splat-ns-v2 which colmap` should print `/opt/colmap-shim/colmap`. If it prints `/usr/local/bin/colmap`, your container was built from a pre-shim image — rebuild with `docker build --target nerfstudio -t splat-nerfstudio-v2 .` and recreate the container.
+2. Confirm the shim wasn't disabled: unset `COLMAP_SHIM_PROMOTE_LARGEST` (or set it to `1`) and re-run.
+3. Inspect `/workspace/processed/<run>/colmap/sparse/` — you should see multiple numeric subfolders. `colmap model_analyzer --path /workspace/processed/<run>/colmap/sparse/0` should report a large `Registered images` count.
+4. As a last resort, rerun `ns-process-data` with `--skip-colmap --colmap-model-path sparse/<N>` pointing at the real submap.
 
 ### "Aborted (core dumped)" at the end of training
 

@@ -134,6 +134,20 @@ RUN pip install --no-cache-dir --no-deps \
 COPY image_bin/ns-export-splatfactow /usr/local/bin/ns-export-splatfactow
 RUN chmod +x /usr/local/bin/ns-export-splatfactow
 
+# v4.3: colmap shim — wraps `colmap mapper` to (a) inject snapshot flags for
+# live viser progress and (b) swap the largest submap into sparse/0 when
+# COLMAP's incremental_pipeline (4.1.0.dev0) splinters the reconstruction.
+# Nerfstudio hardcodes colmap_model_path=Path("colmap/sparse/0"); COLMAP 4.1
+# seeds a 2-image bootstrap as sparse/0 before growing the main model into
+# sparse/1, so ns-process-data silently exports a 2-frame transforms.json
+# while the real reconstruction sits unused. Shim lives at a stable path and
+# is prepended to PATH so every caller (ns-process-data, GUI, interactive
+# shells) hits it transparently; non-mapper subcommands pass through. See
+# shim source for env knobs (COLMAP_SHIM_SNAPSHOT_FREQ, *_PROMOTE_LARGEST).
+COPY image_bin/colmap-shim /opt/colmap-shim/colmap
+RUN chmod +x /opt/colmap-shim/colmap
+ENV PATH=/opt/colmap-shim:$PATH
+
 # v4.2: pre-place a faiss-format vocabulary tree for vocab_tree_matcher.
 # In May 2025 COLMAP migrated its vocab_tree_matcher backend from FLANN to
 # faiss (colmap/colmap#3486). The legacy file nerfstudio downloads from

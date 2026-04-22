@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# colmap-shim — transparent wrapper around /usr/local/bin/colmap.
+#
+# Installed at /opt/colmap-shim/colmap; /opt/colmap-shim is prepended to
+# PATH by the Dockerfile so every `colmap` invocation (ns-process-data,
+# the GUI, interactive shells) lands here first.
+#
+# Two jobs, both only on the `mapper` subcommand — everything else is
+# a straight passthrough:
+#
+#   1. Snapshot injection. If the caller didn't already set
+#      --Mapper.snapshot_path, the shim adds one pointing at a sibling
+#      `snapshots/` directory next to the output path so viser can watch
+#      incremental progress. Preserves the behaviour of the ad-hoc shim
+#      that previously lived in /tmp.
+#
+#   2. Largest-submap promotion (the real bug fix). COLMAP 4.1's
+#      incremental_pipeline seeds a 2-image bootstrap model as sparse/0
+#      before growing the main reconstruction into sparse/1. Nerfstudio's
+#      colmap_converter_to_nerfstudio_dataset hardcodes
+#      colmap_model_path = Path("colmap/sparse/0"), so ns-process-data
+#      silently exports a transforms.json with two frames while the real
+#      261-frame reconstruction sits unused. After a successful mapper
+#      run, if multiple numeric submaps exist and the biggest isn't
+#      already `0`, the shim name-swaps the largest submap into `0`
+#      (preserving all submaps on disk for debugging/inspection).
+#
+# Safety:
+#   - Mapper failures (rc != 0) skip promotion entirely.
+#   - Any probe failure (missing cameras.bin, model_analyzer error, …)
+#     falls through silently — a corrupted swap is strictly worse than
+#     a missing promotion.
+#   - Single-submap runs are untouched.
+#   - Runs where `0` is already the largest are untouched.
+#
+# Env knobs (all optional):
+#   COLMAP_SHIM_REAL               path to the real colmap binary
+#                                  (default: /usr/local/bin/colmap)
+#   COLMAP_SHIM_SNAPSHOT_FREQ      frames-between-snapshots for viser
+#                                  (default: 3; 0 to disable snapshots)
+#   COLMAP_SHIM_PROMOTE_LARGEST    set to 0 to disable promotion
+#                                  (default: 1)
+
+set -uo pipefail
+
+REAL_COLMAP="${COLMAP_SHIM_REAL:-/usr/local/bin/colmap}"
+SNAPSHOT_FREQ="${COLMAP_SHIM_SNAPSHOT_FREQ:-3}"
+PROMOTE_LARGEST="${COLMAP_SHIM_PROMOTE_LARGEST:-1}"
+
+# Passthrough for everything except `mapper`.
+if [[ "${1-}" != "mapper" ]]; then
+    exec "$REAL_COLMAP" "$@"
+fi
+
+# Parse --output_path (needed for both features) and note if the caller
+# already supplied a snapshot path (then we don't inject our own).
+output_path=""
+has_snapshot_path=0
+args=("$@")
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+    case "${args[$i]}" in
+        --output_path)
+            output_path="${args[$((i+1))]-}"
+            i=$((i+2))
+            ;;
+        --output_path=*)
+            output_path="${args[$i]#--output_path=}"
+            i=$((i+1))
+            ;;
+        --Mapper.snapshot_path|--Mapper.snapshot_path=*)
+            has_snapshot_path=1
+            i=$((i+1))
+            ;;
+        *)
+            i=$((i+1))
+            ;;
+    esac
+done
+
+# (1) Snapshot injection — sibling `snapshots/` dir next to output_path.
+extra=()
+if [[ $has_snapshot_path -eq 0 ]] \
+        && [[ -n "$output_path" ]] \
+        && [[ "$SNAPSHOT_FREQ" != "0" ]]; then
+    snap_dir="$(dirname "$output_path")/snapshots"
+    mkdir -p "$snap_dir" 2>/dev/null || true
+    if [[ -d "$snap_dir" ]]; then
+        extra=(--Mapper.snapshot_path "$snap_dir" \
+               --Mapper.snapshot_frames_freq "$SNAPSHOT_FREQ")
+    fi
+fi
+
+# Run the real mapper. Capture rc so we can post-process on success.
+"$REAL_COLMAP" "$@" "${extra[@]}"
+rc=$?
+
+# (2) Largest-submap promotion. Skip on mapper failure, or if the user
+# opted out, or if we can't determine the output directory.
+if [[ $rc -ne 0 ]] \
+        || [[ "$PROMOTE_LARGEST" != "1" ]] \
+        || [[ -z "$output_path" ]] \
+        || [[ ! -d "$output_path" ]]; then
+    exit $rc
+fi
+
+# Collect valid numeric submap names.
+submaps=()
+shopt -s nullglob
+for d in "$output_path"/*/; do
+    name="$(basename "$d")"
+    [[ "$name" =~ ^[0-9]+$ ]] || continue
+    [[ -f "$d/cameras.bin" ]] || continue
+    [[ -f "$d/images.bin" ]] || continue
+    submaps+=("$name")
+done
+shopt -u nullglob
+
+# Nothing to promote on 0-or-1-submap runs.
+if [[ ${#submaps[@]} -le 1 ]]; then
+    exit $rc
+fi
+
+# Probe each submap via colmap model_analyzer (read-only).
+best=""
+best_count=-1
+for n in "${submaps[@]}"; do
+    count=$("$REAL_COLMAP" model_analyzer --path "$output_path/$n" 2>&1 \
+        | grep -oP 'Registered images:\s*\K\d+' | head -1)
+    [[ -z "$count" ]] && continue
+    if (( count > best_count )); then
+        best_count=$count
+        best="$n"
+    fi
+done
+
+if [[ -z "$best" ]] || [[ "$best" == "0" ]]; then
+    exit $rc
+fi
+
+# Three-way swap so sparse/0 <-> sparse/$best. Preserves every submap.
+tmp="$output_path/.shim-swap-$$"
+printf 'colmap-shim: promoting sparse/%s (%s registered images) -> sparse/0\n' \
+    "$best" "$best_count" >&2
+if mv "$output_path/0" "$tmp" 2>/dev/null \
+        && mv "$output_path/$best" "$output_path/0" 2>/dev/null \
+        && mv "$tmp" "$output_path/$best" 2>/dev/null; then
+    printf 'colmap-shim: previous sparse/0 preserved at sparse/%s\n' "$best" >&2
+else
+    # Best-effort rollback — if any mv failed, try to undo the first one.
+    if [[ -d "$tmp" ]] && [[ ! -d "$output_path/0" ]]; then
+        mv "$tmp" "$output_path/0" 2>/dev/null || true
+    fi
+    printf 'colmap-shim: promotion swap failed, leaving submaps untouched\n' >&2
+fi
+
+exit $rc
