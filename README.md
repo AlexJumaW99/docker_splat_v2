@@ -46,7 +46,7 @@ End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M g
 | **gsplat** | `1.4.0` | PyPI (JIT-compiled at runtime) | Gaussian rasterization |
 | **Nerfstudio** | `1.1.5` (git `50e0e3c`) | git main, pinned | Training CLI + viewer |
 | **splatfacto-w** | `0.1.5` (git `119a3bf`) | [KevinXu02/splatfacto-w](https://github.com/KevinXu02/splatfacto-w) | `splatfacto-w` / `splatfacto-w-light` methods |
-| **Viser** | `0.2.7` | Pinned by Nerfstudio | Web-based 3D viewer (port 7007) |
+| **Viser** | `1.0.0` | Pinned by Nerfstudio (`viser==1.0.0`) | Web-based 3D viewer (port 7007) |
 | **TensorBoard** | `2.20.0` | Bundled with NGC PyTorch | Metrics + eval image logging (port 6006) |
 | **ffmpeg** | `6.1.1` | apt | Video frame extraction |
 
