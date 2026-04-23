@@ -394,6 +394,46 @@ echo "$help_out" | grep -q '\-\-appearance-mode' \
     || fail "ns-export-splatfactow --appearance-mode flag" "flag missing from --help"
 
 # ============================================================================
+# 16. Viewer split-mode patch (Stage 5 sed, v4.4)
+#
+# The patch filters gl_z_buf_depth out of the output dropdowns in the viser
+# viewer so split mode doesn't crash when that internal key is defaulted as
+# the split output at a mismatched resolution. We verify:
+#   - file still present at its expected path
+#   - both patched anchors present (1 ref each)
+#   - both unpatched anchors absent (0 refs each)
+#   - gl_z_buf_depth is still referenced for 3D compositing (line 283 reader
+#     plus the two writers at lines 188/199 — 3 refs total) so depth
+#     compositing itself still works
+#   - the patched file still imports cleanly (py_compile)
+# ============================================================================
+section "16. Viewer split-mode patch (v4.4)"
+
+rsm='/usr/local/lib/python3.12/dist-packages/nerfstudio/viewer/render_state_machine.py'
+
+if ! dexec test -f "$rsm"; then
+    fail "render_state_machine.py exists at $rsm" "file missing — nerfstudio version may have moved it"
+else
+    pass "render_state_machine.py exists"
+
+    new_set=$(dexec grep -c -F 'set(outputs.keys()) - {"gl_z_buf_depth"}'                      "$rsm" | tr -d '[:space:]')
+    new_list=$(dexec grep -c -F '[k for k in outputs.keys() if k != "gl_z_buf_depth"]'         "$rsm" | tr -d '[:space:]')
+    old_set=$(dexec  grep -c -E 'output_keys = set\(outputs\.keys\(\)\)$'                      "$rsm" | tr -d '[:space:]')
+    old_list=$(dexec grep -c -F 'update_output_options(list(outputs.keys()))'                  "$rsm" | tr -d '[:space:]')
+    ref_total=$(dexec grep -c -F 'gl_z_buf_depth'                                              "$rsm" | tr -d '[:space:]')
+
+    [ "${new_set:-0}"  = "1" ] && pass "set(...) difference patch present"                     || fail "set difference patch applied" "got $new_set"
+    [ "${new_list:-0}" = "1" ] && pass "list-comprehension patch present"                      || fail "list-comprehension patch applied" "got $new_list"
+    [ "${old_set:-0}"  = "0" ] && pass "unpatched 'set(outputs.keys())' absent"                || fail "unpatched set form removed" "$old_set ref(s) remain"
+    [ "${old_list:-0}" = "0" ] && pass "unpatched 'update_output_options(list(...))' absent"   || fail "unpatched list form removed" "$old_list ref(s) remain"
+    [ "${ref_total:-0}" -ge 3 ] && { pass "gl_z_buf_depth still referenced ($ref_total refs; depth compositing intact)"; info "expected >= 3: 2 writers + 1 reader + our 2 filter mentions"; } \
+                                || fail "gl_z_buf_depth referenced" "only $ref_total ref(s); depth compositing may be broken"
+
+    py_ok=$(dexec python -c "import py_compile; py_compile.compile('$rsm', doraise=True); print('OK')" 2>&1)
+    [ "$py_ok" = "OK" ] && pass "render_state_machine.py py_compile clean" || fail "render_state_machine.py py_compile" "$py_ok"
+fi
+
+# ============================================================================
 # Summary
 # ============================================================================
 section "Summary"

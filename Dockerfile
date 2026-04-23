@@ -115,6 +115,34 @@ RUN sed -i 's|map_location="cpu")|map_location="cpu", weights_only=False)|g' \
         /usr/local/lib/python3.12/dist-packages/nerfstudio/engine/trainer.py \
         /usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/downloads/download_data.py
 
+# v4.4: filter the internal viewer key `gl_z_buf_depth` out of the output
+# dropdowns in the viser viewer. render_state_machine.py injects
+# outputs["gl_z_buf_depth"] on every render — a depth channel used *only* for
+# 3D browser depth compositing (camera frustums / crop gizmo occluded by the
+# gaussian render). For SplatfactoModel it is *downsampled* to 128² in the
+# low_move/low_static interaction states, so it has a different shape than the
+# rgb/depth/accumulation/background keys returned by the model. The viewer
+# passes every key in outputs to update_output_options() and defaults the
+# split dropdown to the *last* key, which happens to be gl_z_buf_depth, so
+# the first time a user enables "Enable" split the viewer crashes with
+#   RuntimeError: Sizes of tensors must match except in dimension 1.
+#   Expected size N but got size M for tensor number 1 in the list.
+# in _send_output_to_viewer's torch.cat. The documented workaround
+# (nerfstudio#3255) is to uncheck "Composite depth" in the viewer — which
+# works but disables 3D compositing. No upstream fix exists as of
+# main@50e0e3c; grep confirms gl_z_buf_depth is only read at three sites, all
+# inside render_state_machine.py (two writers + one reader at line 283 that
+# ships it to viser). We keep the key in the outputs dict so depth
+# compositing still works, and only exclude it from the dropdown options so
+# split mode works regardless of the Composite-depth setting. Both sed
+# anchors are unique in the source (verified with `grep -c` == 1 for each);
+# py_compile succeeds on the patched file. Verified still needed against
+# nerfstudio main@50e0e3c.
+RUN sed -i \
+        -e 's|output_keys = set(outputs.keys())|output_keys = set(outputs.keys()) - {"gl_z_buf_depth"}|' \
+        -e 's|self.viewer.control_panel.update_output_options(list(outputs.keys()))|self.viewer.control_panel.update_output_options([k for k in outputs.keys() if k != "gl_z_buf_depth"])|' \
+        /usr/local/lib/python3.12/dist-packages/nerfstudio/viewer/render_state_machine.py
+
 # splatfacto-w (KevinXu02) is listed as an external method by nerfstudio. It
 # registers `splatfacto-w` and `splatfacto-w-light` via the
 # nerfstudio.method_configs entry point. We install with --no-deps because its
