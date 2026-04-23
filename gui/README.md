@@ -30,10 +30,10 @@ Subsequent launches are instant.
 A project bundles a dataset with its processing/training runs. Two ways to
 create one (**+ New project**):
 
-- **From video** — point at a video file inside `~/Desktop/docker_splat_v2/data/`.
+- **From video** — point at a video file inside `~/docker-stacks/docker_splat_v2/data/`.
   The project goes through Process → Train like the CLI workflow.
 - **Import processed dataset** — point at an already-processed folder inside
-  `~/Desktop/docker_splat_v2/data/`. The app auto-detects the layout:
+  `~/docker-stacks/docker_splat_v2/data/`. The app auto-detects the layout:
   - `transforms.json` at the root → Nerfstudio dataparser
   - `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → COLMAP dataparser,
     with the relative path recorded on the project so `ns-train` gets

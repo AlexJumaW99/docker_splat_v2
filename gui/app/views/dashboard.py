@@ -49,13 +49,13 @@ DOCKER_CREATE_CMD = """docker create \\
   --ulimit stack=67108864 \\
   --shm-size=16g \\
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \\
-  -v ~/Desktop/docker_splat_v2/data:/workspace \\
+  -v ~/docker-stacks/docker_splat_v2/data:/workspace \\
   -p 7007:7007 \\
   -p 6006:6006 \\
   -it \\
   splat-nerfstudio-v2"""
 
-DOCKER_BUILD_CMD = ("cd ~/Desktop/docker_splat_v2\n"
+DOCKER_BUILD_CMD = ("cd ~/docker-stacks/docker_splat_v2\n"
                    "docker build --target nerfstudio -t splat-nerfstudio-v2 .")
 
 

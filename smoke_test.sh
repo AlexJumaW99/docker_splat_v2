@@ -17,7 +17,7 @@ set -u
 
 CONTAINER="${CONTAINER:-splat-ns-v2}"
 IMAGE="${IMAGE:-splat-nerfstudio-v2:latest}"
-HOST_DATA_DIR="${HOST_DATA_DIR:-/home/meroe/Desktop/docker_splat_v2/data}"
+HOST_DATA_DIR="${HOST_DATA_DIR:-/home/meroe/docker-stacks/docker_splat_v2/data}"
 SKIP_JIT=0
 for arg in "$@"; do
     case "$arg" in

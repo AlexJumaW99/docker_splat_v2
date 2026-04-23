@@ -11,7 +11,7 @@ TENSORBOARD_PORT = 6006
 CONFIG_DIR = Path.home() / ".config" / "docker_splat_v2_gui"
 PROJECTS_FILE = CONFIG_DIR / "projects.json"
 
-REPO_ROOT = Path.home() / "Desktop" / "docker_splat_v2"
+REPO_ROOT = Path.home() / "docker-stacks" / "docker_splat_v2"
 DATA_DIR = REPO_ROOT / "data"
 USER_GUIDE = REPO_ROOT / "USER_GUIDE.md"
 

@@ -77,7 +77,7 @@ services:
 
     volumes:
       # --- Bind mount: datasets + results, visible on host --------
-      # Matches the documented `-v ~/Desktop/docker_splat_v2/data:/workspace`.
+      # Matches the documented `-v ~/docker-stacks/docker_splat_v2/data:/workspace`.
       # ./data resolves relative to this compose file, so cloning
       # the repo to any host path still Just Works.
       - ./data:/workspace

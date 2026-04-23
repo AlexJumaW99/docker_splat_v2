@@ -69,12 +69,12 @@ Build takes **25–40 minutes** on first run (COLMAP compile is the bottleneck, 
 ### 2. Create and start the persistent container
 
 ```bash
-mkdir -p ~/Desktop/docker_splat_v2/data
+mkdir -p ~/docker-stacks/docker_splat_v2/data
 
 docker create --name splat-ns-v2 --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -v ~/Desktop/docker_splat_v2/data:/workspace \
+  -v ~/docker-stacks/docker_splat_v2/data:/workspace \
   -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2
 
 docker start splat-ns-v2
@@ -86,7 +86,7 @@ docker exec -it splat-ns-v2 bash
 ### 3. Process a video → train → view
 
 ```bash
-# Inside the container — drop your video at ~/Desktop/docker_splat_v2/data/ first
+# Inside the container — drop your video at ~/docker-stacks/docker_splat_v2/data/ first
 ns-process-data video --data /workspace/yourvideo.mp4 \
   --output-dir /workspace/processed/yourvideo_splat \
   --num-frames-target 250 --matching-method sequential
@@ -198,7 +198,7 @@ All six are baked into the Dockerfile and the documented `docker create` command
 
 - **Blackwell-only by design.** `TORCH_CUDA_ARCH_LIST=12.0` targets `sm_120` exclusively. To run on an Ada or Ampere card, change to `8.9` or `8.6` respectively in the Dockerfile (and rebuild).
 - **16 GB VRAM assumption.** Training large scenes (> 500 images at 4K) may OOM on a 5070 Ti. The `PYTORCH_ALLOC_CONF=expandable_segments:True` env var helps, but is not magic. For heavier scenes, use a 5080 (16GB) or 5090 (32GB).
-- **Container runs as root.** Files written to `/workspace/outputs/` will be `root:root` on the host. Run `sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data` periodically.
+- **Container runs as root.** Files written to `/workspace/outputs/` will be `root:root` on the host. Run `sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data` periodically.
 - **`ns-download-data` is broken upstream.** Nerfstudio's bundled dataset downloader fails due to Google Drive rate-limiting — this is not a bug in this repo, it's a [long-running upstream issue](https://github.com/nerfstudio-project/nerfstudio/issues/3134). Use your own video data.
 - **Viser may stutter briefly during eval steps** when used alongside TensorBoard. Documented upstream; typically a few seconds of laggy viewport every ~1000 iterations. Training metrics are unaffected.
 

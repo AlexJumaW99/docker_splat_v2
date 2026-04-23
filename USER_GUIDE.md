@@ -131,7 +131,7 @@ Expected: one line showing the image with size around **26 GB**. The size is lar
 ### Create the persistent container (once)
 
 ```bash
-mkdir -p ~/Desktop/docker_splat_v2/data
+mkdir -p ~/docker-stacks/docker_splat_v2/data
 
 docker create \
   --name splat-ns-v2 \
@@ -141,7 +141,7 @@ docker create \
   --ulimit stack=67108864 \
   --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -v ~/Desktop/docker_splat_v2/data:/workspace \
+  -v ~/docker-stacks/docker_splat_v2/data:/workspace \
   -p 7007:7007 \
   -p 6006:6006 \
   -it \
@@ -158,7 +158,7 @@ docker create \
 | `--ulimit memlock=-1 --ulimit stack=67108864` | Required by NGC PyTorch for proper memory management |
 | `--shm-size=16g` | Shared memory size for large tensors |
 | `-e PYTORCH_ALLOC_CONF=expandable_segments:True` | Memory allocator config; reduces fragmentation on long training runs |
-| `-v ~/Desktop/docker_splat_v2/data:/workspace` | Bind mount — data persists on host outside the container |
+| `-v ~/docker-stacks/docker_splat_v2/data:/workspace` | Bind mount — data persists on host outside the container |
 | `-p 7007:7007` | Viser web viewer port |
 | `-p 6006:6006` | TensorBoard web UI port |
 | `-it` | Interactive TTY |
@@ -187,14 +187,14 @@ docker rm splat-ns-v2
 # then re-run the `docker create` block above
 ```
 
-Bind-mounted data at `~/Desktop/docker_splat_v2/data` is unaffected — only the container's writable layer is destroyed. Note: this will invalidate the gsplat JIT kernel cache at `/root/.cache/torch_extensions/`, so the first training in the new container will pause 60-120 seconds to recompile kernels.
+Bind-mounted data at `~/docker-stacks/docker_splat_v2/data` is unaffected — only the container's writable layer is destroyed. Note: this will invalidate the gsplat JIT kernel cache at `/root/.cache/torch_extensions/`, so the first training in the new container will pause 60-120 seconds to recompile kernels.
 
 ### File ownership housekeeping
 
 The container runs as root, so files it writes to `/workspace/` will be root-owned on the host. Every so often:
 
 ```bash
-sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data
+sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data
 ```
 
 ---
@@ -227,8 +227,8 @@ First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subseque
 
 A project bundles a dataset with its processing/training runs. **+ New project** offers two modes:
 
-- **From video** — point at a video file inside `~/Desktop/docker_splat_v2/data/`. Goes Process → Train like the CLI workflow.
-- **Import processed dataset** — point at an already-processed folder inside `~/Desktop/docker_splat_v2/data/`. The app auto-detects the layout:
+- **From video** — point at a video file inside `~/docker-stacks/docker_splat_v2/data/`. Goes Process → Train like the CLI workflow.
+- **Import processed dataset** — point at an already-processed folder inside `~/docker-stacks/docker_splat_v2/data/`. The app auto-detects the layout:
   - `transforms.json` at the root → Nerfstudio dataparser
   - `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → COLMAP dataparser, with the relative path saved so `ns-train` gets `--colmap-path <rel>` automatically
 
@@ -286,7 +286,7 @@ Phone video straight out of the camera is fine. No editing needed.
 
 ## Processing a video
 
-Place your video at `~/Desktop/docker_splat_v2/data/yourvideo.mp4` on the host. This becomes `/workspace/yourvideo.mp4` inside the container.
+Place your video at `~/docker-stacks/docker_splat_v2/data/yourvideo.mp4` on the host. This becomes `/workspace/yourvideo.mp4` inside the container.
 
 Inside the container:
 
@@ -459,10 +459,10 @@ If you already have a reconstructed scene (Tanks & Temples, MipNeRF360, your own
 
 ### Place the dataset under the bind mount
 
-The container only sees `~/Desktop/docker_splat_v2/data/` (it's mounted at `/workspace`). So move or symlink the dataset there:
+The container only sees `~/docker-stacks/docker_splat_v2/data/` (it's mounted at `/workspace`). So move or symlink the dataset there:
 
 ```bash
-mv /path/to/Ballroom ~/Desktop/docker_splat_v2/data/processed/ballroom_splat
+mv /path/to/Ballroom ~/docker-stacks/docker_splat_v2/data/processed/ballroom_splat
 ```
 
 The `_splat` suffix is convention — not required, but matches what `ns-process-data` produces.
@@ -682,7 +682,7 @@ Output: `splat.ply` in the specified directory; same 62-property layout (`x y z 
 The PLY will be written as root inside the container. To open it on the host:
 
 ```bash
-sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data/outputs
+sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data/outputs
 ```
 
 ### Recommended post-training editor: SuperSplat
@@ -816,7 +816,7 @@ docker images | grep splat-nerfstudio-v2
 docker create --name splat-ns-v2 --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -v ~/Desktop/docker_splat_v2/data:/workspace \
+  -v ~/docker-stacks/docker_splat_v2/data:/workspace \
   -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2
 
 # Daily lifecycle
@@ -831,7 +831,7 @@ docker rm splat-ns-v2
 docker port splat-ns-v2
 
 # Fix host ownership
-sudo chown -R $USER:$USER ~/Desktop/docker_splat_v2/data
+sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data
 ```
 
 ### Container-side (inside `docker exec -it splat-ns-v2 bash`)
