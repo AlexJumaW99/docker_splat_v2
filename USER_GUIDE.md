@@ -128,6 +128,13 @@ Expected: one line showing the image with size around **26 GB**. The size is lar
 
 ## Container lifecycle
 
+> **Shortcut.** A [`Makefile`](Makefile) at the repo root wraps the commands in
+> this section: `make up` / `make shell` / `make down` for daily use, and
+> `make fresh` for a full rebuild-from-scratch (down → build → up → smoke
+> test) if you lose the image or container. `make help` lists everything.
+> The raw `docker` / `docker compose` commands below remain the ground
+> truth — the Makefile just saves keystrokes.
+
 ### Create the persistent container (once)
 
 ```bash

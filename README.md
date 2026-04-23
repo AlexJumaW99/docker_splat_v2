@@ -56,6 +56,18 @@ End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M g
 
 **Prerequisites:** Linux host with NVIDIA driver ≥ 580, Docker 28+, NVIDIA Container Toolkit, and a Blackwell GPU (RTX 5070 Ti, 5080, 5090, etc.). See [USER_GUIDE.md](USER_GUIDE.md#host-prerequisites) for full setup.
 
+### TL;DR — Makefile shortcuts
+
+If you have `make` installed, one target covers disaster recovery end-to-end:
+
+```bash
+git clone https://github.com/AlexJumaW99/docker_splat_v2.git
+cd docker_splat_v2
+make fresh        # down → build → up → ./smoke_test.sh (full verification)
+```
+
+Everyday: `make up` (start), `make shell` (bash into `/workspace`), `make test` (run smoke suite), `make down` (stop + remove). Run `make help` for the list, or skip the Makefile entirely and use the raw commands in the numbered steps below — they're equivalent.
+
 ### 1. Clone and build
 
 ```bash
