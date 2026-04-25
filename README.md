@@ -42,7 +42,7 @@ End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M g
 | Component | Version | Source | Purpose |
 |---|---|---|---|
 | **Base image** | `nvcr.io/nvidia/pytorch:25.11-py3` | NGC | CUDA 13.0 + PyTorch 2.10 + sm_120 |
-| **COLMAP** | `4.1.0.dev0` | Built from source (`main` branch) | SfM + GPU SIFT |
+| **COLMAP** | `4.1.0.dev0` (commit `ffb5404`) | Built from source, pinned commit | SfM + GPU SIFT |
 | **gsplat** | `1.4.0` | PyPI (JIT-compiled at runtime) | Gaussian rasterization |
 | **Nerfstudio** | `1.1.5` (git `50e0e3c`) | git main, pinned | Training CLI + viewer |
 | **splatfacto-w** | `0.1.5` (git `119a3bf`) | [KevinXu02/splatfacto-w](https://github.com/KevinXu02/splatfacto-w) | `splatfacto-w` / `splatfacto-w-light` methods |
@@ -181,8 +181,9 @@ Three non-obvious issues you'd hit trying to build this yourself:
 | `ns-train` fails to resume from checkpoints with `_pickle.UnpicklingError: Weights only load failed` | PyTorch 2.6 flipped `torch.load`'s `weights_only` default to `True`; nerfstudio's checkpoints include non-tensor state and fail the new safety check | `sed` patch in Stage 5 pins `weights_only=False` in nerfstudio's loader |
 | `ns-export gaussian-splat` crashes with `AssertionError` on splatfacto-w runs | Upstream exporter hard-asserts `isinstance(pipeline.model, SplatfactoModel)`, but `SplatfactoWModel` inherits from `Model` directly — and splatfacto-w computes SH coefficients per-frame from an appearance MLP rather than storing them as tensors | Image ships a custom `ns-export-splatfactow` CLI that bakes one appearance embedding (average of training cameras by default) into per-gaussian SH coefficients and writes an inria-format `.ply` with the same layout as `ns-export gaussian-splat`. The GUI Exports tab auto-routes to it for splatfacto-w/-light. |
 | `ns-process-data` silently exports a 2-frame `transforms.json` on longer videos | COLMAP 4.1's `incremental_pipeline` seeds a 2-image bootstrap as `sparse/0` before growing the main reconstruction into `sparse/1`. Nerfstudio's converter hardcodes `colmap_model_path = Path("colmap/sparse/0")`, so it reads the bootstrap stub and the real 200+-frame model sits unused on disk. | Image ships a PATH-shim (`/opt/colmap-shim/colmap`) that transparently wraps `colmap mapper`. After a successful mapper run it probes every numeric submap with `model_analyzer`, name-swaps the largest into `sparse/0`, and preserves the original `sparse/0` under its old name for inspection. Also injects `--Mapper.snapshot_path` so viser can watch incremental progress. Non-mapper subcommands pass through untouched. |
+| Two builds done a month apart could ship different COLMAP code under the same `4.1.0.dev0` version string | `git clone --depth 1` always pulled whatever was at `main` HEAD; nothing pinned the actual commit | `ARG COLMAP_COMMIT` in Stage 3 pins to a specific upstream SHA (currently `ffb5404`); partial clone (`--filter=blob:none`) checks out exactly that commit. Resolved SHA is recorded at `/etc/colmap-commit.sha` in the image, and `smoke_test.sh` asserts it matches the Dockerfile pin. Bumping the SHA + rerunning smoke tests is the upgrade ritual, matching the convention already in place for `NERFSTUDIO_COMMIT` / `SPLATFACTOW_COMMIT` / `VOCAB_TREE_COMMIT`. |
 
-All six are baked into the Dockerfile and the documented `docker create` command.
+All seven are baked into the Dockerfile and the documented `docker create` command.
 
 ---
 
@@ -193,6 +194,7 @@ All six are baked into the Dockerfile and the documented `docker create` command
 | NGC base image pull and tag detection | ✅ Verified |
 | apt dependency install (Stage 2) | ✅ Verified |
 | COLMAP source build with sm_120 | ✅ Verified — binary reports "with CUDA" |
+| COLMAP commit pin (Dockerfile vs image) | ✅ `smoke_test.sh` asserts `/etc/colmap-commit.sha` matches `ARG COLMAP_COMMIT` |
 | gsplat rasterization on `cuda:0` | ✅ Verified — `RASTERIZATION SUCCESS` smoke test |
 | Nerfstudio CLI available | ✅ Built-in methods including splatfacto, splatfacto-big, splatfacto-mcmc |
 | External method: splatfacto-w | ✅ Registers `splatfacto-w` + `splatfacto-w-light` via nerfstudio entry points |
@@ -223,6 +225,7 @@ All six are baked into the Dockerfile and the documented `docker create` command
 Commit history (`git log --oneline`, most recent first):
 
 ```
+Pin COLMAP to a specific upstream commit + add smoke-test guard
 Add colmap-shim to auto-promote largest submap into sparse/0
 Warn on Process tab when COLMAP splinters into multiple submaps
 Pre-place faiss-format vocab tree for vocab_tree matcher

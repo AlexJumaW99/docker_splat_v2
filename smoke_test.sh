@@ -153,6 +153,49 @@ echo "$help" | grep -q '\-\-SiftExtraction.use_gpu' \
     && warn "old --SiftExtraction.use_gpu still present" "unexpected — should have been replaced" \
     || pass "old --SiftExtraction.use_gpu flag is gone"
 
+# Verify the pinned COLMAP commit was baked into the image and matches the
+# Dockerfile's ARG default. COLMAP's `-h` does print a 7-char abbreviated
+# commit (`Commit ffb5404e on YYYY-MM-DD`), but matching that against a
+# 40-char SHA prefix is fiddly. /etc/colmap-commit.sha stores the full SHA
+# and makes the comparison trivial. Drift here means someone bumped
+# COLMAP_COMMIT in the Dockerfile but forgot to rebuild — or built with
+# --build-arg COLMAP_COMMIT=other, in which case the smoke test correctly
+# flags that the canonical pin no longer describes what's running.
+sha_file='/etc/colmap-commit.sha'
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dockerfile="${script_dir}/Dockerfile"
+
+if ! dexec test -f "$sha_file"; then
+    fail "$sha_file present in image" \
+        "file missing — image pre-dates the COLMAP_COMMIT pin? rebuild with current Dockerfile"
+else
+    actual_sha=$(dexec cat "$sha_file" | tr -d '[:space:]')
+    if [[ "$actual_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        pass "$sha_file holds a 40-char hex SHA"
+        info "image:    $actual_sha"
+    else
+        fail "$sha_file holds a 40-char hex SHA" "got: '$actual_sha'"
+    fi
+
+    if [ -f "$dockerfile" ]; then
+        expected_sha=$(grep -E '^ARG[[:space:]]+COLMAP_COMMIT=' "$dockerfile" \
+            | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    else
+        expected_sha=""
+    fi
+
+    if [ -n "$expected_sha" ]; then
+        info "Dockerfile: $expected_sha"
+        [ "$actual_sha" = "$expected_sha" ] \
+            && pass "image COLMAP commit matches Dockerfile pin" \
+            || fail "image COLMAP commit matches Dockerfile pin" \
+                    "drift detected — rebuild with: docker compose build --no-cache nerfstudio"
+    else
+        warn "could not read expected COLMAP_COMMIT from Dockerfile" \
+            "Dockerfile not found at $dockerfile, or no 'ARG COLMAP_COMMIT=' line"
+    fi
+fi
+
 # ============================================================================
 # 7. ffmpeg
 # ============================================================================

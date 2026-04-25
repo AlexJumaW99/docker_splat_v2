@@ -43,10 +43,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ============================================================
 # Stage 3: colmap — COLMAP built from source with sm_120
+#
+# v4.5: pin COLMAP to a specific upstream commit instead of tracking main
+# HEAD. The previous `git clone --depth 1` would always pull whatever was
+# at main when the build ran, so two builds done a month apart could ship
+# different COLMAP code under the same `4.1.0.dev0` version string.
+# Bumping COLMAP_COMMIT below + re-running smoke_test.sh is the new
+# upgrade ritual; this matches the convention already used by
+# NERFSTUDIO_COMMIT, SPLATFACTOW_COMMIT, and VOCAB_TREE_COMMIT in Stage 5.
+#
+# `git clone --filter=blob:none` is a partial clone — defers blob downloads
+# until checkout, so disk + network usage stays close to a shallow clone
+# while still letting us check out an arbitrary SHA (which `--depth 1`
+# can't do — shallow clones only contain HEAD). Partial clones are
+# supported by GitHub and have been default-on in git since 2.19 (2018).
+#
+# The resolved commit is recorded at /etc/colmap-commit.sha so it can be
+# probed at runtime (`cat /etc/colmap-commit.sha`) and asserted by
+# smoke_test.sh. COLMAP's `-h` does include a 7-char abbreviated commit
+# (e.g. "Commit ffb5404e on 2026-04-24"), but parsing that and matching
+# against a 40-char SHA prefix is fiddly — keeping the full SHA in a
+# dedicated file makes the comparison trivial and unambiguous.
 # ============================================================
 FROM system-deps AS colmap
 
-RUN git clone --depth 1 https://github.com/colmap/colmap.git /opt/colmap_src \
+ARG COLMAP_COMMIT=ffb5404e7bbfb9c718726f16718d7264582fe718
+
+RUN git -c advice.detachedHead=false clone --filter=blob:none \
+        https://github.com/colmap/colmap.git /opt/colmap_src \
+    && git -C /opt/colmap_src checkout "${COLMAP_COMMIT}" \
     && cd /opt/colmap_src \
     && mkdir build && cd build \
     && cmake .. -GNinja \
@@ -55,6 +80,7 @@ RUN git clone --depth 1 https://github.com/colmap/colmap.git /opt/colmap_src \
         -DBLA_VENDOR=Intel10_64lp \
     && ninja \
     && ninja install \
+    && echo "${COLMAP_COMMIT}" > /etc/colmap-commit.sha \
     && cd / && rm -rf /opt/colmap_src
 
 # ============================================================

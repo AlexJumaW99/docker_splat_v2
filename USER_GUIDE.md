@@ -97,7 +97,7 @@ docker build --target nerfstudio -t splat-nerfstudio-v2 .
 | Stage | Time | Cacheable |
 |---|---|---|
 | Stage 1–2 (apt deps) | 3–5 min | Yes (until apt list changes) |
-| Stage 3 (COLMAP compile) | 10–15 min | Yes (until COLMAP source changes) |
+| Stage 3 (COLMAP compile) | 10–15 min | Yes (until `COLMAP_COMMIT` is bumped) |
 | Stage 4 (gsplat compile) | 2–4 min | Yes |
 | Stage 5 (nerfstudio pip install) | 5–10 min | Partially (pip caches wheels) |
 
@@ -771,6 +771,7 @@ Most common causes:
 - Out of disk space — COLMAP compile needs ~5 GB of build artifacts temporarily
 - apt package missing from Stage 2 (if you modified the apt list)
 - GitHub rate-limiting the `git clone` of colmap/colmap.git (retry in a few minutes)
+- Invalid `COLMAP_COMMIT` SHA — Stage 3 errors at `git checkout` with `fatal: reference is not a tree`. Verify the SHA in [`Dockerfile`](Dockerfile) (`ARG COLMAP_COMMIT=...`) is reachable on `colmap/colmap` upstream
 
 ### CUDA "no kernel image is available for execution on the device"
 
