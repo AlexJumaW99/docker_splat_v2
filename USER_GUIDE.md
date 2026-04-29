@@ -763,6 +763,15 @@ Checklist:
 4. For TensorBoard: `tensorboard` process is still running (Shell 1 wasn't closed or Ctrl+C'd)
 5. For TensorBoard: command used `--bind_all` flag (otherwise binds to 127.0.0.1 only)
 6. No other process on the host is using the port (`sudo lsof -i :7007` or `sudo lsof -i :6006`)
+7. The container has been detached from its bridge network — symptoms: `docker port splat-ns-v2` prints nothing despite the container being `Up`, and `docker inspect splat-ns-v2 --format '{{.NetworkSettings.Networks}}'` returns `{}`. This can happen after an interrupted `docker compose down` or a docker-daemon hiccup; the container keeps running (and any in-progress `ns-train` keeps training, since it doesn't need the network) but every host-side connection is refused. Fix it without restarting:
+
+   ```bash
+   make heal-net
+   # or, equivalently:
+   docker network connect docker_splat_v2_default splat-ns-v2
+   ```
+
+   `docker-proxy` re-establishes itself on reconnect, so `localhost:7007` / `localhost:6006` come back online immediately and the running training is undisturbed.
 
 ### `docker build` fails on Stage 3 (COLMAP)
 
