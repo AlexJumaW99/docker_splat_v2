@@ -1,8 +1,9 @@
 """
 Project store.
 
-A project bundles one video + its processed directory + its training runs.
-State persists to ~/.config/docker_splat_gui/projects.json.
+A project bundles one source (video file or image folder) + its processed
+directory + its training runs. State persists to
+~/.config/docker_splat_gui/projects.json.
 
 The store is a QObject singleton; views connect to its signals so they stay
 in sync when the active project changes.
@@ -20,12 +21,66 @@ from PySide6.QtCore import QObject, Signal
 from pydantic import BaseModel, Field
 
 from app.config import DATA_DIR, PROJECTS_FILE
+from app.paths import unique_path
 
 
 # Nerfstudio dataparser subcommand name. "nerfstudio-data" expects a
 # transforms.json at the dataset root (what ns-process-data produces).
 # "colmap" reads a COLMAP sparse reconstruction directly.
 DataparserKind = Literal["nerfstudio-data", "colmap"]
+
+# What the Process tab is feeding ns-process-data this run. "imported" means
+# the project was created from an already-processed folder and the Process
+# tab is gated off entirely.
+SourceKind = Literal["video", "images", "imported"]
+
+
+# Image extensions ns-process-data's `images` subcommand accepts upstream,
+# matching nerfstudio.process_data.process_data_utils.allowed_exts. Centralized
+# so the New-Project dialog's live image-count readout, the Process tab's
+# pre-flight, and any future validator all agree on the same set.
+ALLOWED_IMAGE_EXTS: frozenset[str] = frozenset({
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".cr2",
+})
+
+
+# Conventional location for image folders. Not enforced (a folder anywhere
+# under DATA_DIR is technically valid), but the New-Project dialog defaults
+# the picker here and surfaces a soft warn when users browse elsewhere.
+INPUT_IMAGES_DIR = DATA_DIR / "input_images"
+
+
+def count_images(folder: Path) -> tuple[int, set[str]]:
+    """Return (count, extensions_seen) for files under `folder` whose suffix
+    matches ALLOWED_IMAGE_EXTS (case-insensitive). Returns (0, set()) for a
+    missing folder so callers can treat "not yet created" and "empty" the
+    same way."""
+    if not folder.is_dir():
+        return 0, set()
+    seen: set[str] = set()
+    n = 0
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        if suf in ALLOWED_IMAGE_EXTS:
+            n += 1
+            seen.add(suf)
+    return n, seen
+
+
+def source_kind(project: "Project") -> SourceKind:
+    """Determine which Process-tab flow a project belongs to.
+
+    Derived rather than stored so it can never drift from the underlying
+    fields. video_path and images_dir are mutually exclusive (enforced at
+    create time in `create()` / `create_from_images()`). create_from_processed
+    sets neither, yielding "imported"."""
+    if project.video_path is not None:
+        return "video"
+    if project.images_dir is not None:
+        return "images"
+    return "imported"
 
 
 def _slugify(text: str) -> str:
@@ -73,9 +128,12 @@ def detect_dataset_format(processed_dir: Path) -> DataparserKind | None:
 class Project(BaseModel):
     id: str
     name: str
-    # None for projects imported from an already-processed dataset — there's
-    # no source video to point back at, and the Process tab is gated off.
+    # Source of the dataset. `video_path` and `images_dir` are mutually
+    # exclusive — set exactly one, both None for an imported project. The
+    # legacy schema only had `video_path`, so existing records load unchanged
+    # (images_dir defaults to None, source_kind() returns "video").
     video_path: str | None = None
+    images_dir: str | None = None
     processed_dir: str  # absolute host path, must live under DATA_DIR
     # Which ns-train dataparser this project's processed_dir uses. Defaults
     # to nerfstudio-data so legacy records (pre-import-flow) load unchanged.
@@ -206,11 +264,61 @@ class ProjectStore(QObject):
             ) from None
 
         pid = self._reserve_pid(name)
-        processed_dir = DATA_DIR / "processed" / f"{pid}_splat"
+        # unique_path covers the edge case where a previous project under the
+        # same slug was deleted from the store but its processed/<pid>_splat
+        # folder is still on disk — the new project gets a clean _2/_3 suffix
+        # so it never adopts stale data without consent.
+        processed_dir = unique_path(DATA_DIR / "processed", f"{pid}_splat")
         return self._insert(Project(
             id=pid,
             name=name,
             video_path=str(video_path.resolve()),
+            processed_dir=str(processed_dir),
+            dataparser="nerfstudio-data",
+        ))
+
+    def create_from_images(self, name: str, images_dir: Path) -> Project:
+        """Creates a project from a folder of images. Raises ValueError if the
+        name conflicts, the folder is outside the data/ bind mount, doesn't
+        exist, or contains no supported image files."""
+        name = name.strip()
+        if not name:
+            raise ValueError("Project name can't be empty.")
+
+        resolved = images_dir.resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Not a directory:\n{resolved}")
+
+        try:
+            resolved.relative_to(DATA_DIR.resolve())
+        except ValueError:
+            raise ValueError(
+                f"Image folder must live inside {DATA_DIR}.\n\n"
+                "The container only sees that folder (it's bind-mounted as /workspace)."
+            ) from None
+
+        n, _exts = count_images(resolved)
+        if n == 0:
+            allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
+            raise ValueError(
+                f"No supported images found in:\n{resolved}\n\n"
+                f"Accepted extensions: {allowed}"
+            )
+
+        if any(
+            p.images_dir and Path(p.images_dir).resolve() == resolved
+            for p in self._root.projects
+        ):
+            raise ValueError(
+                "Another project is already pointed at this image folder."
+            )
+
+        pid = self._reserve_pid(name)
+        processed_dir = unique_path(DATA_DIR / "processed", f"{pid}_splat")
+        return self._insert(Project(
+            id=pid,
+            name=name,
+            images_dir=str(resolved),
             processed_dir=str(processed_dir),
             dataparser="nerfstudio-data",
         ))
@@ -272,6 +380,47 @@ class ProjectStore(QObject):
         if p is None:
             return
         p.video_path = str(video_path.resolve())
+        self._save()
+        self.active_changed.emit(self.active)
+
+    def update_images_dir(self, project_id: str, images_dir: Path) -> None:
+        resolved = images_dir.resolve()
+        try:
+            resolved.relative_to(DATA_DIR.resolve())
+        except ValueError:
+            raise ValueError(f"Image folder must live inside {DATA_DIR}.") from None
+        if not resolved.is_dir():
+            raise ValueError(f"Not a directory:\n{resolved}")
+        n, _ = count_images(resolved)
+        if n == 0:
+            allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
+            raise ValueError(
+                f"No supported images in:\n{resolved}\n\nAccepted: {allowed}"
+            )
+        p = self.get(project_id)
+        if p is None:
+            return
+        p.images_dir = str(resolved)
+        self._save()
+        self.active_changed.emit(self.active)
+
+    def update_processed_dir(self, project_id: str, processed_dir: Path) -> None:
+        """Repoint a project at a new processed folder. Used by the Process
+        tab after a successful run — see views/process.py:_on_job_finished.
+
+        Old processed folders are not deleted; downstream artifacts (training
+        runs in outputs/, rendered videos in renders/) keep the literal path
+        baked into their config.yml so they remain functional in isolation."""
+        try:
+            processed_dir.resolve().relative_to(DATA_DIR.resolve())
+        except ValueError:
+            raise ValueError(
+                f"Processed folder must live inside {DATA_DIR}."
+            ) from None
+        p = self.get(project_id)
+        if p is None:
+            return
+        p.processed_dir = str(processed_dir.resolve())
         self._save()
         self.active_changed.emit(self.active)
 

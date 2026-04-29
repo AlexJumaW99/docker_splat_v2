@@ -18,7 +18,11 @@ from app import docker_service as dock
 from app.config import CONTAINER_NAME, DATA_DIR
 from app.ffprobe import VideoInfo, probe
 from app.jobs import JobManager, JobSpec
-from app.store import Project, ProjectStore
+from app.paths import unique_path
+from app.store import (
+    ALLOWED_IMAGE_EXTS, INPUT_IMAGES_DIR, Project, ProjectStore, count_images,
+    source_kind,
+)
 from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
 
 
@@ -35,6 +39,36 @@ _HELP = {
         "path bind-mounted into the container. Steady handheld or drone orbits "
         "with plenty of overlap give the best reconstructions; fast shakes or "
         "rolling-shutter artifacts weaken COLMAP's feature matching."
+    ),
+    "images_dir": (
+        "Source image folder",
+        "A directory of still images COLMAP will calibrate cameras for.<br><br>"
+        "<b>Convention</b>: drop folders under <code>data/input_images/</code>. "
+        "Any path inside <code>data/</code> works (the container needs to see "
+        "it), but keeping image sets in <code>input_images/</code> matches "
+        "the rest of the docs.<br><br>"
+        "Accepted extensions: <code>.jpg .jpeg .png .tif .tiff .cr2</code> "
+        "(case-insensitive). For best results use 30+ overlapping views of a "
+        "static scene with consistent lighting; sparse coverage or motion "
+        "between shots will crater COLMAP's pose recovery."
+    ),
+    "eval_dir": (
+        "Eval image folder (optional)",
+        "A second folder of images held out from training and used to "
+        "compute PSNR / SSIM on unseen views. Must live inside "
+        "<code>data/</code>. Leave empty to let ns-process-data carve a "
+        "split out of the main folder instead."
+    ),
+    "next_target": (
+        "Next-run output folder",
+        "Every “Run processing” writes to a fresh, never-overwritten "
+        "folder under <code>data/processed/</code>. The first run for a "
+        "project lands at <code>&lt;project&gt;_splat/</code>; subsequent "
+        "runs auto-suffix <code>_2</code>, <code>_3</code>, … so old "
+        "datasets stay intact and any training runs already pointing at "
+        "them keep working.<br><br>"
+        "After a successful run, the project is repointed at the new folder "
+        "so the Train tab picks it up automatically."
     ),
     "preset": (
         "Parameter presets",
@@ -333,7 +367,23 @@ class _Form(QWidget):
         self._store = store
         self._jobs = jobs
         self._project = project
+        # _mode locks the form to either the video or images flow at
+        # construction time. ProcessView._rebuild() is the only thing that
+        # creates _Form instances and it gates on source_kind, so this
+        # narrowing matches the caller's contract — there's no "imported"
+        # case to handle here.
+        kind = source_kind(project)
+        assert kind in ("video", "images"), f"_Form built for kind={kind}"
+        self._mode = kind
+        # Output folder the next "Run processing" click will write into.
+        # Computed at run time via unique_path (so concurrent re-runs auto-
+        # suffix _2/_3 and never clobber a previous dataset). Stashed here
+        # between _on_run and _on_job_finished so the success handler knows
+        # which folder to repoint the project at — see _on_job_finished.
+        self._pending_target: Path | None = None
         self._running_mine = False
+        # Async ffprobe is video-only; the images flow does a synchronous
+        # iterdir() in _refresh_source_meta() and doesn't need a worker.
         self._probe_signals = _ProbeSignals()
         self._probe_signals.done.connect(self._on_probe_done)
 
@@ -365,7 +415,12 @@ class _Form(QWidget):
         header_row = QHBoxLayout()
         title = QLabel("Process")
         title.setObjectName("PageTitle")
-        sub = QLabel("Prepare a video for splatfacto training.")
+        sub_text = (
+            "Prepare a video for splatfacto training."
+            if self._mode == "video"
+            else "Prepare a folder of images for splatfacto training."
+        )
+        sub = QLabel(sub_text)
         sub.setProperty("role", "caption")
 
         self.advanced_cb = QCheckBox("Advanced mode")
@@ -382,7 +437,7 @@ class _Form(QWidget):
         header_row.addWidget(adv_wrap, 0, Qt.AlignBottom | Qt.AlignRight)
         bl.addLayout(header_row)
 
-        bl.addWidget(self._video_card())
+        bl.addWidget(self._source_card())
         bl.addWidget(self._params_card())
         bl.addWidget(self._output_card())
         bl.addWidget(self._actions_card())
@@ -391,29 +446,34 @@ class _Form(QWidget):
         scroll.setWidget(body)
         outer.addWidget(scroll)
 
-    # ---- video card ----
-    def _video_card(self) -> QFrame:
+    # ---- source card ----
+    def _source_card(self) -> QFrame:
+        """Pick-the-source card. Video mode shows a file picker + ffprobe
+        readout; images mode shows a folder picker + image-count readout.
+        Both modes share the same widget names (source_path_edit /
+        source_meta_lbl / source_browse_btn) so downstream methods don't
+        need to branch."""
         c = card()
         v = QVBoxLayout(c)
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(10)
-        v.addWidget(section_title("VIDEO"))
+        v.addWidget(section_title("VIDEO" if self._mode == "video" else "IMAGE FOLDER"))
 
         row = QHBoxLayout(); row.setSpacing(8)
-        self.video_path_edit = QLineEdit()
-        self.video_path_edit.setReadOnly(True)
-        self.video_path_edit.setProperty("role", "readout")
-        row.addWidget(_hb("video"))
-        self.browse_btn = QPushButton("Browse…")
-        self.browse_btn.setProperty("role", "secondary")
-        self.browse_btn.setCursor(Qt.PointingHandCursor)
-        self.browse_btn.clicked.connect(self._on_browse_video)
-        row.addWidget(self.video_path_edit, 1)
-        row.addWidget(self.browse_btn)
+        self.source_path_edit = QLineEdit()
+        self.source_path_edit.setReadOnly(True)
+        self.source_path_edit.setProperty("role", "readout")
+        row.addWidget(_hb("video" if self._mode == "video" else "images_dir"))
+        self.source_browse_btn = QPushButton("Browse…")
+        self.source_browse_btn.setProperty("role", "secondary")
+        self.source_browse_btn.setCursor(Qt.PointingHandCursor)
+        self.source_browse_btn.clicked.connect(self._on_browse_source)
+        row.addWidget(self.source_path_edit, 1)
+        row.addWidget(self.source_browse_btn)
         v.addLayout(row)
 
-        self.meta_lbl = QLabel("")
-        self.meta_lbl.setProperty("role", "caption")
-        v.addWidget(self.meta_lbl)
+        self.source_meta_lbl = QLabel("")
+        self.source_meta_lbl.setProperty("role", "caption")
+        v.addWidget(self.source_meta_lbl)
         return c
 
     # ---- params card ----
@@ -445,8 +505,12 @@ class _Form(QWidget):
         grid.setHorizontalSpacing(14); grid.setVerticalSpacing(12)
         grid.setColumnStretch(1, 1)
 
-        # Target frames
-        grid.addWidget(labeled("Target frames", *_HELP["frames"]), 0, 0)
+        # Target frames — video only. ns-process-data images has no
+        # equivalent flag (every input image is already a frame), so we
+        # build the widgets unconditionally for preset round-tripping but
+        # hide the row for images projects.
+        self.frames_label = labeled("Target frames", *_HELP["frames"])
+        grid.addWidget(self.frames_label, 0, 0)
         frames_row = QHBoxLayout(); frames_row.setSpacing(10)
         self.frames_slider = QSlider(Qt.Horizontal)
         self.frames_slider.setRange(50, 500); self.frames_slider.setSingleStep(10)
@@ -458,8 +522,11 @@ class _Form(QWidget):
         self.frames_value.valueChanged.connect(self.frames_slider.setValue)
         frames_row.addWidget(self.frames_slider, 1)
         frames_row.addWidget(self.frames_value)
-        w = QWidget(); w.setLayout(frames_row)
-        grid.addWidget(w, 0, 1)
+        self.frames_row_wrap = QWidget(); self.frames_row_wrap.setLayout(frames_row)
+        grid.addWidget(self.frames_row_wrap, 0, 1)
+        if self._mode == "images":
+            self.frames_label.hide()
+            self.frames_row_wrap.hide()
 
         # Matching method
         grid.addWidget(labeled("Matching method", *_HELP["matching"]), 1, 0)
@@ -594,23 +661,34 @@ class _Form(QWidget):
 
         # Reproducibility seeds. -1 displays as "random" via setSpecialValueText
         # and is the signal that we shouldn't emit the corresponding flag.
-        g.addWidget(labeled("Train frame-selection seed", *_HELP["seed"]), 3, 0)
+        # ns-process-data images doesn't subsample frames (every input file
+        # is already a frame), so the seed flags don't apply — we still
+        # build the widgets for preset round-tripping but hide the rows.
+        self.seed_label = labeled("Train frame-selection seed", *_HELP["seed"])
+        g.addWidget(self.seed_label, 3, 0)
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(SEED_RANDOM, 2_147_483_647)
         self.seed_spin.setSpecialValueText("random")
         self.seed_spin.setMaximumWidth(140)
         seed_row = QHBoxLayout(); seed_row.addWidget(self.seed_spin); seed_row.addStretch(1)
-        seed_wrap = QWidget(); seed_wrap.setLayout(seed_row)
-        g.addWidget(seed_wrap, 3, 1)
+        self.seed_wrap = QWidget(); self.seed_wrap.setLayout(seed_row)
+        g.addWidget(self.seed_wrap, 3, 1)
 
-        g.addWidget(labeled("Eval frame-selection seed", *_HELP["eval_seed"]), 4, 0)
+        self.eval_seed_label = labeled("Eval frame-selection seed", *_HELP["eval_seed"])
+        g.addWidget(self.eval_seed_label, 4, 0)
         self.eval_seed_spin = QSpinBox()
         self.eval_seed_spin.setRange(SEED_RANDOM, 2_147_483_647)
         self.eval_seed_spin.setSpecialValueText("random")
         self.eval_seed_spin.setMaximumWidth(140)
         es_row = QHBoxLayout(); es_row.addWidget(self.eval_seed_spin); es_row.addStretch(1)
-        es_wrap = QWidget(); es_wrap.setLayout(es_row)
-        g.addWidget(es_wrap, 4, 1)
+        self.eval_seed_wrap = QWidget(); self.eval_seed_wrap.setLayout(es_row)
+        g.addWidget(self.eval_seed_wrap, 4, 1)
+
+        if self._mode == "images":
+            self.seed_label.hide()
+            self.seed_wrap.hide()
+            self.eval_seed_label.hide()
+            self.eval_seed_wrap.hide()
 
         sv.addLayout(g)
         return sc
@@ -628,30 +706,44 @@ class _Form(QWidget):
         sfm_wrap = QWidget(); sfm_wrap.setLayout(sfm_row)
         sv.addWidget(sfm_wrap)
 
-        # Eval video picker (optional). Stored as host path; converted at run time.
-        sv.addWidget(labeled("Eval video (optional)", *_HELP["eval_video"]))
+        # Eval-data picker (optional). Stored as host path; converted at run
+        # time. ns-process-data's --eval-data accepts a file in video mode and
+        # a directory in images mode — same flag, different validator. The
+        # widget name is generic (eval_data_*) and the browse handler
+        # dispatches based on self._mode.
+        eval_help_key = "eval_video" if self._mode == "video" else "eval_dir"
+        eval_label = (
+            "Eval video (optional)" if self._mode == "video"
+            else "Eval folder (optional)"
+        )
+        sv.addWidget(labeled(eval_label, *_HELP[eval_help_key]))
         eval_row = QHBoxLayout(); eval_row.setSpacing(8)
-        self.eval_video_edit = QLineEdit()
-        self.eval_video_edit.setReadOnly(True)
-        self.eval_video_edit.setProperty("role", "readout")
-        self.eval_video_edit.setPlaceholderText("(none)")
-        self.eval_video_browse = QPushButton("Browse…")
-        self.eval_video_browse.setProperty("role", "secondary")
-        self.eval_video_browse.setCursor(Qt.PointingHandCursor)
-        self.eval_video_browse.clicked.connect(self._on_browse_eval_video)
-        self.eval_video_clear = QPushButton("Clear")
-        self.eval_video_clear.setProperty("role", "ghost")
-        self.eval_video_clear.setCursor(Qt.PointingHandCursor)
-        self.eval_video_clear.clicked.connect(lambda: self.eval_video_edit.setText(""))
-        eval_row.addWidget(self.eval_video_edit, 1)
-        eval_row.addWidget(self.eval_video_browse)
-        eval_row.addWidget(self.eval_video_clear)
+        self.eval_data_edit = QLineEdit()
+        self.eval_data_edit.setReadOnly(True)
+        self.eval_data_edit.setProperty("role", "readout")
+        self.eval_data_edit.setPlaceholderText("(none)")
+        self.eval_data_browse = QPushButton("Browse…")
+        self.eval_data_browse.setProperty("role", "secondary")
+        self.eval_data_browse.setCursor(Qt.PointingHandCursor)
+        self.eval_data_browse.clicked.connect(self._on_browse_eval_data)
+        self.eval_data_clear = QPushButton("Clear")
+        self.eval_data_clear.setProperty("role", "ghost")
+        self.eval_data_clear.setCursor(Qt.PointingHandCursor)
+        self.eval_data_clear.clicked.connect(lambda: self.eval_data_edit.setText(""))
+        eval_row.addWidget(self.eval_data_edit, 1)
+        eval_row.addWidget(self.eval_data_browse)
+        eval_row.addWidget(self.eval_data_clear)
         sv.addLayout(eval_row)
 
-        hint = QLabel(
+        hint_text = (
             "Eval video, if set, is processed alongside the train video and "
             "held out from training. Must live inside the data/ bind mount."
+            if self._mode == "video"
+            else "Eval folder, if set, is processed alongside the train "
+                 "images and held out from training. Must live inside the "
+                 "data/ bind mount."
         )
+        hint = QLabel(hint_text)
         hint.setProperty("role", "caption")
         hint.setWordWrap(True)
         sv.addWidget(hint)
@@ -692,24 +784,56 @@ class _Form(QWidget):
         self.equirect_combo.setVisible(is_equirect)
 
 
-    def _on_browse_eval_video(self) -> None:
-        from app.config import DATA_DIR as _DD
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Pick an eval video",
-            str(_DD),
-            "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v);;All files (*.*)",
-        )
-        if not path:
-            return
-        try:
-            Path(path).resolve().relative_to(_DD.resolve())
-        except ValueError:
-            QMessageBox.warning(
-                self, "Eval video outside data/",
-                f"Eval videos must live inside {_DD} so the container can see them."
+    def _on_browse_eval_data(self) -> None:
+        """Eval-data browse dispatcher.
+
+        ns-process-data's --eval-data flag accepts a file when the parent
+        subcommand is `video` and a directory when it's `images`. We pick
+        the right Qt dialog and validation rule for the current mode.
+        """
+        if self._mode == "video":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Pick an eval video",
+                str(DATA_DIR),
+                "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v);;All files (*.*)",
             )
-            return
-        self.eval_video_edit.setText(path)
+            if not path:
+                return
+            try:
+                Path(path).resolve().relative_to(DATA_DIR.resolve())
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Eval video outside data/",
+                    f"Eval videos must live inside {DATA_DIR} so the container can see them."
+                )
+                return
+            self.eval_data_edit.setText(path)
+        else:
+            INPUT_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            path = QFileDialog.getExistingDirectory(
+                self, "Pick an eval image folder",
+                str(INPUT_IMAGES_DIR),
+                QFileDialog.ShowDirsOnly,
+            )
+            if not path:
+                return
+            try:
+                Path(path).resolve().relative_to(DATA_DIR.resolve())
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Eval folder outside data/",
+                    f"Eval folders must live inside {DATA_DIR} so the container can see them."
+                )
+                return
+            n, _ = count_images(Path(path))
+            if n == 0:
+                allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
+                QMessageBox.warning(
+                    self, "No images in folder",
+                    f"Folder contains no supported images.\nAccepted: {allowed}"
+                )
+                return
+            self.eval_data_edit.setText(path)
 
     # ---- output card ----
     def _output_card(self) -> QFrame:
@@ -718,7 +842,7 @@ class _Form(QWidget):
         v.setContentsMargins(20, 16, 20, 18); v.setSpacing(8)
         out_hdr = QHBoxLayout(); out_hdr.setSpacing(6); out_hdr.setContentsMargins(0, 0, 0, 0)
         out_hdr.addWidget(section_title("OUTPUT DATASET"))
-        out_hdr.addWidget(_hb("output"))
+        out_hdr.addWidget(_hb("next_target"))
         out_hdr.addStretch(1)
         out_wrap = QWidget(); out_wrap.setLayout(out_hdr)
         v.addWidget(out_wrap)
@@ -726,12 +850,39 @@ class _Form(QWidget):
         self.output_lbl.setReadOnly(True)
         self.output_lbl.setProperty("role", "readout")
         v.addWidget(self.output_lbl)
+        # Caption updates via _refresh_next_target(): explains whether the
+        # next Run will write into the existing processed_dir or auto-suffix
+        # to a new sibling. Visible at all times so users see the policy.
+        self.next_target_lbl = QLabel("")
+        self.next_target_lbl.setProperty("role", "caption")
+        self.next_target_lbl.setWordWrap(True)
+        v.addWidget(self.next_target_lbl)
         hint = QLabel(
-            "Host path. Container sees this as /workspace/processed/… automatically."
+            "Host path. Container sees this as /workspace/processed/… "
+            "automatically. Every run lands in a fresh folder; existing "
+            "datasets are never overwritten."
         )
         hint.setProperty("role", "caption")
+        hint.setWordWrap(True)
         v.addWidget(hint)
         return c
+
+    # ---- next-run target preview ----
+    def _refresh_next_target(self) -> None:
+        """Recompute the next-run target and update the caption.
+
+        Called after a job finishes (the previous target is now occupied,
+        so the next click of Run will see a fresh suffix) and when the
+        project is loaded. Cheap — just a few stat() calls."""
+        target = unique_path(DATA_DIR / "processed", f"{self._project.id}_splat")
+        if str(target) != self._project.processed_dir:
+            existing = Path(self._project.processed_dir).name
+            self.next_target_lbl.setText(
+                f"Next run will write to: {target.name}  "
+                f"(auto-suffixed — '{existing}' is the current dataset)."
+            )
+        else:
+            self.next_target_lbl.setText("Next run will write here.")
 
     # ---- actions ----
     def _actions_card(self) -> QFrame:
@@ -804,14 +955,28 @@ class _Form(QWidget):
     # ---- project lifecycle ----
     def _load_project(self) -> None:
         p = self._project
-        self.video_path_edit.setText(p.video_path)
+        if self._mode == "video":
+            assert p.video_path is not None  # narrowed by source_kind
+            self.source_path_edit.setText(p.video_path)
+        else:
+            assert p.images_dir is not None
+            self.source_path_edit.setText(p.images_dir)
         self.output_lbl.setText(p.processed_dir)
+        # Source-meta readout (ffprobe for video, image count for images).
+        # Video uses an async worker because ffprobe hits the disk + spawns
+        # a subprocess; images is just iterdir() and doesn't need a thread.
+        if self._mode == "video":
+            self._probe_video(Path(p.video_path))
+        else:
+            self._refresh_images_meta(Path(p.images_dir))
+        # Output card shows the host path of the next-run target so the
+        # auto-suffix is visible BEFORE the user clicks Run, not just after.
+        self._refresh_next_target()
 
         # Populate form from last params or sensible defaults.
         self._apply_params(p.last_process_params or {})
 
         self._refresh_presets()
-        self._probe_video(Path(p.video_path))
 
     def _apply_params(self, params: dict) -> None:
         """Populate every widget from a params dict. Missing keys fall back to
@@ -820,7 +985,11 @@ class _Form(QWidget):
         # --- basic ---
         self.frames_slider.setValue(int(params.get("num_frames_target", 250)))
         self.frames_value.setValue(int(params.get("num_frames_target", 250)))
-        method = params.get("matching_method", "sequential")
+        # ns-process-data's own --matching-method default differs per
+        # subcommand: vocab_tree for images, and historically sequential for
+        # video (continuous orbits match neighbors well). We follow upstream.
+        default_method = "vocab_tree" if self._mode == "images" else "sequential"
+        method = params.get("matching_method", default_method)
         idx = MATCH_METHODS.index(method) if method in MATCH_METHODS else 0
         self.method_combo.setCurrentIndex(idx)
         self.downscales_spin.setValue(int(params.get("num_downscales", 3)))
@@ -856,7 +1025,7 @@ class _Form(QWidget):
 
         # --- extras ---
         self.use_sfm_depth_cb.setChecked(bool(params.get("use_sfm_depth", False)))
-        self.eval_video_edit.setText(params.get("eval_data") or "")
+        self.eval_data_edit.setText(params.get("eval_data") or "")
 
     def _refresh_presets(self) -> None:
         self.preset_combo.blockSignals(True)
@@ -885,7 +1054,15 @@ class _Form(QWidget):
         if idx >= 0:
             self.preset_combo.setCurrentIndex(idx)
 
-    # ---- video probe ----
+    # ---- source path: browse + meta readouts ----
+    def _on_browse_source(self) -> None:
+        """Dispatcher — the source_browse_btn handler. Mode picks file vs
+        folder picker so we don't end up with two buttons in the same row."""
+        if self._mode == "video":
+            self._on_browse_video()
+        else:
+            self._on_browse_images()
+
     def _on_browse_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Pick a video",
@@ -899,18 +1076,53 @@ class _Form(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "Video outside data/", str(e))
             return
-        self.video_path_edit.setText(path)
+        self.source_path_edit.setText(path)
         self._probe_video(Path(path))
 
+    def _on_browse_images(self) -> None:
+        # Default the picker to data/input_images/ — auto-create on first use
+        # so the dialog has somewhere sensible to land, matching the New
+        # Project dialog's behavior at widgets.py:_browse_images_folder.
+        INPUT_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        path = QFileDialog.getExistingDirectory(
+            self, "Pick a folder of images",
+            str(INPUT_IMAGES_DIR),
+            QFileDialog.ShowDirsOnly,
+        )
+        if not path:
+            return
+        try:
+            self._store.update_images_dir(self._project.id, Path(path))
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't use folder", str(e))
+            return
+        self.source_path_edit.setText(path)
+        self._refresh_images_meta(Path(path))
+
     def _probe_video(self, path: Path) -> None:
-        self.meta_lbl.setText("reading video metadata…")
+        self.source_meta_lbl.setText("reading video metadata…")
         QThreadPool.globalInstance().start(_ProbeTask(path, self._probe_signals))
 
     def _on_probe_done(self, info: VideoInfo | None) -> None:
         if info is None:
-            self.meta_lbl.setText("video not found")
+            self.source_meta_lbl.setText("video not found")
             return
-        self.meta_lbl.setText(info.pretty())
+        self.source_meta_lbl.setText(info.pretty())
+
+    def _refresh_images_meta(self, path: Path) -> None:
+        """Synchronous image-folder readout. Cheap enough to run on the GUI
+        thread for any folder size we'd realistically ns-process-data on
+        (a few thousand files at most)."""
+        if not path.is_dir():
+            self.source_meta_lbl.setText("folder not found")
+            return
+        n, exts = count_images(path)
+        if n == 0:
+            allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
+            self.source_meta_lbl.setText(f"no supported images (need: {allowed})")
+            return
+        ext_summary = ", ".join(sorted(exts))
+        self.source_meta_lbl.setText(f"{n} image(s) · {ext_summary}")
 
     # ---- collect + run ----
     def _collect_params(self) -> dict:
@@ -939,27 +1151,34 @@ class _Form(QWidget):
             "eval_random_seed": None if eval_seed_v == SEED_RANDOM else eval_seed_v,
             # extras
             "use_sfm_depth": self.use_sfm_depth_cb.isChecked(),
-            "eval_data": self.eval_video_edit.text().strip() or None,
+            "eval_data": self.eval_data_edit.text().strip() or None,
         }
 
-    def _build_argv(self, params: dict, c_video: str, c_out: str) -> list[str]:
+    def _build_argv(self, params: dict, c_source: str, c_out: str) -> list[str]:
         """Translate the form's params dict into an ns-process-data invocation.
 
         Only flags whose values differ from ns-process-data's own defaults are
         emitted, so the rendered command line stays identical to today's for a
-        user who never touches the advanced panel.
+        user who never touches the advanced panel. The subcommand and a few
+        per-subcommand flags vary by self._mode; everything else is shared.
 
         May raise ValueError when a host-path field can't be mapped into the
         container's /workspace mount (e.g. eval video stored outside DATA_DIR).
         """
         argv = [
-            "ns-process-data", "video",
-            "--data", c_video,
+            "ns-process-data", self._mode,
+            "--data", c_source,
             "--output-dir", c_out,
-            "--num-frames-target", str(params["num_frames_target"]),
+        ]
+        # video-only: random subsample of frames from the input clip.
+        # images mode treats every input file as a frame, so the flag is
+        # rejected by tyro upstream.
+        if self._mode == "video":
+            argv.extend(["--num-frames-target", str(params["num_frames_target"])])
+        argv.extend([
             "--matching-method", params["matching_method"],
             "--num-downscales", str(params["num_downscales"]),
-        ]
+        ])
         if params.get("verbose"):
             argv.append("--verbose")
 
@@ -994,12 +1213,15 @@ class _Form(QWidget):
         if not params.get("gpu_enabled", True):
             argv.append("--no-gpu")
 
-        seed = params.get("random_seed")
-        if seed is not None:
-            argv.extend(["--random-seed", str(int(seed))])
-        eval_seed = params.get("eval_random_seed")
-        if eval_seed is not None:
-            argv.extend(["--eval-random-seed", str(int(eval_seed))])
+        # video-only: seeds for the random train/eval frame split. Skipped
+        # for images mode (every input image is a frame, no subsample).
+        if self._mode == "video":
+            seed = params.get("random_seed")
+            if seed is not None:
+                argv.extend(["--random-seed", str(int(seed))])
+            eval_seed = params.get("eval_random_seed")
+            if eval_seed is not None:
+                argv.extend(["--eval-random-seed", str(int(eval_seed))])
 
         # Extras
         if params.get("use_sfm_depth"):
@@ -1016,54 +1238,96 @@ class _Form(QWidget):
         return argv
 
     def _on_run(self) -> None:
-        if self._jobs.is_running():
-            QMessageBox.information(self, "Busy",
-                "Another job is already running. Cancel it first.")
-            return
+        # Disable the Run button SYNCHRONOUSLY so a quick double-click can't
+        # produce two unique_path lookups that race for the same _N suffix.
+        # The job-start path keeps the button disabled via _on_job_started;
+        # any early-return path below uses the `started` flag + finally
+        # clause to restore the idle state.
+        self.run_btn.setEnabled(False)
+        started = False
+        try:
+            if self._jobs.is_running():
+                QMessageBox.information(self, "Busy",
+                    "Another job is already running. Cancel it first.")
+                return
 
-        state = dock.container_state(CONTAINER_NAME)
-        if state.status != "running":
-            QMessageBox.warning(
-                self, "Container not running",
-                f"The {CONTAINER_NAME} container isn't running. "
-                "Start it from the Dashboard, then try again.",
+            state = dock.container_state(CONTAINER_NAME)
+            if state.status != "running":
+                QMessageBox.warning(
+                    self, "Container not running",
+                    f"The {CONTAINER_NAME} container isn't running. "
+                    "Start it from the Dashboard, then try again.",
+                )
+                return
+
+            source = Path(self.source_path_edit.text())
+            if self._mode == "video":
+                if not source.is_file():
+                    QMessageBox.warning(self, "Video not found", f"No such file:\n{source}")
+                    return
+            else:
+                if not source.is_dir():
+                    QMessageBox.warning(
+                        self, "Image folder not found",
+                        f"No such directory:\n{source}",
+                    )
+                    return
+                n, _ = count_images(source)
+                if n == 0:
+                    allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
+                    QMessageBox.warning(
+                        self, "No images in folder",
+                        f"Folder contains no supported images.\n"
+                        f"Accepted extensions: {allowed}",
+                    )
+                    return
+
+            params = self._collect_params()
+            self._store.update_last_process_params(self._project.id, params)
+
+            # Fresh output folder on every run — auto-suffix _2/_3/… on
+            # collision so prior datasets are never overwritten. The project
+            # is repointed at this folder only after the job SUCCEEDS (see
+            # _on_job_finished); a failed run leaves processed_dir pointing
+            # at the most recent successful output, so Train keeps working.
+            target = unique_path(DATA_DIR / "processed", f"{self._project.id}_splat")
+
+            try:
+                c_source = _host_to_container(source)
+                c_out = _host_to_container(target)
+            except ValueError as e:
+                QMessageBox.warning(self, "Path outside data/", str(e))
+                return
+
+            try:
+                argv = self._build_argv(params, c_source, c_out)
+            except ValueError as e:
+                # Raised by _host_to_container when the eval data lives
+                # outside the bind mount, or by shlex.split on malformed
+                # --raw flags.
+                QMessageBox.warning(self, "Bad parameter", str(e))
+                return
+
+            display = f"docker exec {CONTAINER_NAME} " + " ".join(shlex.quote(a) for a in argv)
+
+            spec = JobSpec(
+                kind="process",
+                display_cmd=display,
+                container_argv=argv,
+                kill_pattern="ns-process-data",
             )
-            return
-
-        video = Path(self.video_path_edit.text())
-        if not video.exists():
-            QMessageBox.warning(self, "Video not found", f"No such file:\n{video}")
-            return
-
-        params = self._collect_params()
-        self._store.update_last_process_params(self._project.id, params)
-
-        try:
-            c_video = _host_to_container(video)
-            c_out = _host_to_container(self._project.processed_dir)
-        except ValueError as e:
-            QMessageBox.warning(self, "Path outside data/", str(e))
-            return
-
-        try:
-            argv = self._build_argv(params, c_video, c_out)
-        except ValueError as e:
-            # Raised by _host_to_container when the eval video lives outside
-            # the bind mount, or by shlex.split on malformed --raw flags.
-            QMessageBox.warning(self, "Bad parameter", str(e))
-            return
-
-        display = f"docker exec {CONTAINER_NAME} " + " ".join(shlex.quote(a) for a in argv)
-
-        spec = JobSpec(
-            kind="process",
-            display_cmd=display,
-            container_argv=argv,
-            kill_pattern="ns-process-data",
-        )
-        self.ready_to_train.hide()
-        self.splinter_warn.hide()
-        self._jobs.start(spec)
+            self._pending_target = target
+            self.ready_to_train.hide()
+            self.splinter_warn.hide()
+            self.output_lbl.setText(str(target))
+            self._jobs.start(spec)
+            started = True
+        finally:
+            if not started:
+                # Any pre-start bailout: discard the pending target and let
+                # the user click Run again.
+                self._pending_target = None
+                self.run_btn.setEnabled(True)
 
     def _on_cancel(self) -> None:
         self._jobs.cancel()
@@ -1095,29 +1359,73 @@ class _Form(QWidget):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         if code == 0:
+            # The job wrote into _pending_target (the unique folder we
+            # picked at click-time). Repoint the project at it now so
+            # Train, Exports, and the splinter probe all read from the
+            # newly-finished dataset. Old processed folders stay on disk
+            # and old training runs that bake their config.yml against
+            # them remain functional.
+            target = self._pending_target
+            if target is not None:
+                try:
+                    self._store.update_processed_dir(self._project.id, target)
+                except ValueError:
+                    # update_processed_dir validates "under DATA_DIR" — we
+                    # already checked that in _on_run, so a failure here
+                    # means the user moved DATA_DIR mid-run. Don't crash
+                    # the GUI; the user will see the old path on output_lbl
+                    # and a successful run pill, which is honest enough.
+                    pass
+                else:
+                    # Refresh derived UI: output_lbl already showed `target`
+                    # since _on_run, but read it back from the project record
+                    # in case the store normalized the path.
+                    self.output_lbl.setText(self._project.processed_dir)
+            self._pending_target = None
             set_pill(self.status_pill, "Done", "success")
             self.ready_to_train.show()
             self._check_sparse_splinter()
+            # The just-completed target is now on disk; the next Run will
+            # therefore auto-suffix one slot further.
+            self._refresh_next_target()
         else:
+            # A non-zero exit means the run failed — do NOT repoint the
+            # project. The orphaned partial folder at _pending_target
+            # stays on disk (user can clean up manually).
+            self._pending_target = None
             set_pill(self.status_pill, f"Failed · exit {code}", "error")
+            # Restore output_lbl to the project's still-active processed_dir
+            # so the user isn't misled into thinking the failed run succeeded.
+            self.output_lbl.setText(self._project.processed_dir)
+            # The orphaned partial target now exists on disk, so the next
+            # Run will skip past it as well as past any prior datasets.
+            self._refresh_next_target()
 
     def _on_job_cancelled(self) -> None:
         if not self._running_mine:
             self._reset_idle()
             return
         self._running_mine = False
+        self._pending_target = None
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Cancelled", "error")
+        self.output_lbl.setText(self._project.processed_dir)
+        # A cancelled job may have left a partial folder at _pending_target;
+        # recomputing here handles that without needing to track it further.
+        self._refresh_next_target()
 
     def _on_job_failed(self, msg: str) -> None:
         if not self._running_mine:
             self._reset_idle()
             return
         self._running_mine = False
+        self._pending_target = None
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Failed to start", "error")
+        self.output_lbl.setText(self._project.processed_dir)
+        self._refresh_next_target()
 
     def _reset_idle(self) -> None:
         """Another kind's job just ended — restore our idle UI."""
@@ -1224,7 +1532,10 @@ class ProcessView(QWidget):
         if active is None:
             self.stack.addWidget(_EmptyState(self._store))
             return
-        if active.video_path is None:
+        # Dispatch on source_kind so a freshly-created images project
+        # (video_path=None, images_dir set) gets _Form, not _ImportedState.
+        kind = source_kind(active)
+        if kind == "imported":
             gate = _ImportedState(active)
             gate.request_train.connect(lambda: self.request_navigate.emit(2))
             self.stack.addWidget(gate)

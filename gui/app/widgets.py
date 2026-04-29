@@ -11,7 +11,10 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import DATA_DIR
-from app.store import Project, ProjectStore, detect_dataset_format
+from app.store import (
+    INPUT_IMAGES_DIR, Project, ProjectStore, count_images,
+    detect_dataset_format,
+)
 
 
 # ---------- primitives ----------
@@ -192,15 +195,21 @@ class ProjectBar(QFrame):
 # ---------- new project dialog ----------
 
 _MODE_VIDEO = 0
-_MODE_IMPORT = 1
+_MODE_IMAGES = 1
+_MODE_IMPORT = 2
 
 
 class NewProjectDialog(QDialog):
-    """Create a project either from a raw video (→ Process → Train) or by
-    importing an already-processed dataset folder (→ Train directly).
+    """Create a project from a raw video, a folder of images, or by importing
+    an already-processed dataset folder.
 
     Mode selection toggles a QStackedWidget so the NAME field is shared and
-    validation / accept dispatch lives in one place (`_accept`).
+    validation / accept dispatch lives in one place (`_accept`). Each mode's
+    Process / Train flow:
+
+      VIDEO   → ns-process-data video  → ns-train ...
+      IMAGES  → ns-process-data images → ns-train ...
+      IMPORT  → (skip Process)         → ns-train ...
     """
 
     def __init__(self, store: ProjectStore, parent: QWidget | None = None):
@@ -227,6 +236,7 @@ class NewProjectDialog(QDialog):
         v.addWidget(section_title("SOURCE"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("From video — run processing, then train", _MODE_VIDEO)
+        self.mode_combo.addItem("From image folder — run processing, then train", _MODE_IMAGES)
         self.mode_combo.addItem("Import processed dataset — train directly", _MODE_IMPORT)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         v.addWidget(self.mode_combo)
@@ -239,9 +249,11 @@ class NewProjectDialog(QDialog):
 
         v.addSpacing(4)
 
-        # Path row — swaps between video and folder pickers.
+        # Path row — swaps between video, images-folder, and import pickers.
+        # Order MUST match the _MODE_* constants so setCurrentIndex(mode) works.
         self.path_stack = QStackedWidget()
         self.path_stack.addWidget(self._video_page())
+        self.path_stack.addWidget(self._images_page())
         self.path_stack.addWidget(self._import_page())
         v.addWidget(self.path_stack)
 
@@ -278,6 +290,46 @@ class NewProjectDialog(QDialog):
         note = QLabel(
             f"Must live inside {DATA_DIR}.  "
             "That's the folder bind-mounted into the container as /workspace."
+        )
+        note.setProperty("role", "caption")
+        note.setWordWrap(True)
+        wv.addWidget(note)
+        return w
+
+    def _images_page(self) -> QWidget:
+        w = QWidget()
+        wv = QVBoxLayout(w)
+        wv.setContentsMargins(0, 0, 0, 0)
+        wv.setSpacing(6)
+
+        wv.addWidget(section_title("IMAGE FOLDER"))
+        row = QHBoxLayout(); row.setSpacing(8)
+        self.images_path_edit = QLineEdit()
+        self.images_path_edit.setPlaceholderText(
+            str(INPUT_IMAGES_DIR) + "/your_image_set"
+        )
+        self.images_path_edit.textChanged.connect(self._refresh_images_detection)
+        self.images_browse_btn = QPushButton("Browse…")
+        self.images_browse_btn.setProperty("role", "secondary")
+        self.images_browse_btn.setCursor(Qt.PointingHandCursor)
+        self.images_browse_btn.clicked.connect(self._browse_images_folder)
+        row.addWidget(self.images_path_edit, 1)
+        row.addWidget(self.images_browse_btn)
+        wv.addLayout(row)
+
+        # Live readout — populated by _refresh_images_detection on textChanged
+        # and after a successful browse. Format mirrors _import_page's detect
+        # caption so the dialog feels consistent across modes.
+        self.images_detect_lbl = QLabel("")
+        self.images_detect_lbl.setProperty("role", "caption")
+        self.images_detect_lbl.setWordWrap(True)
+        wv.addWidget(self.images_detect_lbl)
+
+        note = QLabel(
+            f"Convention: drop image folders under {INPUT_IMAGES_DIR}/.\n"
+            f"Anywhere inside {DATA_DIR}/ is technically accepted (the "
+            "container needs to see the folder), but keeping image sets "
+            "under input_images/ keeps the data/ tree organized."
         )
         note.setProperty("role", "caption")
         note.setWordWrap(True)
@@ -327,7 +379,13 @@ class NewProjectDialog(QDialog):
                 "Pick a source video. ns-process-data will extract frames and "
                 "build a Nerfstudio dataset before training."
             )
-        else:
+        elif idx == _MODE_IMAGES:
+            self.hint.setText(
+                "Pick a folder of images. ns-process-data will run COLMAP on "
+                "them and build a Nerfstudio dataset before training."
+            )
+            self._refresh_images_detection(self.images_path_edit.text())
+        else:  # _MODE_IMPORT
             self.hint.setText(
                 "Pick a folder that's already been processed. The project will "
                 "skip straight to the Train tab."
@@ -346,6 +404,57 @@ class NewProjectDialog(QDialog):
             self.video_path_edit.setText(path)
             if not self.name_edit.text().strip():
                 self.name_edit.setText(Path(path).stem)
+
+    # ---- images mode helpers ----
+    def _browse_images_folder(self) -> None:
+        # Auto-create input_images/ on first use so the picker has somewhere
+        # sensible to land. Doesn't force the user to keep folders there —
+        # _accept only checks DATA_DIR membership, not input_images/.
+        INPUT_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        start_dir = str(INPUT_IMAGES_DIR)
+        path = QFileDialog.getExistingDirectory(
+            self, "Pick a folder of images", start_dir,
+            QFileDialog.ShowDirsOnly,
+        )
+        if path:
+            self.images_path_edit.setText(path)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(Path(path).name)
+
+    def _refresh_images_detection(self, raw: str) -> None:
+        raw = raw.strip()
+        if not raw:
+            self.images_detect_lbl.setText("")
+            return
+        p = Path(raw).expanduser()
+        if not p.is_dir():
+            self.images_detect_lbl.setText("⚠ Folder does not exist.")
+            return
+        n, exts = count_images(p)
+        if n == 0:
+            self.images_detect_lbl.setText(
+                "⚠ No supported images in this folder "
+                "(need .jpg / .jpeg / .png / .tif / .tiff / .cr2)."
+            )
+            return
+        ext_summary = ", ".join(sorted(exts))
+        # Soft nudge when the folder is under DATA_DIR but not under
+        # input_images/. We accept either, but the convention keeps things
+        # tidy and matches the rest of the docs.
+        try:
+            p.resolve().relative_to(INPUT_IMAGES_DIR.resolve())
+            location_note = ""
+        except ValueError:
+            try:
+                p.resolve().relative_to(DATA_DIR.resolve())
+                location_note = (
+                    f"  ·  Tip: keep image sets under {INPUT_IMAGES_DIR}/."
+                )
+            except ValueError:
+                location_note = ""
+        self.images_detect_lbl.setText(
+            f"✓ {n} image(s) detected ({ext_summary}).{location_note}"
+        )
 
     # ---- import mode helpers ----
     def _browse_folder(self) -> None:
@@ -403,7 +512,20 @@ class NewProjectDialog(QDialog):
             except ValueError as e:
                 QMessageBox.warning(self, "Can't create project", str(e))
                 return
-        else:
+        elif mode == _MODE_IMAGES:
+            raw = self.images_path_edit.text().strip()
+            if not raw:
+                QMessageBox.warning(
+                    self, "Missing folder", "Pick a folder of images."
+                )
+                return
+            path = Path(raw).expanduser()
+            try:
+                self._store.create_from_images(name, path)
+            except ValueError as e:
+                QMessageBox.warning(self, "Can't create project", str(e))
+                return
+        else:  # _MODE_IMPORT
             raw = self.import_path_edit.text().strip()
             if not raw:
                 QMessageBox.warning(

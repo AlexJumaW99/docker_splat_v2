@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from app import docker_service as dock
 from app.config import CONTAINER_NAME, DATA_DIR
 from app.jobs import JobManager, JobSpec
+from app.paths import unique_path
 from app.store import Project, ProjectStore
 from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
 
@@ -101,20 +102,6 @@ def _sanitize_stem(raw: str, ext: str) -> str:
         s = s[:-len(ext)]
     s = s.replace("/", "_").replace("\\", "_")
     return s.strip()
-
-
-def _unique_path(parent: Path, stem: str, ext: str) -> Path:
-    """Return a path under `parent` whose `<stem><ext>` name is free.
-    Appends `_2`, `_3`, … until a free slot is found."""
-    target = parent / f"{stem}{ext}"
-    if not target.exists():
-        return target
-    i = 2
-    while True:
-        candidate = parent / f"{stem}_{i}{ext}"
-        if not candidate.exists():
-            return candidate
-        i += 1
 
 
 # ---------- training run discovery ----------
@@ -524,7 +511,7 @@ class _Form(QWidget):
         stem = _sanitize_stem(self.ply_name_edit.text(), ".ply")
         if not stem:
             stem = _default_ply_stem(self._current_run())
-        target = _unique_path(EXPORTS_DIR, stem, ".ply")
+        target = unique_path(EXPORTS_DIR, stem, ".ply")
         self.ply_target_line.setText(str(target))
         desired = f"{stem}.ply"
         if target.name != desired:
@@ -605,7 +592,7 @@ class _Form(QWidget):
         if not stem:
             stem = cp.stem
         out_dir = _renders_out_dir(self._project)
-        target = _unique_path(out_dir, stem, ".mp4")
+        target = unique_path(out_dir, stem, ".mp4")
         self.video_target_line.setText(str(target))
         desired = f"{stem}.mp4"
         if target.name != desired:
@@ -655,7 +642,7 @@ class _Form(QWidget):
 
         stem = _sanitize_stem(self.ply_name_edit.text(), ".ply") \
             or _default_ply_stem(run)
-        host_target = _unique_path(EXPORTS_DIR, stem, ".ply")
+        host_target = unique_path(EXPORTS_DIR, stem, ".ply")
         final_name = host_target.name
 
         # Both exporters write `splat.ply` into their --output-dir, so we
@@ -724,7 +711,7 @@ class _Form(QWidget):
 
         stem = _sanitize_stem(self.video_name_edit.text(), ".mp4") or cp.stem
         out_dir = _renders_out_dir(self._project)
-        host_target = _unique_path(out_dir, stem, ".mp4")
+        host_target = unique_path(out_dir, stem, ".mp4")
         final_name = host_target.name
 
         c_config = run.container_config

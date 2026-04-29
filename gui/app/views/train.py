@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from app import docker_service as dock
 from app.config import CONTAINER_NAME, DATA_DIR, VISER_PORT
 from app.jobs import JobManager, JobSpec
-from app.store import Project, ProjectStore
+from app.store import Project, ProjectStore, source_kind
 from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
 
 
@@ -230,7 +230,11 @@ class _NotProcessedState(QWidget):
         v.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         v.setSpacing(10)
 
-        imported = project.video_path is None
+        # source_kind == "imported" means the project was created via the
+        # "Import processed dataset" flow — there's no source to re-process,
+        # so we point the user at the broken folder rather than at Process.
+        # video- and images-sourced projects can both be re-processed.
+        imported = source_kind(project) == "imported"
 
         title = QLabel("Imported dataset missing" if imported else "Not processed yet")
         title.setObjectName("PageTitle")
@@ -651,10 +655,12 @@ class _Form(QWidget):
             QMessageBox.warning(
                 self, "Missing dataset",
                 f"Expected file not found:\n{marker}\n\n"
-                "Restore the dataset folder, or (for video-sourced projects) "
-                "re-run Process.",
+                "Restore the dataset folder, or (for video- or images-sourced "
+                "projects) re-run Process.",
             )
-            if self._project.video_path is not None:
+            # Imported projects have no source to re-process — only offer
+            # the jump-to-Process shortcut for video / images projects.
+            if source_kind(self._project) != "imported":
                 self.request_process.emit()
             return
 
