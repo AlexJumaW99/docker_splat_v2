@@ -3,7 +3,7 @@ Project store.
 
 A project bundles one source (video file or image folder) + its processed
 directory + its training runs. State persists to
-~/.config/docker_splat_gui/projects.json.
+~/.config/docker_splat_v2_gui/projects.json.
 
 The store is a QObject singleton; views connect to its signals so they stay
 in sync when the active project changes.

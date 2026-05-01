@@ -41,7 +41,7 @@ create one (**+ New project**):
   Imported projects skip straight to the Train tab.
 
 Per-project state (presets, last-used params, dataparser metadata) persists
-to `~/.config/docker_splat_gui/projects.json`.
+to `~/.config/docker_splat_v2_gui/projects.json`.
 
 ## Safety guarantees
 

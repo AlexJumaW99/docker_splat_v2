@@ -171,7 +171,7 @@ The Dockerfile uses a 5-stage build. Each stage is independently buildable with 
 
 ## What's been fixed
 
-Three non-obvious issues you'd hit trying to build this yourself:
+Seven non-obvious issues you'd hit trying to build this yourself:
 
 | Issue | Root cause | Fix |
 |---|---|---|
@@ -204,6 +204,7 @@ All seven are baked into the Dockerfile and the documented `docker create` comma
 | `ns-train splatfacto` full training | ✅ 7000 iterations, ~84M gaussians, ~15 min |
 | Viser viewer reachable from host | ✅ Port 7007 bridged, scene renders live |
 | TensorBoard reachable from host | ✅ Port 6006 bridged, scalars + events logged |
+| Viewer split-mode patch (gl_z_buf_depth) | ✅ `smoke_test.sh` verifies patched anchors present + depth compositing intact |
 | `--vis viewer+tensorboard` simultaneous | ✅ Verified — both work in parallel, minor eval stutter |
 
 ---
@@ -225,13 +226,21 @@ All seven are baked into the Dockerfile and the documented `docker create` comma
 Commit history (`git log --oneline`, most recent first):
 
 ```
-Pin COLMAP to a specific upstream commit + add smoke-test guard
-Add colmap-shim to auto-promote largest submap into sparse/0
+Document network-detachment recovery + add make heal-net
+Add image-folder source mode to the Process tab GUI
+Pin COLMAP commit + smoke-test SHA against Dockerfile pin
+Add Makefile wrapping compose + smoke-test for disaster-recovery shortcuts
+Fix viewer split-mode crash by filtering gl_z_buf_depth from dropdowns
+Relocate repo from ~/Desktop to ~/docker-stacks; pin PySide6==6.11.0
+Capture runtime contract in docker-compose.yml + trim build context
+Correct viser version in stack table (0.2.7 → 1.0.0)
+Auto-promote largest COLMAP submap into sparse/0 via PATH-shim
 Warn on Process tab when COLMAP splinters into multiple submaps
 Pre-place faiss-format vocab tree for vocab_tree matcher
 Add help-badge tooltips across GUI and retheme to light palette
 Add advanced controls to Process tab and drop broken depth-debug flag
 Label splatfacto-mcmc runs distinctly in Exports tab
+Add splatfacto-w .ply exporter and route GUI Exports tab to it
 Bake splatfacto-w into image and expose in Train dropdown (GUI)
 Add Exports tab with .ply export and camera-path video render (GUI)
 Fork naming to v2 and pin nerfstudio to git main (enables splatfacto-mcmc)
