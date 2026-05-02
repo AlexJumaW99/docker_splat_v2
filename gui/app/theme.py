@@ -234,6 +234,20 @@ QPushButton[role="ghost"]:hover {{
     color: {text};
     background-color: {surface_hi};
 }}
+QPushButton[role="danger"] {{
+    background-color: {error};
+    color: #FFFFFF;
+    border: 1px solid {error};
+    border-radius: 7px;
+    padding: 8px 18px;
+    font-weight: 600;
+}}
+QPushButton[role="danger"]:hover {{ background-color: #9A1E14; border-color: #9A1E14; }}
+QPushButton[role="danger"]:disabled {{
+    background-color: {border};
+    color: {text_dim};
+    border-color: {border};
+}}
 
 /* help badge */
 QPushButton[role="help"] {{

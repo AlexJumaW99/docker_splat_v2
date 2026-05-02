@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -219,6 +221,174 @@ class Project(BaseModel):
 class _Root(BaseModel):
     projects: list[Project] = Field(default_factory=list)
     active_project_id: str | None = None
+
+
+def _dir_size(path: Path) -> int:
+    if not path.is_dir():
+        return 0
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.1f} TB"
+
+
+def _host_to_container(path: Path) -> str | None:
+    """Map a host path to its /workspace equivalent, or None if outside DATA_DIR."""
+    try:
+        rel = path.resolve().relative_to(DATA_DIR.resolve())
+    except ValueError:
+        return None
+    return f"/workspace/{rel.as_posix()}"
+
+
+def _docker_rm(container_path: str) -> bool:
+    """``docker exec <container> rm -rf <path>`` — returns True on success."""
+    import subprocess
+    from app.config import CONTAINER_NAME
+    docker = shutil.which("docker")
+    if not docker:
+        return False
+    try:
+        r = subprocess.run(
+            [docker, "exec", CONTAINER_NAME, "rm", "-rf", container_path],
+            capture_output=True, text=True, timeout=60.0,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _rm_tree(path: Path) -> None:
+    """Remove a directory, using docker exec for root-owned files."""
+    if not path.is_dir():
+        return
+    c_path = _host_to_container(path)
+    if c_path and _docker_rm(c_path):
+        _log.info("deleted (via container): %s", path)
+        return
+    try:
+        shutil.rmtree(path)
+        _log.info("deleted: %s", path)
+    except OSError as e:
+        _log.warning("failed to delete %s: %s", path, e)
+
+
+def _rm_file(path: Path) -> None:
+    """Remove a single file, using docker exec for root-owned files."""
+    if not path.is_file():
+        return
+    try:
+        path.unlink()
+        _log.info("deleted: %s", path)
+    except PermissionError:
+        c_path = _host_to_container(path)
+        if c_path and _docker_rm(c_path):
+            _log.info("deleted (via container): %s", path)
+        else:
+            _log.warning("failed to delete %s: permission denied", path)
+    except OSError as e:
+        _log.warning("failed to delete %s: %s", path, e)
+
+
+@dataclass
+class ProjectDataScan:
+    """Result of scanning the filesystem for all data tied to a project."""
+    processed_dirs: list[Path] = field(default_factory=list)
+    outputs_dir: Path | None = None
+    export_files: list[Path] = field(default_factory=list)
+    render_dirs: list[Path] = field(default_factory=list)
+    total_bytes: int = 0
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.processed_dirs or self.outputs_dir
+                     or self.export_files or self.render_dirs)
+
+    def summary_lines(self) -> list[str]:
+        lines: list[str] = []
+        if self.processed_dirs:
+            names = ", ".join(p.name for p in self.processed_dirs)
+            lines.append(f"Processed datasets ({len(self.processed_dirs)}): {names}")
+        if self.outputs_dir:
+            methods = [d.name for d in self.outputs_dir.iterdir() if d.is_dir()] \
+                if self.outputs_dir.is_dir() else []
+            lines.append(f"Training outputs: {self.outputs_dir.name}/"
+                         + (f" ({', '.join(methods)})" if methods else ""))
+        if self.export_files:
+            lines.append(f"Exported .ply files ({len(self.export_files)}): "
+                         + ", ".join(f.name for f in self.export_files))
+        if self.render_dirs:
+            names = ", ".join(p.name for p in self.render_dirs)
+            lines.append(f"Rendered videos ({len(self.render_dirs)}): {names}")
+        if self.total_bytes:
+            lines.append(f"Total size: {_fmt_size(self.total_bytes)}")
+        return lines
+
+
+def scan_project_data(project: Project) -> ProjectDataScan:
+    """Inventory all filesystem artifacts associated with *project*."""
+    scan = ProjectDataScan()
+    pid = project.id
+
+    # -- processed dirs: the stored one + any sibling _splat* variants --
+    processed_parent = DATA_DIR / "processed"
+    seen: set[Path] = set()
+    stored = Path(project.processed_dir)
+    if stored.is_dir():
+        seen.add(stored.resolve())
+    if processed_parent.is_dir():
+        for d in processed_parent.iterdir():
+            if not d.is_dir():
+                continue
+            if d.name == f"{pid}_splat" or d.name.startswith(f"{pid}_splat_"):
+                seen.add(d.resolve())
+    scan.processed_dirs = sorted(seen)
+
+    # -- training outputs --
+    out = DATA_DIR / "outputs" / pid
+    if out.is_dir():
+        scan.outputs_dir = out
+
+    # -- exported .ply files --
+    exports_dir = DATA_DIR / "exports" / "splat"
+    if exports_dir.is_dir():
+        for f in exports_dir.iterdir():
+            if not f.is_file() or f.suffix.lower() != ".ply":
+                continue
+            if f.name.startswith(f"{pid}_"):
+                scan.export_files.append(f)
+        scan.export_files.sort()
+
+    # -- render dirs (keyed by processed_dir basename) --
+    renders_parent = DATA_DIR / "renders"
+    if renders_parent.is_dir():
+        basenames = {p.name for p in scan.processed_dirs}
+        for d in renders_parent.iterdir():
+            if d.is_dir() and d.name in basenames:
+                scan.render_dirs.append(d)
+        scan.render_dirs.sort()
+
+    # -- total size --
+    total = 0
+    for d in scan.processed_dirs:
+        total += _dir_size(d)
+    if scan.outputs_dir:
+        total += _dir_size(scan.outputs_dir)
+    for f in scan.export_files:
+        try:
+            total += f.stat().st_size
+        except OSError:
+            pass
+    for d in scan.render_dirs:
+        total += _dir_size(d)
+    scan.total_bytes = total
+
+    return scan
 
 
 class ProjectStore(QObject):
@@ -513,3 +683,39 @@ class ProjectStore(QObject):
         store = p.presets_process if kind == "process" else p.presets_train
         store[name] = params
         self._save()
+
+    def delete(self, project_id: str, delete_data: bool = False) -> None:
+        """Remove a project from the store, optionally deleting all its data.
+
+        Data created by ns-process-data / ns-train inside the container is
+        owned by root. We delete via ``docker exec rm -rf`` when the container
+        is running (same privilege that created the files). Falls back to
+        ``shutil.rmtree`` for user-owned dirs or when the container is down.
+        """
+        p = self.get(project_id)
+        if p is None:
+            raise ValueError(f"No project with id '{project_id}'.")
+
+        if delete_data:
+            scan = scan_project_data(p)
+            dirs = list(scan.processed_dirs)
+            if scan.outputs_dir:
+                dirs.append(scan.outputs_dir)
+            dirs.extend(scan.render_dirs)
+            for d in dirs:
+                _rm_tree(d)
+            for f in scan.export_files:
+                _rm_file(f)
+
+        self._root.projects = [
+            proj for proj in self._root.projects if proj.id != project_id
+        ]
+        was_active = self._root.active_project_id == project_id
+        if was_active:
+            self._root.active_project_id = (
+                self._root.projects[0].id if self._root.projects else None
+            )
+        self._save()
+        self.projects_changed.emit()
+        if was_active:
+            self.active_changed.emit(self.active)

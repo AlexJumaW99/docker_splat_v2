@@ -5,15 +5,16 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from app.config import DATA_DIR
+from app.jobs import JobManager
 from app.store import (
     INPUT_IMAGES_DIR, Project, ProjectStore, count_heic_images, count_images,
-    detect_dataset_format,
+    detect_dataset_format, scan_project_data,
 )
 
 
@@ -126,13 +127,15 @@ def labeled(text: str, help_title: str | None = None, help_body: str | None = No
 # ---------- project bar ----------
 
 class ProjectBar(QFrame):
-    """Top-of-page bar that shows the active project and lets the user switch
-    or create a new one. Syncs to ProjectStore on both sides."""
+    """Top-of-page bar that shows the active project and lets the user switch,
+    create, or delete one. Syncs to ProjectStore on both sides."""
 
-    def __init__(self, store: ProjectStore, parent: QWidget | None = None):
+    def __init__(self, store: ProjectStore, jobs: JobManager,
+                 parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("ProjectBar")
         self._store = store
+        self._jobs = jobs
 
         h = QHBoxLayout(self)
         h.setContentsMargins(18, 10, 18, 10)
@@ -149,14 +152,20 @@ class ProjectBar(QFrame):
         self.new_btn.setProperty("role", "secondary")
         self.new_btn.setCursor(Qt.PointingHandCursor)
 
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setProperty("role", "ghost")
+        self.delete_btn.setCursor(Qt.PointingHandCursor)
+
         h.addWidget(lbl)
         h.addWidget(self.combo)
         h.addStretch(1)
+        h.addWidget(self.delete_btn)
         h.addWidget(self.new_btn)
 
         self._suppress = False
         self.combo.currentIndexChanged.connect(self._on_combo_changed)
         self.new_btn.clicked.connect(self._on_new)
+        self.delete_btn.clicked.connect(self._on_delete)
         self._store.projects_changed.connect(self._refresh)
         self._store.active_changed.connect(lambda _p: self._refresh())
 
@@ -172,8 +181,10 @@ class ProjectBar(QFrame):
         if not projects:
             self.combo.addItem("— no projects —", userData=None)
             self.combo.setEnabled(False)
+            self.delete_btn.setEnabled(False)
         else:
             self.combo.setEnabled(True)
+            self.delete_btn.setEnabled(True)
             active = self._store.active
             if active:
                 idx = next((i for i, p in enumerate(projects) if p.id == active.id), 0)
@@ -189,6 +200,19 @@ class ProjectBar(QFrame):
 
     def _on_new(self) -> None:
         dlg = NewProjectDialog(self._store, self)
+        dlg.exec()
+
+    def _on_delete(self) -> None:
+        active = self._store.active
+        if active is None:
+            return
+        if self._jobs.is_running():
+            QMessageBox.warning(
+                self, "Job running",
+                "A job is currently running. Cancel it before deleting a project.",
+            )
+            return
+        dlg = DeleteProjectDialog(self._store, active, self)
         dlg.exec()
 
 
@@ -544,4 +568,127 @@ class NewProjectDialog(QDialog):
             except ValueError as e:
                 QMessageBox.warning(self, "Can't import dataset", str(e))
                 return
+        self.accept()
+
+
+# ---------- delete project dialog ----------
+
+class DeleteProjectDialog(QDialog):
+    """Confirm deletion of a project, optionally removing all data from disk."""
+
+    def __init__(self, store: ProjectStore, project: Project,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self._store = store
+        self._project = project
+        self.setWindowTitle("Delete project")
+        self.setMinimumWidth(520)
+
+        self._scan = scan_project_data(project)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(24, 22, 24, 18)
+        v.setSpacing(10)
+
+        title = QLabel(f"Delete '{project.name}'?")
+        title.setObjectName("PageTitle")
+        v.addWidget(title)
+
+        warn = QLabel("This action cannot be undone.")
+        warn.setStyleSheet("color: #B42318; font-weight: 600;")
+        v.addWidget(warn)
+
+        v.addSpacing(4)
+
+        # Data checkbox + summary
+        self.data_cb = QCheckBox("Also delete all project data from disk")
+        self.data_cb.setChecked(True)
+        self.data_cb.toggled.connect(self._on_data_toggled)
+        v.addWidget(self.data_cb)
+
+        self.data_frame = QFrame()
+        self.data_frame.setProperty("role", "subcard")
+        df_lay = QVBoxLayout(self.data_frame)
+        df_lay.setContentsMargins(14, 10, 14, 10)
+        df_lay.setSpacing(4)
+
+        if self._scan.has_data:
+            for line in self._scan.summary_lines():
+                lbl = QLabel(line)
+                lbl.setProperty("role", "caption")
+                lbl.setWordWrap(True)
+                lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                df_lay.addWidget(lbl)
+        else:
+            no_data = QLabel("No project data found on disk.")
+            no_data.setProperty("role", "caption")
+            df_lay.addWidget(no_data)
+            self.data_cb.setChecked(False)
+            self.data_cb.setEnabled(False)
+
+        v.addWidget(self.data_frame)
+        v.addSpacing(6)
+
+        # Confirmation input
+        v.addWidget(section_title("CONFIRM"))
+        confirm_hint = QLabel(
+            f"Type \"{project.name}\" to confirm deletion."
+        )
+        confirm_hint.setProperty("role", "caption")
+        confirm_hint.setWordWrap(True)
+        v.addWidget(confirm_hint)
+
+        self.confirm_edit = QLineEdit()
+        self.confirm_edit.setPlaceholderText(project.name)
+        self.confirm_edit.textChanged.connect(self._on_confirm_text_changed)
+        v.addWidget(self.confirm_edit)
+
+        v.addSpacing(8)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setProperty("role", "secondary")
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.clicked.connect(self.reject)
+
+        self.delete_btn = QPushButton("Delete project")
+        self.delete_btn.setProperty("role", "danger")
+        self.delete_btn.setCursor(Qt.PointingHandCursor)
+        self.delete_btn.setEnabled(False)
+        self.delete_btn.clicked.connect(self._accept)
+
+        btn_row.addStretch(1)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(self.delete_btn)
+        v.addLayout(btn_row)
+
+        self._update_button_text()
+
+    def _on_data_toggled(self, checked: bool) -> None:
+        self.data_frame.setVisible(checked)
+        self._update_button_text()
+
+    def _on_confirm_text_changed(self, text: str) -> None:
+        self.delete_btn.setEnabled(text.strip() == self._project.name)
+
+    def _update_button_text(self) -> None:
+        if self.data_cb.isChecked() and self._scan.has_data:
+            self.delete_btn.setText("Delete project and data")
+        else:
+            self.delete_btn.setText("Delete project")
+
+    def _accept(self) -> None:
+        if self.confirm_edit.text().strip() != self._project.name:
+            return
+        try:
+            self._store.delete(
+                self._project.id,
+                delete_data=self.data_cb.isChecked(),
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Delete failed", str(e))
+            return
         self.accept()

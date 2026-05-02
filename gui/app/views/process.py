@@ -4,9 +4,10 @@ Process view — runs ns-process-data inside splat-ns.
 from __future__ import annotations
 
 import shlex
+import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
-from app.config import CONTAINER_NAME, DATA_DIR
+from app.config import CONTAINER_NAME, DATA_DIR, VIZER_CONTAINER, VIZER_VIEWER_PORT
 from app.ffprobe import VideoInfo, probe
 from app.jobs import JobManager, JobSpec
 from app.paths import unique_path
@@ -274,6 +275,27 @@ class _ProbeTask(QRunnable):
         self._sig.done.emit(probe(self._path))
 
 
+# ---------- async vizer status ----------
+
+class _VizerStatusSignals(QObject):
+    done = Signal(str)
+
+
+class _VizerStatusTask(QRunnable):
+    def __init__(self, signals: _VizerStatusSignals):
+        super().__init__()
+        self.setAutoDelete(True)
+        self._signals = signals
+
+    @Slot()
+    def run(self) -> None:
+        state = dock.container_state(VIZER_CONTAINER)
+        try:
+            self._signals.done.emit(state.status)
+        except RuntimeError:
+            pass
+
+
 # ---------- empty state ----------
 
 class _EmptyState(QWidget):
@@ -386,10 +408,20 @@ class _Form(QWidget):
         # iterdir() in _refresh_source_meta() and doesn't need a worker.
         self._probe_signals = _ProbeSignals()
         self._probe_signals.done.connect(self._on_probe_done)
+        self._vizer_signals = _VizerStatusSignals()
+        self._vizer_signals.done.connect(self._on_vizer_status)
+        self._vizer_poll_pool = QThreadPool(self)
+        self._vizer_poll_pool.setMaxThreadCount(1)
 
         self._build()
         self._load_project()
         self._wire_jobs()
+
+        self._vizer_timer = QTimer(self)
+        self._vizer_timer.setInterval(3000)
+        self._vizer_timer.timeout.connect(self._poll_vizer)
+        self._vizer_timer.start()
+        self._poll_vizer()
 
         # Catch up if a job is already running (e.g. user switched projects
         # mid-run) so our UI reflects reality immediately.
@@ -947,6 +979,18 @@ class _Form(QWidget):
         self.splinter_warn.hide()
 
         v.addLayout(row)
+
+        vizer_row = QHBoxLayout(); vizer_row.setSpacing(10)
+        self.vizer_btn = QPushButton("Watch live in vizer")
+        self.vizer_btn.setProperty("role", "secondary")
+        self.vizer_btn.setCursor(Qt.PointingHandCursor)
+        self.vizer_btn.clicked.connect(self._on_open_vizer)
+        self.vizer_pill = pill("—", "neutral")
+        vizer_row.addWidget(self.vizer_btn)
+        vizer_row.addStretch(1)
+        vizer_row.addWidget(self.vizer_pill)
+        v.addLayout(vizer_row)
+
         v.addWidget(self.ready_to_train)
         v.addWidget(self.splinter_warn)
         return c
@@ -1511,6 +1555,44 @@ class _Form(QWidget):
         )
         self.splinter_warn.show()
 
+    # ---- vizer live viewer ----
+    def _poll_vizer(self) -> None:
+        if self._vizer_poll_pool.activeThreadCount() > 0:
+            return
+        self._vizer_poll_pool.start(_VizerStatusTask(self._vizer_signals))
+
+    def _on_vizer_status(self, status: str) -> None:
+        if status == "running":
+            set_pill(self.vizer_pill, "● Running", "success")
+        elif status in ("exited", "created"):
+            set_pill(self.vizer_pill, "Stopped", "warning")
+        elif status == "missing":
+            set_pill(self.vizer_pill, "Not found", "error")
+        else:
+            set_pill(self.vizer_pill, status, "neutral")
+
+    def _on_open_vizer(self) -> None:
+        state = dock.container_state(VIZER_CONTAINER)
+        if state.status == "missing":
+            QMessageBox.warning(
+                self, "Vizer container not found",
+                f"No container named '{VIZER_CONTAINER}' exists.\n\n"
+                "Create it first — see the vizer README or run:\n"
+                "  cd ~/docker-stacks/vizer && docker compose up -d",
+            )
+            return
+        if state.status != "running":
+            try:
+                dock.start_container(VIZER_CONTAINER)
+            except dock.DockerError as e:
+                QMessageBox.warning(
+                    self, "Couldn't start vizer",
+                    f"Failed to start '{VIZER_CONTAINER}':\n{e}",
+                )
+                return
+            set_pill(self.vizer_pill, "● Starting…", "warning")
+        webbrowser.open(f"http://localhost:{VIZER_VIEWER_PORT}")
+
 
 # ---------- top-level view ----------
 
@@ -1529,7 +1611,7 @@ class ProcessView(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self.project_bar = ProjectBar(store)
+        self.project_bar = ProjectBar(store, jobs)
         outer.addWidget(self.project_bar)
 
         self.stack = QStackedWidget()

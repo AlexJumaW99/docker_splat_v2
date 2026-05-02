@@ -8,6 +8,9 @@ IMAGE_NAME = "splat-nerfstudio-v2"
 VISER_PORT = 7007
 TENSORBOARD_PORT = 6006
 
+VIZER_CONTAINER = "viser-colmap"
+VIZER_VIEWER_PORT = 7070
+
 CONFIG_DIR = Path.home() / ".config" / "docker_splat_v2_gui"
 PROJECTS_FILE = CONFIG_DIR / "projects.json"
 

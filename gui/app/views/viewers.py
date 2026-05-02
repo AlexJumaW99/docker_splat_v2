@@ -723,7 +723,7 @@ class ViewersView(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self.project_bar = ProjectBar(store)
+        self.project_bar = ProjectBar(store, jobs)
         outer.addWidget(self.project_bar)
 
         self.stack = QStackedWidget()
