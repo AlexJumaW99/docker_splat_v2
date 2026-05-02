@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from app.config import DATA_DIR
 from app.store import (
-    INPUT_IMAGES_DIR, Project, ProjectStore, count_images,
+    INPUT_IMAGES_DIR, Project, ProjectStore, count_heic_images, count_images,
     detect_dataset_format,
 )
 
@@ -431,13 +431,19 @@ class NewProjectDialog(QDialog):
             self.images_detect_lbl.setText("⚠ Folder does not exist.")
             return
         n, exts = count_images(p)
-        if n == 0:
+        n_heic = count_heic_images(p)
+        if n == 0 and n_heic == 0:
             self.images_detect_lbl.setText(
                 "⚠ No supported images in this folder "
-                "(need .jpg / .jpeg / .png / .tif / .tiff / .cr2)."
+                "(need .jpg / .jpeg / .png / .tif / .tiff / .cr2 / .heic)."
             )
             return
-        ext_summary = ", ".join(sorted(exts))
+        parts: list[str] = []
+        if n:
+            ext_summary = ", ".join(sorted(exts))
+            parts.append(f"{n} image(s) detected ({ext_summary})")
+        if n_heic:
+            parts.append(f"{n_heic} HEIC — will auto-convert to JPEG")
         # Soft nudge when the folder is under DATA_DIR but not under
         # input_images/. We accept either, but the convention keeps things
         # tidy and matches the rest of the docs.
@@ -453,7 +459,7 @@ class NewProjectDialog(QDialog):
             except ValueError:
                 location_note = ""
         self.images_detect_lbl.setText(
-            f"✓ {n} image(s) detected ({ext_summary}).{location_note}"
+            f"✓ {'  ·  '.join(parts)}.{location_note}"
         )
 
     # ---- import mode helpers ----

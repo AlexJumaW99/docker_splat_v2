@@ -20,8 +20,8 @@ from app.ffprobe import VideoInfo, probe
 from app.jobs import JobManager, JobSpec
 from app.paths import unique_path
 from app.store import (
-    ALLOWED_IMAGE_EXTS, INPUT_IMAGES_DIR, Project, ProjectStore, count_images,
-    source_kind,
+    ALLOWED_IMAGE_EXTS, INPUT_IMAGES_DIR, Project, ProjectStore,
+    convert_heic_images, count_heic_images, count_images, source_kind,
 )
 from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
 
@@ -825,7 +825,10 @@ class _Form(QWidget):
                     f"Eval folders must live inside {DATA_DIR} so the container can see them."
                 )
                 return
-            n, _ = count_images(Path(path))
+            eval_path = Path(path)
+            if count_heic_images(eval_path):
+                convert_heic_images(eval_path)
+            n, _ = count_images(eval_path)
             if n == 0:
                 allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
                 QMessageBox.warning(
@@ -1117,12 +1120,18 @@ class _Form(QWidget):
             self.source_meta_lbl.setText("folder not found")
             return
         n, exts = count_images(path)
-        if n == 0:
+        n_heic = count_heic_images(path)
+        if n == 0 and n_heic == 0:
             allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
             self.source_meta_lbl.setText(f"no supported images (need: {allowed})")
             return
-        ext_summary = ", ".join(sorted(exts))
-        self.source_meta_lbl.setText(f"{n} image(s) · {ext_summary}")
+        parts: list[str] = []
+        if n:
+            ext_summary = ", ".join(sorted(exts))
+            parts.append(f"{n} image(s) · {ext_summary}")
+        if n_heic:
+            parts.append(f"{n_heic} HEIC → will auto-convert to JPEG")
+        self.source_meta_lbl.setText("  ·  ".join(parts))
 
     # ---- collect + run ----
     def _collect_params(self) -> dict:
@@ -1272,6 +1281,15 @@ class _Form(QWidget):
                         f"No such directory:\n{source}",
                     )
                     return
+                n_heic = count_heic_images(source)
+                if n_heic:
+                    self.source_meta_lbl.setText(
+                        f"Converting {n_heic} HEIC image(s) to JPEG…"
+                    )
+                    from PySide6.QtWidgets import QApplication
+                    QApplication.processEvents()
+                    converted = convert_heic_images(source)
+                    self._refresh_images_meta(source)
                 n, _ = count_images(source)
                 if n == 0:
                     allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))

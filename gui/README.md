@@ -11,15 +11,15 @@ run by hand, wrapped in a form with sensible defaults and per-project state.
 ./run.sh
 ```
 
-First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB).
-Subsequent launches are instant.
+First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif
+(~90 MB). Subsequent launches are instant.
 
 ## What works today
 
 | Tab       | State    | What it does                                                                                                                                 |
 |-----------|----------|----------------------------------------------------------------------------------------------------------------------------------------------|
 | Dashboard | live     | Polls the Docker daemon, `splat-ns-v2` container, and GPU (via `nvidia-smi`). Shows the exact `docker build` / `docker create` commands if the container is missing, with copy buttons — never runs them for you. |
-| Process   | live     | Form-driven `ns-process-data video`. Per-project presets, advanced raw-flag passthrough, live ffprobe readout of the source video.           |
+| Process   | live     | Form-driven `ns-process-data` (video or images). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF (iPhone) to max-quality JPEG with EXIF preserved; originals stashed in `heic_originals/`. |
 | Train     | live     | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle, advanced raw-flag passthrough. Detects when the viser port becomes live and deep-links to `http://localhost:7007`. |
 | Exports   | live     | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (MP4 from viser keyframe JSON). Writes to `data/exports/splat/` and `data/renders/<project>/`; auto-suffixes on filename collisions so repeat exports never overwrite. |
 | Viewers   | live     | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
@@ -27,11 +27,14 @@ Subsequent launches are instant.
 
 ## Projects
 
-A project bundles a dataset with its processing/training runs. Two ways to
+A project bundles a dataset with its processing/training runs. Three ways to
 create one (**+ New project**):
 
 - **From video** — point at a video file inside `~/docker-stacks/docker_splat_v2/data/`.
   The project goes through Process → Train like the CLI workflow.
+- **From images** — point at a folder of photos inside
+  `~/docker-stacks/docker_splat_v2/data/input_images/`. Supports JPEG, PNG, TIFF,
+  CR2, and HEIC/HEIF (auto-converted to JPEG). Goes Process → Train.
 - **Import processed dataset** — point at an already-processed folder inside
   `~/docker-stacks/docker_splat_v2/data/`. The app auto-detects the layout:
   - `transforms.json` at the root → Nerfstudio dataparser

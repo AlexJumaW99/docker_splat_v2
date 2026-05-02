@@ -18,14 +18,15 @@ From host setup to your first exported Gaussian Splat PLY.
 4. [Desktop GUI (optional)](#desktop-gui-optional)
 5. [Recording videos for splatfacto](#recording-videos-for-splatfacto)
 6. [Processing a video](#processing-a-video)
-7. [Training splatfacto](#training-splatfacto)
-8. [Training on a pre-processed dataset](#training-on-a-pre-processed-dataset)
-9. [Viewing in viser](#viewing-in-viser)
-10. [Real-time monitoring with TensorBoard](#real-time-monitoring-with-tensorboard)
-11. [Exporting a PLY file](#exporting-a-ply-file)
-12. [Rendering a camera-path video](#rendering-a-camera-path-video)
-13. [Troubleshooting](#troubleshooting)
-14. [Appendix: full command reference](#appendix-full-command-reference)
+7. [Processing images (instead of video)](#processing-images-instead-of-video)
+8. [Training splatfacto](#training-splatfacto)
+9. [Training on a pre-processed dataset](#training-on-a-pre-processed-dataset)
+10. [Viewing in viser](#viewing-in-viser)
+11. [Real-time monitoring with TensorBoard](#real-time-monitoring-with-tensorboard)
+12. [Exporting a PLY file](#exporting-a-ply-file)
+13. [Rendering a camera-path video](#rendering-a-camera-path-video)
+14. [Troubleshooting](#troubleshooting)
+15. [Appendix: full command reference](#appendix-full-command-reference)
 
 ---
 
@@ -217,14 +218,14 @@ cd gui
 ./run.sh
 ```
 
-First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subsequent launches are instant.
+First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif (~90 MB). Subsequent launches are instant.
 
 ### What each tab does
 
 | Tab       | State | Behavior                                                                                                                                      |
 |-----------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------|
 | Dashboard | live  | Polls Docker + `splat-ns-v2` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
-| Process   | live  | Form-driven `ns-process-data video` with per-project presets, advanced raw-flag passthrough, and live ffprobe readout of the source video.   |
+| Process   | live  | Form-driven `ns-process-data` (video or images). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF photos (iPhone) to maximum-quality JPEG with EXIF preserved before processing; originals are stashed in a `heic_originals/` subfolder. |
 | Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
 | Exports   | live  | Form-driven PLY export and `ns-render camera-path` (video from viser keyframe JSON). Auto-routes to `ns-export-splatfactow` for `splatfacto-w` / `splatfacto-w-light` runs (upstream `ns-export gaussian-splat` doesn't handle them) and to `ns-export gaussian-splat` for everything else. Auto-suffixes duplicate filenames (`_2`, `_3`, …) to prevent overwrites. |
 | Viewers   | live  | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
@@ -232,9 +233,10 @@ First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subseque
 
 ### Projects
 
-A project bundles a dataset with its processing/training runs. **+ New project** offers two modes:
+A project bundles a dataset with its processing/training runs. **+ New project** offers three modes:
 
 - **From video** — point at a video file inside `~/docker-stacks/docker_splat_v2/data/`. Goes Process → Train like the CLI workflow.
+- **From images** — point at a folder of photos inside `~/docker-stacks/docker_splat_v2/data/input_images/`. Supports JPEG, PNG, TIFF, CR2, and HEIC/HEIF (auto-converted to JPEG). Goes Process → Train.
 - **Import processed dataset** — point at an already-processed folder inside `~/docker-stacks/docker_splat_v2/data/`. The app auto-detects the layout:
   - `transforms.json` at the root → Nerfstudio dataparser
   - `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → COLMAP dataparser, with the relative path saved so `ns-train` gets `--colmap-path <rel>` automatically
@@ -372,6 +374,48 @@ COLMAP found poses for XX.X% of the images.
 | 85–95% | Good. Some unregistered frames are normal. |
 | 70–85% | Marginal. Consider reshooting with better lighting or slower motion. |
 | < 70% | Poor. Your video likely has motion blur, poor texture, or scene dynamics. Reshoot. |
+
+---
+
+## Processing images (instead of video)
+
+You can also process a folder of still photos instead of a video. Place your images in a subfolder under `~/docker-stacks/docker_splat_v2/data/input_images/` on the host. This becomes `/workspace/input_images/<folder>` inside the container.
+
+### iPhone HEIC photos
+
+Modern iPhones (and some Android phones) save photos in HEIC/HEIF format. The GUI's Process tab auto-converts HEIC/HEIF files to maximum-quality JPEG (quality 100, chroma subsampling 4:4:4) with full EXIF metadata preserved — including focal length and camera model, which COLMAP needs for accurate intrinsics. After conversion, originals are moved to a `heic_originals/` subfolder so the input folder stays clean.
+
+If processing via the CLI, convert HEIC files to JPEG beforehand (e.g. with `heif-convert` or any tool that preserves EXIF).
+
+### CLI recipe
+
+```bash
+ns-process-data images \
+  --data /workspace/input_images/your_scene \
+  --output-dir /workspace/processed/your_scene_splat \
+  --matching-method exhaustive \
+  --num-downscales 1 \
+  --verbose
+```
+
+### Matching method guidance for images
+
+| Method | Best for | Notes |
+|---|---|---|
+| `exhaustive` | < 100 images | Checks all N*(N-1)/2 pairs. Gold standard for small sets. |
+| `vocab_tree` | 100–500 images | Vocabulary-tree approximation. Faster but can miss matches on textureless or repetitive scenes. |
+| `sequential` | Ordered sequences (e.g. video frames) | Only matches nearby frames. Not suitable for unordered photo sets. |
+
+For still photos, **use `exhaustive` unless you have more than ~100 images.** With 31 photos, exhaustive takes seconds; vocab_tree can miss critical matches in scenes with repetitive geometry.
+
+### Tips for good photo captures
+
+The same principles as video apply — see [Recording videos for splatfacto](#recording-videos-for-splatfacto) — with these additions:
+
+1. **60–80% overlap between adjacent shots.** Each photo should share most of its frame with its neighbors.
+2. **Avoid textureless close-ups.** Shots of flat white walls, ceiling tiles, or uniform surfaces give COLMAP nothing to match on.
+3. **Keep the camera at a consistent height** and pointed roughly horizontal.
+4. **50–100 photos** for a room-sized scene. More overlap is always better than more coverage.
 
 ---
 
@@ -860,6 +904,14 @@ ns-process-data video \
   --output-dir /workspace/processed/yourvideo_splat \
   --num-frames-target 250 \
   --matching-method sequential
+
+# Process image folder into dataset (use exhaustive for < 100 images)
+ns-process-data images \
+  --data /workspace/input_images/your_scene \
+  --output-dir /workspace/processed/your_scene_splat \
+  --matching-method exhaustive \
+  --num-downscales 1 \
+  --verbose
 
 # Train splatfacto with viser + TensorBoard monitoring
 ns-train splatfacto \

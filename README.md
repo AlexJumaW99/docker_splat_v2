@@ -117,13 +117,13 @@ For detailed workflow, troubleshooting, and export instructions, see **[USER_GUI
 
 ### 4. Optional: desktop GUI
 
-A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` / `ns-viewer` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, an **Exports tab** for PLY export (auto-routed to the splatfacto-w-aware exporter when applicable) and camera-path video rendering, and a **Viewers tab** for launching ns-viewer against finished checkpoints and starting/stopping TensorBoard scoped to the active project.
+A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` / `ns-viewer` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, an **Exports tab** for PLY export (auto-routed to the splatfacto-w-aware exporter when applicable) and camera-path video rendering, and a **Viewers tab** for launching ns-viewer against finished checkpoints and starting/stopping TensorBoard scoped to the active project. The Process tab accepts both video files and image folders as input, with automatic HEIC/HEIF → JPEG conversion (quality 100, EXIF preserved) for iPhone photos — originals are stashed in a `heic_originals/` subfolder.
 
 ```bash
 cd gui && ./run.sh
 ```
 
-First launch creates `.venv/` and installs PySide6 + pydantic. See [gui/README.md](gui/README.md) and the [Desktop GUI section](USER_GUIDE.md#desktop-gui-optional) of the user guide.
+First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif. See [gui/README.md](gui/README.md) and the [Desktop GUI section](USER_GUIDE.md#desktop-gui-optional) of the user guide.
 
 ---
 
@@ -226,6 +226,7 @@ All seven are baked into the Dockerfile and the documented `docker create` comma
 Commit history (`git log --oneline`, most recent first):
 
 ```
+Add HEIC/HEIF auto-conversion to JPEG in the Process tab GUI (pillow-heif, quality 100, EXIF preserved)
 Add Viewers tab with ns-viewer launch, TensorBoard start/stop, and live port status (GUI)
 Document network-detachment recovery + add make heal-net
 Add image-folder source mode to the Process tab GUI

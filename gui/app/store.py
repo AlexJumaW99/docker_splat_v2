@@ -11,6 +11,7 @@ in sync when the active project changes.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
 from datetime import datetime, timezone
@@ -43,6 +44,8 @@ ALLOWED_IMAGE_EXTS: frozenset[str] = frozenset({
     ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".cr2",
 })
 
+CONVERTIBLE_IMAGE_EXTS: frozenset[str] = frozenset({".heic", ".heif"})
+
 
 # Conventional location for image folders. Not enforced (a folder anywhere
 # under DATA_DIR is technically valid), but the New-Project dialog defaults
@@ -67,6 +70,68 @@ def count_images(folder: Path) -> tuple[int, set[str]]:
             n += 1
             seen.add(suf)
     return n, seen
+
+
+_log = logging.getLogger(__name__)
+
+
+def count_heic_images(folder: Path) -> int:
+    """Return the number of HEIC/HEIF files in *folder* that have no
+    corresponding JPEG already (i.e. files that still need conversion)."""
+    if not folder.is_dir():
+        return 0
+    n = 0
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in CONVERTIBLE_IMAGE_EXTS:
+            jpg = p.with_suffix(".jpg")
+            if not jpg.exists():
+                n += 1
+    return n
+
+
+def convert_heic_images(folder: Path) -> int:
+    """Convert every HEIC/HEIF file in *folder* to a maximum-quality JPEG,
+    preserving EXIF metadata (critical for COLMAP focal-length extraction).
+
+    Skips files that already have a corresponding .jpg. After conversion,
+    originals are moved into a ``heic_originals/`` subdirectory so the
+    input folder only contains clean JPEGs for ns-process-data."""
+    import pillow_heif
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+
+    originals: list[Path] = []
+    converted = 0
+    for p in sorted(folder.iterdir()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in CONVERTIBLE_IMAGE_EXTS:
+            continue
+        dest = p.with_suffix(".jpg")
+        if dest.exists():
+            originals.append(p)
+            _log.debug("skip %s — %s already exists", p.name, dest.name)
+            continue
+        img = Image.open(p)
+        exif = img.info.get("exif", b"")
+        save_kw: dict = {"quality": 100, "subsampling": 0}
+        if exif:
+            save_kw["exif"] = exif
+        img.save(dest, "JPEG", **save_kw)
+        _log.info("converted %s → %s", p.name, dest.name)
+        originals.append(p)
+        converted += 1
+
+    if originals:
+        stash = folder / "heic_originals"
+        stash.mkdir(exist_ok=True)
+        for p in originals:
+            p.rename(stash / p.name)
+        _log.info("moved %d HEIC original(s) to %s", len(originals), stash)
+    return converted
 
 
 def source_kind(project: "Project") -> SourceKind:
@@ -298,7 +363,8 @@ class ProjectStore(QObject):
             ) from None
 
         n, _exts = count_images(resolved)
-        if n == 0:
+        n_heic = count_heic_images(resolved)
+        if n == 0 and n_heic == 0:
             allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
             raise ValueError(
                 f"No supported images found in:\n{resolved}\n\n"
@@ -392,7 +458,8 @@ class ProjectStore(QObject):
         if not resolved.is_dir():
             raise ValueError(f"Not a directory:\n{resolved}")
         n, _ = count_images(resolved)
-        if n == 0:
+        n_heic = count_heic_images(resolved)
+        if n == 0 and n_heic == 0:
             allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTS))
             raise ValueError(
                 f"No supported images in:\n{resolved}\n\nAccepted: {allowed}"
