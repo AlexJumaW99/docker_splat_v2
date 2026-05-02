@@ -22,7 +22,7 @@ Subsequent launches are instant.
 | Process   | live     | Form-driven `ns-process-data video`. Per-project presets, advanced raw-flag passthrough, live ffprobe readout of the source video.           |
 | Train     | live     | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle, advanced raw-flag passthrough. Detects when the viser port becomes live and deep-links to `http://localhost:7007`. |
 | Exports   | live     | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (MP4 from viser keyframe JSON). Writes to `data/exports/splat/` and `data/renders/<project>/`; auto-suffixes on filename collisions so repeat exports never overwrite. |
-| Viewers   | stub     | Placeholder — viser + TensorBoard are reachable directly in the browser in the meantime.                                                     |
+| Viewers   | live     | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
 | Runs      | stub     | Placeholder for a training-run browser over `data/outputs/`.                                                                                 |
 
 ## Projects
@@ -53,7 +53,8 @@ subcommands:
 - Lifecycle: `docker start`
 - Exec: `docker exec` — used by two narrow helpers (in-container port probe
   and a `pkill`-based viser-port reclaim) plus `JobManager` for streaming
-  long-running `ns-process-data` / `ns-train` runs.
+  long-running `ns-process-data` / `ns-train` / `ns-viewer` runs. The Viewers
+  tab also uses detached `docker exec -d` to start TensorBoard.
 
 It **cannot** build, create, remove, commit, tag, push, rename, stop, kill,
 or run containers. Your `splat-nerfstudio-v2` image and `splat-ns-v2` container

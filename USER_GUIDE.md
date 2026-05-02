@@ -227,7 +227,7 @@ First launch creates `.venv/` and installs PySide6 + pydantic (~80 MB). Subseque
 | Process   | live  | Form-driven `ns-process-data video` with per-project presets, advanced raw-flag passthrough, and live ffprobe readout of the source video.   |
 | Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
 | Exports   | live  | Form-driven PLY export and `ns-render camera-path` (video from viser keyframe JSON). Auto-routes to `ns-export-splatfactow` for `splatfacto-w` / `splatfacto-w-light` runs (upstream `ns-export gaussian-splat` doesn't handle them) and to `ns-export gaussian-splat` for everything else. Auto-suffixes duplicate filenames (`_2`, `_3`, …) to prevent overwrites. |
-| Viewers   | stub  | Placeholder — reach viser / TensorBoard directly in the browser in the meantime.                                                             |
+| Viewers   | live  | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
 | Runs      | stub  | Placeholder for a training-run browser over `data/outputs/`.                                                                                  |
 
 ### Projects

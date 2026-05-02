@@ -13,6 +13,7 @@ from app.views.dashboard import DashboardView
 from app.views.exports import ExportsView
 from app.views.process import ProcessView
 from app.views.train import TrainView
+from app.views.viewers import ViewersView
 
 
 NAV_ITEMS = [
@@ -69,7 +70,9 @@ class MainWindow(QMainWindow):
         exports_view = ExportsView(store, jobs)
         exports_view.request_navigate.connect(self._nav_to)
         self.stack.addWidget(exports_view)
-        self.stack.addWidget(StubView("Viewers", "Open viser and TensorBoard for the active project."))
+        viewers_view = ViewersView(store, jobs)
+        viewers_view.request_navigate.connect(self._nav_to)
+        self.stack.addWidget(viewers_view)
         self.stack.addWidget(StubView("Runs", "Scan data/outputs/, list training runs, "
                                      "open in viser, export PLY, duplicate params, delete."))
 

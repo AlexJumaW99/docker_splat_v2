@@ -117,7 +117,7 @@ For detailed workflow, troubleshooting, and export instructions, see **[USER_GUI
 
 ### 4. Optional: desktop GUI
 
-A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, and an **Exports tab** for PLY export (auto-routed to the splatfacto-w-aware exporter when applicable) and camera-path video rendering.
+A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` / `ns-viewer` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, an **Exports tab** for PLY export (auto-routed to the splatfacto-w-aware exporter when applicable) and camera-path video rendering, and a **Viewers tab** for launching ns-viewer against finished checkpoints and starting/stopping TensorBoard scoped to the active project.
 
 ```bash
 cd gui && ./run.sh
@@ -226,6 +226,7 @@ All seven are baked into the Dockerfile and the documented `docker create` comma
 Commit history (`git log --oneline`, most recent first):
 
 ```
+Add Viewers tab with ns-viewer launch, TensorBoard start/stop, and live port status (GUI)
 Document network-detachment recovery + add make heal-net
 Add image-folder source mode to the Process tab GUI
 Pin COLMAP commit + smoke-test SHA against Dockerfile pin
