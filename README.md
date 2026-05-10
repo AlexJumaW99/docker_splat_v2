@@ -43,7 +43,7 @@ End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M g
 |---|---|---|---|
 | **Base image** | `nvcr.io/nvidia/pytorch:25.11-py3` | NGC | CUDA 13.0 + PyTorch 2.10 + sm_120 |
 | **COLMAP** | `4.1.0.dev0` (commit `ffb5404`) | Built from source, pinned commit | SfM + GPU SIFT |
-| **gsplat** | `1.4.0` | PyPI (JIT-compiled at runtime) | Gaussian rasterization |
+| **gsplat** | `1.5.3` | PyPI (JIT-compiled at runtime) | Gaussian rasterization — unlocks 2DGS, fused-SSIM, 3DGUT, Fisheye-GS, F-Theta inside splatfacto via config flags |
 | **Nerfstudio** | `1.1.5` (git `50e0e3c`) | git main, pinned | Training CLI + viewer |
 | **splatfacto-w** | `0.1.5` (git `119a3bf`) | [KevinXu02/splatfacto-w](https://github.com/KevinXu02/splatfacto-w) | `splatfacto-w` / `splatfacto-w-light` methods |
 | **Viser** | `1.0.0` | Pinned by Nerfstudio (`viser==1.0.0`) | Web-based 3D viewer (port 7007) |
@@ -154,8 +154,8 @@ The Dockerfile uses a 5-stage build. Each stage is independently buildable with 
 └────────────────────────────┬────────────────────────────────┘
                              │
 ┌────────────────────────────▼────────────────────────────────┐
-│  Stage 4: gsplat (cache accelerator)                        │
-│  gsplat from git, replaced by 1.4.0 wheel in next stage     │
+│  Stage 4: gsplat (pinned to 1.5.3 PyPI wheel)               │
+│  Re-installed after nerfstudio's 1.4.0 downgrade in Stage 5 │
 └────────────────────────────┬────────────────────────────────┘
                              │
 ┌────────────────────────────▼────────────────────────────────┐

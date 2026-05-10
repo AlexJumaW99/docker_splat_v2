@@ -84,16 +84,29 @@ RUN git -c advice.detachedHead=false clone --filter=blob:none \
     && cd / && rm -rf /opt/colmap_src
 
 # ============================================================
-# Stage 4: gsplat — CUDA rasterizer compiled against NGC torch
-# Note: nerfstudio in Stage 5 pins gsplat==1.4.0 and will replace
-# this install. Kept for cache efficiency during iteration; the
-# final gsplat 1.4.0 wheel uses JIT compilation that picks up
-# TORCH_CUDA_ARCH_LIST=12.0 at runtime for sm_120 kernels.
+# Stage 4: gsplat — pinned to 1.5.3 (PyPI wheel, JIT-compiled at runtime)
+#
+# v4.6: pin gsplat to 1.5.3 (was: untracked git tip overwritten by
+# nerfstudio's gsplat==1.4.0 pin in Stage 5). 1.5.3 unlocks 2DGS,
+# fused-SSIM (Taming-3DGS), 3DGUT, Fisheye-GS, and F-Theta camera
+# support inside the existing splatfacto methods — all via config
+# flags on splatfacto/-big/-mcmc, no new ns-train method names.
+#
+# Verified backward compatible against the existing splatfacto +
+# splatfacto-w callsites: rasterization() in 1.5.3 is a strict
+# superset of 1.4.0 (9 new kwargs all default-valued; return tuple
+# `(Tensor, Tensor, Dict)` unchanged). gsplat.strategy and
+# gsplat.cuda._wrapper.spherical_harmonics keep the same signatures
+# splatfacto-w imports. Both callsites use all-kwargs invocations.
+#
+# Stage 5's nerfstudio install will pip-downgrade gsplat back to its
+# pinned 1.4.0 — we re-install 1.5.3 explicitly after that step. This
+# stage is kept for docker-layer cache warming of the pip wheel.
 # ============================================================
 FROM colmap AS gsplat
 
-RUN pip install --no-cache-dir --no-build-isolation \
-        git+https://github.com/nerfstudio-project/gsplat.git
+ARG GSPLAT_VERSION=1.5.3
+RUN pip install --no-cache-dir "gsplat==${GSPLAT_VERSION}"
 
 # ============================================================
 # Stage 5: nerfstudio — final image with CLI and splatfacto methods
@@ -130,6 +143,18 @@ FROM gsplat AS nerfstudio
 ARG NERFSTUDIO_COMMIT=50e0e3c70c775e89333256213363badbf074f29d
 RUN pip install --no-cache-dir \
         "nerfstudio @ git+https://github.com/nerfstudio-project/nerfstudio.git@${NERFSTUDIO_COMMIT}"
+
+# v4.6: nerfstudio 1.1.5's pyproject.toml pins gsplat==1.4.0, so the
+# install above silently downgrades the 1.5.3 we put in place in Stage 4.
+# Re-install 1.5.3 explicitly to lock the upgrade in. Pip prints a
+# non-fatal warning ("nerfstudio 1.1.5 requires gsplat==1.4.0, but you
+# have gsplat 1.5.3 which is incompatible") — this is informational
+# only and does not abort the build. Verified end-to-end by
+# smoke_test.sh (62/62 passing, including #9 rasterization on sm_120)
+# and by importing splatfacto, splatfacto-w, and ns-export-splatfactow
+# against the upgraded rasterizer.
+ARG GSPLAT_VERSION=1.5.3
+RUN pip install --no-cache-dir "gsplat==${GSPLAT_VERSION}"
 
 RUN sed -i \
         -e 's/SiftExtraction\.use_gpu/FeatureExtraction.use_gpu/g' \
