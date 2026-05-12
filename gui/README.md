@@ -46,6 +46,65 @@ create one (**+ New project**):
 Per-project state (presets, last-used params, dataparser metadata) persists
 to `~/.config/docker_splat_v2_gui/projects.json`.
 
+## Lineage & manifests
+
+Process and Train runs write into the ULID-keyed warehouse at
+`~/docker-stacks/docker_splat_v2/data_v2/` (bind-mounted into the container
+at `/warehouse/`). Each run carries a `manifest.json` declaring its
+upstream parent run, so a `.ckpt` traces back to its source video through
+three file reads with no tooling required:
+
+```
+data_v2/sources/<source_ULID>/manifest.json     # stage=source, parent=null
+data_v2/processed/<process_ULID>/manifest.json  # stage=process, parent.run_id=<source_ULID>
+data_v2/trained/<train_ULID>/manifest.json      # stage=train,   parent.run_id=<process_ULID>
+```
+
+The schema (Pydantic v2 + JSON Schema Draft 2020-12, frozen at v1.0) lives
+in [`app/manifest.py`](app/manifest.py) and the generated artifact at
+[`app/manifest_schema.json`](app/manifest_schema.json). The side-effect
+layer that mints ULIDs, computes checksums, copies sources, scrapes
+metrics, and writes manifests is in [`app/warehouse.py`](app/warehouse.py).
+
+### Why training also writes a `pending.json` sidecar
+
+`ns-train` typically launches with `--viewer.quit-on-train-completion False`
+so the viser viewer stays open after the last iteration. That keeps the
+process pinned alive past the actual end of training, which means a
+"manifest written on process exit" contract would never fire until the
+user closes the viewer. Even worse: if the GUI dies in that window, the
+successful run becomes an orphan on disk with no lineage breadcrumb.
+
+The Train tab works around both problems:
+
+1. **Write-ahead-log sidecar.** Before `ns-train` launches, the tab writes
+   `data_v2/trained/<ULID>/pending.json` capturing the declared parent
+   run, command, form params, and start time. The sidecar survives GUI
+   death.
+2. **`🎉 Training Finished 🎉` banner detection.** The tab watches
+   `ns-train`'s stdout for nerfstudio's completion banner and finalizes
+   the `TrainManifest` immediately when it appears — independent of
+   process exit. The pending sidecar is then deleted, preserving the
+   "`manifest.json` present = success" invariant.
+3. **Process-exit fallback.** If the banner isn't detected (older
+   nerfstudio, edited stdout, etc.) but the process eventually exits 0,
+   the manifest is written from the exit path as a fallback.
+
+### Recovering an orphan run
+
+If you ever find `data_v2/trained/<ULID>/pending.json` with no
+`manifest.json` (e.g. you killed the GUI while training was still alive),
+reconstruct the manifest from `config.yml` + the pending sidecar:
+
+```bash
+./.venv/bin/python -m app.warehouse backfill-train ../data_v2/trained/<ULID>
+```
+
+The CLI writes a `manifest.json` with `provenance: "backfilled"` and
+removes the pending sidecar. It works even without a pending sidecar
+(falls back to scraping `config.yml` alone) and refuses to overwrite an
+existing `manifest.json`.
+
 ## Safety guarantees
 
 The Docker wrapper in `app/docker_service.py` exposes a narrow allow-list of

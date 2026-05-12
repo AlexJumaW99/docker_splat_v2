@@ -139,7 +139,8 @@ Expected: one line showing the image with size around **26 GB**. The size is lar
 ### Create the persistent container (once)
 
 ```bash
-mkdir -p ~/docker-stacks/docker_splat_v2/data
+mkdir -p ~/docker-stacks/docker_splat_v2/data \
+         ~/docker-stacks/docker_splat_v2/data_v2
 
 docker create \
   --name splat-ns-v2 \
@@ -150,6 +151,7 @@ docker create \
   --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -v ~/docker-stacks/docker_splat_v2/data:/workspace \
+  -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \
   -p 7007:7007 \
   -p 6006:6006 \
   -it \
@@ -166,7 +168,8 @@ docker create \
 | `--ulimit memlock=-1 --ulimit stack=67108864` | Required by NGC PyTorch for proper memory management |
 | `--shm-size=16g` | Shared memory size for large tensors |
 | `-e PYTORCH_ALLOC_CONF=expandable_segments:True` | Memory allocator config; reduces fragmentation on long training runs |
-| `-v ~/docker-stacks/docker_splat_v2/data:/workspace` | Bind mount — data persists on host outside the container |
+| `-v ~/docker-stacks/docker_splat_v2/data:/workspace` | Legacy artifact tree — still used by raw CLI workflows in this guide |
+| `-v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse` | Manifest-driven, ULID-keyed warehouse — where the GUI writes new sources, processed datasets, and training runs (see [Desktop GUI: lineage & manifests](#lineage--manifests)) |
 | `-p 7007:7007` | Viser web viewer port |
 | `-p 6006:6006` | TensorBoard web UI port |
 | `-it` | Interactive TTY |
@@ -244,6 +247,58 @@ A project bundles a dataset with its processing/training runs. **+ New project**
   Imported projects skip the Process tab and land straight on Train. This is the right flow for Tanks & Temples, MipNeRF360, or anything else already reconstructed with COLMAP.
 
 State persists to `~/.config/docker_splat_v2_gui/projects.json`. Delete that directory to reset.
+
+### Lineage & manifests
+
+Anything you produce through the GUI's Process or Train tab lands in
+`~/docker-stacks/docker_splat_v2/data_v2/` (the warehouse), bind-mounted into
+the container at `/warehouse/`. Every run is its own ULID-keyed directory
+with a `manifest.json` declaring how it was produced and which upstream
+run it descends from:
+
+```
+data_v2/
+├── sources/<source_ULID>/        # original video or image folder
+│   └── manifest.json             # SourceManifest, parent = null (root)
+├── processed/<process_ULID>/     # ns-process-data output
+│   └── manifest.json             # ProcessManifest, parent.run_id = <source_ULID>
+└── trained/<train_ULID>/         # ns-train output (nested per nerfstudio)
+    ├── <project>/<method>/<timestamp>/    # config.yml, ckpts, tfevents
+    └── manifest.json             # TrainManifest, parent.run_id = <process_ULID>
+```
+
+Lineage is **declared**, not inferred — to trace a `.ckpt` back to its
+source video, read `manifest.json` for the train run, follow
+`parent.run_id` into `data_v2/processed/`, then follow that manifest's
+`parent.run_id` into `data_v2/sources/`. Three file reads, no tooling
+required. The full JSON Schema for all five manifest stages is at
+[`gui/app/manifest_schema.json`](gui/app/manifest_schema.json) (Draft
+2020-12, frozen at v1.0).
+
+**Incomplete runs are first-class.** When the Train tab starts a run it
+writes a `pending.json` sidecar *before* `ns-train` launches. If the GUI
+is closed, the project switched, or the run is cancelled before
+completion, the sidecar stays on disk as a breadcrumb. The Train tab also
+watches `ns-train`'s stdout for the `🎉 Training Finished 🎉` banner so it
+can finalize the manifest *the moment training ends*, not when the viewer
+process eventually exits — important because the default
+`--viewer.quit-on-train-completion False` keeps `ns-train` pinned alive
+after the last iteration.
+
+**Recovering an orphan run.** If you ever find a `data_v2/trained/<ULID>/`
+directory with `pending.json` but no `manifest.json` (e.g. you killed the
+GUI while training was still alive), reconstruct the manifest from the
+on-disk `config.yml` and pending sidecar:
+
+```bash
+cd gui
+.venv/bin/python -m app.warehouse backfill-train ../data_v2/trained/<ULID>
+```
+
+The CLI writes a `manifest.json` with `provenance: "backfilled"` and
+removes the pending sidecar. The lineage chain closes; the run becomes
+indistinguishable from a live-finalized one for any downstream consumer
+walking the warehouse.
 
 ---
 
@@ -490,7 +545,7 @@ Swap the first positional argument of `ns-train` to pick one (e.g. `ns-train spl
 
 ### Final output location
 
-When training completes, your model lands at:
+When training completes from the **raw CLI** with `--output-dir /workspace/outputs`, your model lands at:
 
 ```
 /workspace/outputs/<dataset_name>/splatfacto/<YYYY-MM-DD_HHMMSS>/
@@ -501,6 +556,19 @@ When training completes, your model lands at:
 ```
 
 Note the timestamp directory — you'll reference it for viewing and exporting.
+
+When training is started from the **GUI Train tab**, output goes under the warehouse instead:
+
+```
+/warehouse/trained/<train_ULID>/
+├── manifest.json                        # TrainManifest, parent.run_id → ProcessManifest
+└── <project>/<method>/<YYYY-MM-DD_HHMMSS>/
+    ├── config.yml
+    ├── events.out.tfevents.*
+    └── nerfstudio_models/step-NNNNNNNNN.ckpt
+```
+
+Both layouts are functional — `ns-viewer` and `ns-export` only need the path to `config.yml`. See [Lineage & manifests](#lineage--manifests) for why the GUI nests an extra ULID level.
 
 ---
 

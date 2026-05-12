@@ -2,6 +2,7 @@
 # Data, datasets, and training outputs — never commit these
 # ============================================================
 data/
+data_v2/
 outputs/
 processed/
 *.mp4
@@ -63,6 +64,7 @@ env/
 # ============================================================
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~

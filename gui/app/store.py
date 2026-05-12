@@ -23,7 +23,7 @@ from typing import Literal
 from PySide6.QtCore import QObject, Signal
 from pydantic import BaseModel, Field
 
-from app.config import DATA_DIR, PROJECTS_FILE
+from app.config import DATA_DIR, PROJECTS_FILE, WAREHOUSE_DIR
 from app.paths import unique_path
 
 
@@ -216,6 +216,11 @@ class Project(BaseModel):
     presets_train: dict[str, dict] = Field(default_factory=dict)
     last_process_params: dict | None = None
     last_train_params: dict | None = None
+    # ULID of the most recent successful TrainManifest under
+    # data_v2/trained/<ULID>/. Set by the Train tab on a 0-exit run, alongside
+    # the manifest write. Lets the Exports tab (once wired) jump straight to
+    # the run dir without filesystem-walking data_v2/trained/.
+    last_train_run_id: str | None = None
 
 
 class _Root(BaseModel):
@@ -647,13 +652,18 @@ class ProjectStore(QObject):
 
         Old processed folders are not deleted; downstream artifacts (training
         runs in outputs/, rendered videos in renders/) keep the literal path
-        baked into their config.yml so they remain functional in isolation."""
-        try:
-            processed_dir.resolve().relative_to(DATA_DIR.resolve())
-        except ValueError:
+        baked into their config.yml so they remain functional in isolation.
+
+        Accepts paths under either DATA_DIR (legacy `data/`, bind-mounted at
+        /workspace) or WAREHOUSE_DIR (`data_v2/`, bind-mounted at /warehouse).
+        New runs from the manifest-aware Process tab land in WAREHOUSE_DIR;
+        legacy projects continue to point into DATA_DIR until rebuilt."""
+        resolved = processed_dir.resolve()
+        roots = (DATA_DIR.resolve(), WAREHOUSE_DIR.resolve())
+        if not any(resolved.is_relative_to(root) for root in roots):
             raise ValueError(
-                f"Processed folder must live inside {DATA_DIR}."
-            ) from None
+                f"Processed folder must live inside {DATA_DIR} or {WAREHOUSE_DIR}."
+            )
         p = self.get(project_id)
         if p is None:
             return
@@ -673,6 +683,16 @@ class ProjectStore(QObject):
         if p is None:
             return
         p.last_train_params = params
+        self._save()
+
+    def update_last_train_run_id(self, project_id: str, run_id: str) -> None:
+        """Record the ULID of the most recent successful training run.
+        Called by the Train tab's success handler right after the
+        TrainManifest is persisted. See Project.last_train_run_id."""
+        p = self.get(project_id)
+        if p is None:
+            return
+        p.last_train_run_id = run_id
         self._save()
 
     def save_preset(self, project_id: str, kind: str, name: str, params: dict) -> None:

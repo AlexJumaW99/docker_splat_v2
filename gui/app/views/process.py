@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import shlex
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
@@ -16,10 +17,13 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
-from app.config import CONTAINER_NAME, DATA_DIR, VIZER_CONTAINER, VIZER_VIEWER_PORT
+from app import warehouse as wh
+from app.config import (
+    CONTAINER_NAME, DATA_DIR, VIZER_CONTAINER, VIZER_VIEWER_PORT, WAREHOUSE_DIR,
+)
 from app.ffprobe import VideoInfo, probe
 from app.jobs import JobManager, JobSpec
-from app.paths import unique_path
+from app.manifest import ProcessParams, SourceManifest
 from app.store import (
     ALLOWED_IMAGE_EXTS, INPUT_IMAGES_DIR, Project, ProjectStore,
     convert_heic_images, count_heic_images, count_images, source_kind,
@@ -398,11 +402,19 @@ class _Form(QWidget):
         assert kind in ("video", "images"), f"_Form built for kind={kind}"
         self._mode = kind
         # Output folder the next "Run processing" click will write into.
-        # Computed at run time via unique_path (so concurrent re-runs auto-
-        # suffix _2/_3 and never clobber a previous dataset). Stashed here
-        # between _on_run and _on_job_finished so the success handler knows
-        # which folder to repoint the project at — see _on_job_finished.
+        # Now a ULID-keyed dir under WAREHOUSE_DIR. Stashed between _on_run
+        # and _on_job_finished so the success handler knows which folder
+        # to repoint the project at and where to write manifest.json.
         self._pending_target: Path | None = None
+        # Run-scoped state captured at _on_run time and consumed by the
+        # success branch of _on_job_finished to build the ProcessManifest.
+        # All None outside of an active run.
+        self._pending_source_id: str | None = None
+        self._pending_run_id: str | None = None
+        self._pending_params: ProcessParams | None = None
+        self._pending_command: str | None = None
+        self._pending_start_time: datetime | None = None
+        self._pending_display_name: str | None = None
         self._running_mine = False
         # Async ffprobe is video-only; the images flow does a synchronous
         # iterdir() in _refresh_source_meta() and doesn't need a worker.
@@ -904,20 +916,23 @@ class _Form(QWidget):
 
     # ---- next-run target preview ----
     def _refresh_next_target(self) -> None:
-        """Recompute the next-run target and update the caption.
+        """Update the caption that previews where the next Run will land.
 
-        Called after a job finishes (the previous target is now occupied,
-        so the next click of Run will see a fresh suffix) and when the
-        project is loaded. Cheap — just a few stat() calls."""
-        target = unique_path(DATA_DIR / "processed", f"{self._project.id}_splat")
-        if str(target) != self._project.processed_dir:
-            existing = Path(self._project.processed_dir).name
+        Output dirs are now ULID-keyed under WAREHOUSE_DIR/processed/, so
+        we can't show a literal next target (ULIDs are minted at click
+        time). The caption tells the user the policy and, when applicable,
+        which prior dataset the project is currently pointing at."""
+        current = self._project.processed_dir
+        if current:
+            existing = Path(current).name
             self.next_target_lbl.setText(
-                f"Next run will write to: {target.name}  "
-                f"(auto-suffixed — '{existing}' is the current dataset)."
+                f"Next run will write to {WAREHOUSE_DIR.name}/processed/<new ULID>/  "
+                f"(current dataset: '{existing}')."
             )
         else:
-            self.next_target_lbl.setText("Next run will write here.")
+            self.next_target_lbl.setText(
+                f"Next run will write to {WAREHOUSE_DIR.name}/processed/<new ULID>/."
+            )
 
     # ---- actions ----
     def _actions_card(self) -> QFrame:
@@ -1292,7 +1307,7 @@ class _Form(QWidget):
 
     def _on_run(self) -> None:
         # Disable the Run button SYNCHRONOUSLY so a quick double-click can't
-        # produce two unique_path lookups that race for the same _N suffix.
+        # mint two process ULIDs and start two redundant jobs in parallel.
         # The job-start path keeps the button disabled via _on_job_started;
         # any early-return path below uses the `started` flag + finally
         # clause to restore the idle state.
@@ -1347,18 +1362,75 @@ class _Form(QWidget):
             params = self._collect_params()
             self._store.update_last_process_params(self._project.id, params)
 
-            # Fresh output folder on every run — auto-suffix _2/_3/… on
-            # collision so prior datasets are never overwritten. The project
-            # is repointed at this folder only after the job SUCCEEDS (see
-            # _on_job_finished); a failed run leaves processed_dir pointing
-            # at the most recent successful output, so Train keeps working.
-            target = unique_path(DATA_DIR / "processed", f"{self._project.id}_splat")
+            # Register the source under data_v2/sources/<ULID>/. Idempotent
+            # by SHA256 of file (video) or by sorted (relpath, size) listing
+            # (image folder) — re-running on the same source returns the
+            # existing SourceManifest without copying. Slow on first call
+            # for multi-GB videos (full copy + checksum); the status pill
+            # makes the wait visible.
+            set_pill(self.status_pill, "Registering source…", "warning")
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+            try:
+                if self._mode == "video":
+                    src_manifest = wh.register_source_video(
+                        source,
+                        display_name=self._project.name or source.name,
+                        video_info=probe(source),
+                    )
+                else:
+                    n_imgs, exts = count_images(source)
+                    n_heic = count_heic_images(source)
+                    src_manifest = wh.register_source_image_folder(
+                        source,
+                        display_name=self._project.name or source.name,
+                        image_count=n_imgs,
+                        extensions=sorted(exts),
+                        heic_originals_count=n_heic or None,
+                    )
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Source registration failed",
+                    f"Couldn't register source under {WAREHOUSE_DIR}:\n{e}",
+                )
+                # We pushed "Registering source…" before the call; revert
+                # so the pill doesn't get stuck pretending we're still working.
+                set_pill(self.status_pill, "Ready", "neutral")
+                return
+
+            # Resolve the source's host path (the copy under
+            # data_v2/sources/<ULID>/) and its container-side counterpart
+            # under /warehouse. ns-process-data --data points at the copy,
+            # not the user-picked original.
+            src_rel = src_manifest.outputs.get("file") or src_manifest.outputs.get("directory")
+            if src_rel is None:
+                QMessageBox.warning(
+                    self, "Source manifest invalid",
+                    "Registered source manifest has no outputs.file or outputs.directory.",
+                )
+                return
+            source_canonical = WAREHOUSE_DIR / src_rel
+
+            # Mint a process ULID and reserve its output directory under
+            # data_v2/processed/<ULID>/. ns-process-data creates the dir
+            # itself when --output-dir doesn't exist; we just need the
+            # parent (data_v2/processed/) to be present.
+            proc_run_id = wh.mint_ulid()
+            target = wh.run_dir("process", proc_run_id)
+            # Pre-create the run dir as the host user. The container runs
+            # as root and writes files INTO this dir; those files will be
+            # root-owned, but the directory itself stays user-owned, so
+            # the host-side manifest write in _on_job_finished succeeds.
+            # Without this we'd hit EACCES on manifest.json.tmp because
+            # the container's mkdir would land first and create the dir
+            # root-owned (755).
+            target.mkdir(parents=True, exist_ok=True)
 
             try:
-                c_source = _host_to_container(source)
-                c_out = _host_to_container(target)
+                c_source = wh.host_to_container_warehouse(source_canonical)
+                c_out = wh.host_to_container_warehouse(target)
             except ValueError as e:
-                QMessageBox.warning(self, "Path outside data/", str(e))
+                QMessageBox.warning(self, "Path translation failed", str(e))
                 return
 
             try:
@@ -1379,6 +1451,19 @@ class _Form(QWidget):
                 kill_pattern="ns-process-data",
             )
             self._pending_target = target
+            self._pending_source_id = src_manifest.run_id
+            self._pending_run_id = proc_run_id
+            try:
+                self._pending_params = wh.process_params_from_form(params, self._mode)
+            except Exception as e:
+                # process_params_from_form validates literal-typed fields;
+                # if the form somehow holds a bad camera_type / matcher,
+                # we'd rather not run at all than write a malformed manifest.
+                QMessageBox.warning(self, "Bad parameter", str(e))
+                return
+            self._pending_command = display
+            self._pending_start_time = datetime.now(timezone.utc)
+            self._pending_display_name = self._project.name or source.name
             self.ready_to_train.hide()
             self.splinter_warn.hide()
             self.output_lbl.setText(str(target))
@@ -1421,46 +1506,79 @@ class _Form(QWidget):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         if code == 0:
-            # The job wrote into _pending_target (the unique folder we
-            # picked at click-time). Repoint the project at it now so
-            # Train, Exports, and the splinter probe all read from the
-            # newly-finished dataset. Old processed folders stay on disk
-            # and old training runs that bake their config.yml against
-            # them remain functional.
+            # The job wrote into _pending_target (data_v2/processed/<ULID>/).
+            # Two things happen on success:
+            #   1. Write manifest.json into the target — the canonical
+            #      "this run succeeded" signal for any external consumer
+            #      walking the warehouse. Atomic via .tmp + rename, so a
+            #      crash during step 2 leaves the manifest valid.
+            #   2. Repoint the project at the new target so the Train tab
+            #      keeps working off projects.json today (we'll migrate it
+            #      to the warehouse contract in a later turn).
             target = self._pending_target
-            if target is not None:
+            if (
+                target is not None
+                and self._pending_source_id is not None
+                and self._pending_run_id is not None
+                and self._pending_params is not None
+                and self._pending_start_time is not None
+            ):
+                duration = (
+                    datetime.now(timezone.utc) - self._pending_start_time
+                ).total_seconds()
+                try:
+                    wh.write_process_manifest(
+                        output_dir=target,
+                        run_id=self._pending_run_id,
+                        parent_source_id=self._pending_source_id,
+                        display_name=self._pending_display_name or target.name,
+                        params=self._pending_params,
+                        command=self._pending_command or "",
+                        duration_seconds=duration,
+                        start_time=self._pending_start_time,
+                    )
+                except Exception as e:
+                    # Manifest write failed — surface to the user but don't
+                    # treat the run itself as failed. The on-disk dataset
+                    # is intact; only the lineage record is missing, and
+                    # a future scan_catalog pass can backfill it.
+                    QMessageBox.warning(
+                        self, "Manifest write failed",
+                        f"ns-process-data succeeded but the manifest "
+                        f"couldn't be written:\n{e}\n\nDataset is still "
+                        f"usable; lineage will need to be backfilled.",
+                    )
                 try:
                     self._store.update_processed_dir(self._project.id, target)
                 except ValueError:
-                    # update_processed_dir validates "under DATA_DIR" — we
-                    # already checked that in _on_run, so a failure here
-                    # means the user moved DATA_DIR mid-run. Don't crash
-                    # the GUI; the user will see the old path on output_lbl
-                    # and a successful run pill, which is honest enough.
+                    # update_processed_dir validates the path is under
+                    # one of the known data roots. If it raises here the
+                    # warehouse root isn't registered with the store yet;
+                    # the manifest still landed correctly, so it's safe
+                    # to no-op and let projects.json catch up later.
                     pass
                 else:
                     # Refresh derived UI: output_lbl already showed `target`
                     # since _on_run, but read it back from the project record
                     # in case the store normalized the path.
                     self.output_lbl.setText(self._project.processed_dir)
-            self._pending_target = None
+            self._clear_pending_state()
             set_pill(self.status_pill, "Done", "success")
             self.ready_to_train.show()
             self._check_sparse_splinter()
             # The just-completed target is now on disk; the next Run will
-            # therefore auto-suffix one slot further.
+            # mint a fresh ULID anyway, but the caption shows the policy.
             self._refresh_next_target()
         else:
             # A non-zero exit means the run failed — do NOT repoint the
-            # project. The orphaned partial folder at _pending_target
-            # stays on disk (user can clean up manually).
-            self._pending_target = None
+            # project and do NOT write a manifest (no manifest = canonical
+            # "failed/incomplete" marker). The orphaned partial folder at
+            # _pending_target stays on disk for inspection / manual cleanup.
+            self._clear_pending_state()
             set_pill(self.status_pill, f"Failed · exit {code}", "error")
             # Restore output_lbl to the project's still-active processed_dir
             # so the user isn't misled into thinking the failed run succeeded.
             self.output_lbl.setText(self._project.processed_dir)
-            # The orphaned partial target now exists on disk, so the next
-            # Run will skip past it as well as past any prior datasets.
             self._refresh_next_target()
 
     def _on_job_cancelled(self) -> None:
@@ -1468,13 +1586,13 @@ class _Form(QWidget):
             self._reset_idle()
             return
         self._running_mine = False
-        self._pending_target = None
+        self._clear_pending_state()
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Cancelled", "error")
         self.output_lbl.setText(self._project.processed_dir)
         # A cancelled job may have left a partial folder at _pending_target;
-        # recomputing here handles that without needing to track it further.
+        # the absence of manifest.json marks it incomplete for any consumer.
         self._refresh_next_target()
 
     def _on_job_failed(self, msg: str) -> None:
@@ -1482,12 +1600,24 @@ class _Form(QWidget):
             self._reset_idle()
             return
         self._running_mine = False
-        self._pending_target = None
+        self._clear_pending_state()
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Failed to start", "error")
         self.output_lbl.setText(self._project.processed_dir)
         self._refresh_next_target()
+
+    def _clear_pending_state(self) -> None:
+        """Drop all per-run state stashed by _on_run. Called from every
+        terminal job-signal handler (finished/cancelled/failed) so we
+        never carry stale source/run IDs into the next click of Run."""
+        self._pending_target = None
+        self._pending_source_id = None
+        self._pending_run_id = None
+        self._pending_params = None
+        self._pending_command = None
+        self._pending_start_time = None
+        self._pending_display_name = None
 
     def _reset_idle(self) -> None:
         """Another kind's job just ended — restore our idle UI."""

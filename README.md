@@ -81,12 +81,14 @@ Build takes **25–40 minutes** on first run (COLMAP compile is the bottleneck, 
 ### 2. Create and start the persistent container
 
 ```bash
-mkdir -p ~/docker-stacks/docker_splat_v2/data
+mkdir -p ~/docker-stacks/docker_splat_v2/data \
+         ~/docker-stacks/docker_splat_v2/data_v2
 
 docker create --name splat-ns-v2 --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -v ~/docker-stacks/docker_splat_v2/data:/workspace \
+  -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \
   -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2
 
 docker start splat-ns-v2
@@ -94,6 +96,8 @@ docker exec -it splat-ns-v2 bash
 ```
 
 **Two ports mapped:** `7007` for the viser 3D viewer, `6006` for TensorBoard metrics. Both are optional but recommended for full visibility during training.
+
+**Two bind mounts:** `data/` is the legacy artifact tree (still used by raw CLI workflows); `data_v2/` is the new ULID-keyed, manifest-driven warehouse where the GUI writes new sources, processed datasets, and training runs. `make up` and `docker compose up -d` set both up automatically.
 
 ### 3. Process a video → train → view
 
@@ -226,6 +230,10 @@ All seven are baked into the Dockerfile and the documented `docker create` comma
 Commit history (`git log --oneline`, most recent first):
 
 ```
+Migrate GUI Process + Train tabs to a manifest-driven ULID warehouse under data_v2/: SourceManifest → ProcessManifest → TrainManifest chain with declared parent.run_id at every hop, frozen v1.0 JSON Schema artifact, pending.json write-ahead-log sidecar so a closed GUI never strands a successful run, "🎉 Training Finished" stdout banner detection so manifests finalize when training ends (not when the viewer process exits), and a `python -m app.warehouse backfill-train` CLI that reconstructs manifests for orphan runs from config.yml + the pending sidecar
+Upgrade gsplat 1.4.0 -> 1.5.3 to unlock 2DGS, fused-SSIM, 3DGUT, Fisheye-GS
+Add scan_catalog.py: rebuild catalog.db index over data/ tree
+Add vizer live point-cloud viewer button to Process tab + project management enhancements
 Add HEIC/HEIF auto-conversion to JPEG in the Process tab GUI (pillow-heif, quality 100, EXIF preserved)
 Add Viewers tab with ns-viewer launch, TensorBoard start/stop, and live port status (GUI)
 Document network-detachment recovery + add make heal-net

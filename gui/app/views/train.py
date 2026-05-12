@@ -8,8 +8,10 @@ concurrent process/train run can't cross-wire UI state.
 """
 from __future__ import annotations
 
+import re
 import shlex
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -20,7 +22,8 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
-from app.config import CONTAINER_NAME, DATA_DIR, VISER_PORT
+from app import warehouse as wh
+from app.config import CONTAINER_NAME, VISER_PORT, WAREHOUSE_DIR
 from app.jobs import JobManager, JobSpec
 from app.store import Project, ProjectStore, source_kind
 from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
@@ -118,8 +121,6 @@ def _hb(key: str) -> HelpBadge:
 
 # ---------- constants ----------
 
-OUTPUTS_DIR = DATA_DIR / "outputs"
-
 METHODS = [
     "splatfacto", "splatfacto-big", "splatfacto-mcmc",
     "splatfacto-w", "splatfacto-w-light",
@@ -127,12 +128,17 @@ METHODS = [
 VIS_MODES = ["viewer+tensorboard", "viewer", "tensorboard"]
 
 
-# ---------- helpers ----------
+# nerfstudio prints a rich Panel with "🎉 Training Finished 🎉" in the title
+# when ns-train completes its final iteration. When the user runs with
+# --viewer.quit-on-train-completion False (our default), the process stays
+# alive past this banner to keep the viser viewer up. We watch stdout for
+# this marker so the manifest can be finalized at the *real* end-of-training
+# event, not at process exit. Match on the bare text (no emoji) so we're
+# robust against ANSI/encoding surprises.
+_TRAINING_DONE_RE = re.compile(r"\bTraining Finished\b")
 
-def _host_to_container(host_path: str | Path) -> str:
-    p = Path(host_path).resolve()
-    rel = p.relative_to(DATA_DIR.resolve())
-    return f"/workspace/{rel.as_posix()}"
+
+# ---------- helpers ----------
 
 
 def _colmap_rel(project: Project) -> str:
@@ -286,6 +292,29 @@ class _Form(QWidget):
         self._jobs = jobs
         self._project = project
         self._running_mine = False
+
+        # Output dir reserved at _on_run time and consumed by the success
+        # branch of _on_job_finished. Holds the absolute host path of
+        # data_v2/trained/<train_ULID>/. All pending fields cleared via
+        # _clear_pending_state() at every terminal handler.
+        self._pending_target: Path | None = None
+        self._pending_run_id: str | None = None
+        self._pending_parent_process_id: str | None = None
+        self._pending_form_params: dict | None = None
+        self._pending_command: str | None = None
+        self._pending_start_time: datetime | None = None
+        self._pending_display_name: str | None = None
+        # ns-train picks its own `<YYYY-MM-DD_HHMMSS>` slug AFTER it starts,
+        # so timestamp_dir is captured at manifest-write time by scanning the
+        # output dir — not stashed here.
+
+        # Set True the moment we see nerfstudio's "Training Finished" banner
+        # in stdout. _on_job_line uses it to write the manifest BEFORE the
+        # process exits — necessary because viewer-stays-open runs never
+        # terminate until the user clicks Cancel. _on_job_finished checks
+        # this flag and skips its own manifest write so we don't double-write.
+        # Reset to False at the top of _on_run for each new attempt.
+        self._training_finalized = False
 
         # Poll for viser readiness (port 7007) once training has started.
         self._viser_poll = QTimer(self)
@@ -493,8 +522,9 @@ class _Form(QWidget):
         self.output_lbl.setProperty("role", "readout")
         v.addWidget(self.output_lbl)
         hint = QLabel(
-            "Host path. ns-train appends /<method>/<timestamp>/ automatically "
-            "so every launch gets its own run folder."
+            f"Each Run training writes to {WAREHOUSE_DIR.name}/trained/<new ULID>/. "
+            "ns-train nests its own <experiment>/<method>/<timestamp>/ subfolder "
+            "underneath; the ULID dir holds the manifest plus that nested run."
         )
         hint.setProperty("role", "caption")
         hint.setWordWrap(True)
@@ -561,7 +591,9 @@ class _Form(QWidget):
         self.dataset_path.setText(p.processed_dir)
         self.dataset_meta.setText(_dataset_meta_text(p))
 
-        self.output_lbl.setText(str(OUTPUTS_DIR / p.id))
+        # Output path isn't knowable until _on_run mints a ULID. Show the
+        # policy here so the user sees where the next run will land.
+        self._refresh_next_target()
 
         params = p.last_train_params or {}
         method = params.get("method", "splatfacto")
@@ -634,125 +666,220 @@ class _Form(QWidget):
         }
 
     def _on_run(self) -> None:
-        if self._jobs.is_running():
-            QMessageBox.information(
-                self, "Busy",
-                "Another job is already running. Cancel it first.",
-            )
-            return
-
-        state = dock.container_state(CONTAINER_NAME)
-        if state.status != "running":
-            QMessageBox.warning(
-                self, "Container not running",
-                f"The {CONTAINER_NAME} container isn't running. "
-                "Start it from the Dashboard, then try again.",
-            )
-            return
-
-        if not _is_trainable(self._project):
-            marker = _marker_file(self._project)
-            QMessageBox.warning(
-                self, "Missing dataset",
-                f"Expected file not found:\n{marker}\n\n"
-                "Restore the dataset folder, or (for video- or images-sourced "
-                "projects) re-run Process.",
-            )
-            # Imported projects have no source to re-process — only offer
-            # the jump-to-Process shortcut for video / images projects.
-            if source_kind(self._project) != "imported":
-                self.request_process.emit()
-            return
-
-        params = self._collect_params()
-
-        # If the viewer was requested, make sure nothing INSIDE the container
-        # is already bound to viser's port. The host-side port is always held
-        # by docker-proxy while splat-ns is running — that's the port mapping
-        # itself and is expected. A real conflict only exists when a leftover
-        # ns-train/ns-viewer is still holding :VISER_PORT inside the container.
-        if "viewer" in params["vis"]:
-            busy = dock.container_port_in_use(VISER_PORT)
-            if busy is True:
-                resp = QMessageBox.question(
-                    self, "Viser port is busy inside the container",
-                    f"Something inside {CONTAINER_NAME} is already bound to "
-                    f":{VISER_PORT} — most likely a leftover ns-train or "
-                    "ns-viewer from a previous run.\n\n"
-                    "Terminate it (SIGTERM → SIGKILL) and continue?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes,
-                )
-                if resp != QMessageBox.Yes:
-                    return
-                if not dock.free_container_port(VISER_PORT):
-                    QMessageBox.warning(
-                        self, "Couldn't free port",
-                        f"Port {VISER_PORT} inside {CONTAINER_NAME} is still "
-                        "busy after SIGKILL. Inspect with:\n\n"
-                        f"  docker exec {CONTAINER_NAME} ps -ef\n\n"
-                        "and stop the offender manually.",
-                    )
-                    return
-
-        self._store.update_last_train_params(self._project.id, params)
-
+        # Disable the Run button SYNCHRONOUSLY so a quick double-click can't
+        # mint two train ULIDs and start two redundant jobs in parallel.
+        # The job-start path keeps it disabled via _on_job_started; any
+        # early-return below uses the `started` flag + finally clause to
+        # restore the idle state.
+        self.run_btn.setEnabled(False)
+        # Fresh attempt: clear any "training finished" flag leftover from a
+        # previous run that already finalized. (The flag intentionally
+        # survives _clear_pending_state so the banner-detection path and the
+        # process-exit path can both consult it.)
+        self._training_finalized = False
+        started = False
         try:
-            c_data = _host_to_container(self._project.processed_dir)
-            c_out = _host_to_container(OUTPUTS_DIR)
-        except ValueError as e:
-            QMessageBox.warning(self, "Path outside data/", str(e))
-            return
-
-        argv = [
-            "ns-train", params["method"],
-            "--experiment-name", self._project.id,
-            "--data", c_data,
-            "--output-dir", c_out,
-            "--max-num-iterations", str(params["max_num_iterations"]),
-            "--steps-per-save", str(params["steps_per_save"]),
-            "--vis", params["vis"],
-        ]
-        if "viewer" in params["vis"]:
-            argv.extend([
-                "--viewer.websocket-host", "0.0.0.0",
-                "--viewer.quit-on-train-completion",
-                "True" if params["quit_on_train_completion"] else "False",
-            ])
-        if params["extra_flags"]:
-            try:
-                extras = shlex.split(params["extra_flags"])
-            except ValueError as e:
-                QMessageBox.warning(self, "Bad extra flags", str(e))
+            if self._jobs.is_running():
+                QMessageBox.information(
+                    self, "Busy",
+                    "Another job is already running. Cancel it first.",
+                )
                 return
-            argv.extend(extras)
 
-        # Dataparser subcommand goes last — tyro binds every subsequent flag
-        # to the dataparser, so method/pipeline flags have to precede it. The
-        # default (nerfstudio-data) is implicit when omitted, so we only emit
-        # non-default names to keep the generated command minimal.
-        if self._project.dataparser == "colmap":
-            argv.append("colmap")
-            # Always forward the stored path rather than relying on
-            # ColmapDataParserConfig's default ("colmap/sparse/0"), which
-            # doesn't match the plain-COLMAP ("sparse/0") layout.
-            argv.extend(["--colmap-path", _colmap_rel(self._project)])
-        elif self._project.dataparser != "nerfstudio-data":
-            argv.append(self._project.dataparser)
+            state = dock.container_state(CONTAINER_NAME)
+            if state.status != "running":
+                QMessageBox.warning(
+                    self, "Container not running",
+                    f"The {CONTAINER_NAME} container isn't running. "
+                    "Start it from the Dashboard, then try again.",
+                )
+                return
 
-        display = (
-            f"docker exec {CONTAINER_NAME} "
-            + " ".join(shlex.quote(a) for a in argv)
-        )
+            if not _is_trainable(self._project):
+                marker = _marker_file(self._project)
+                QMessageBox.warning(
+                    self, "Missing dataset",
+                    f"Expected file not found:\n{marker}\n\n"
+                    "Restore the dataset folder, or (for video- or images-sourced "
+                    "projects) re-run Process.",
+                )
+                # Imported projects have no source to re-process — only offer
+                # the jump-to-Process shortcut for video / images projects.
+                if source_kind(self._project) != "imported":
+                    self.request_process.emit()
+                return
 
-        spec = JobSpec(
-            kind="train",
-            display_cmd=display,
-            container_argv=argv,
-            kill_pattern="ns-train",
-        )
-        self.viser_card.hide()
-        self._jobs.start(spec)
+            # Block legacy data/processed/*_splat/ datasets (no parent
+            # ProcessManifest = nothing to point TrainManifest.parent at,
+            # and the schema requires parent). Backfill is a separate task.
+            processed_path = Path(self._project.processed_dir).resolve()
+            try:
+                is_warehouse = processed_path.is_relative_to(WAREHOUSE_DIR.resolve())
+            except ValueError:
+                is_warehouse = False
+            if not is_warehouse:
+                QMessageBox.warning(
+                    self, "Legacy dataset — reprocess required",
+                    f"'{self._project.name}' is pointed at\n"
+                    f"{processed_path}\n\n"
+                    "which predates the warehouse and has no manifest.json. "
+                    "TrainManifest needs a declared parent ProcessManifest, "
+                    "so this dataset can't be trained until you reprocess it "
+                    "via the Process tab.",
+                )
+                if source_kind(self._project) != "imported":
+                    self.request_process.emit()
+                return
+            parent_manifest = wh.find_parent_process_manifest(processed_path)
+            if parent_manifest is None:
+                QMessageBox.warning(
+                    self, "Missing parent manifest",
+                    f"No manifest.json found at\n{processed_path}/manifest.json\n\n"
+                    "Reprocess via the Process tab so a lineage record exists.",
+                )
+                if source_kind(self._project) != "imported":
+                    self.request_process.emit()
+                return
+
+            params = self._collect_params()
+
+            # If the viewer was requested, make sure nothing INSIDE the container
+            # is already bound to viser's port. The host-side port is always held
+            # by docker-proxy while splat-ns is running — that's the port mapping
+            # itself and is expected. A real conflict only exists when a leftover
+            # ns-train/ns-viewer is still holding :VISER_PORT inside the container.
+            if "viewer" in params["vis"]:
+                busy = dock.container_port_in_use(VISER_PORT)
+                if busy is True:
+                    resp = QMessageBox.question(
+                        self, "Viser port is busy inside the container",
+                        f"Something inside {CONTAINER_NAME} is already bound to "
+                        f":{VISER_PORT} — most likely a leftover ns-train or "
+                        "ns-viewer from a previous run.\n\n"
+                        "Terminate it (SIGTERM → SIGKILL) and continue?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes,
+                    )
+                    if resp != QMessageBox.Yes:
+                        return
+                    if not dock.free_container_port(VISER_PORT):
+                        QMessageBox.warning(
+                            self, "Couldn't free port",
+                            f"Port {VISER_PORT} inside {CONTAINER_NAME} is still "
+                            "busy after SIGKILL. Inspect with:\n\n"
+                            f"  docker exec {CONTAINER_NAME} ps -ef\n\n"
+                            "and stop the offender manually.",
+                        )
+                        return
+
+            self._store.update_last_train_params(self._project.id, params)
+
+            # Mint a train ULID and reserve its output directory under
+            # data_v2/trained/<ULID>/. Pre-create as the host user so the
+            # post-run manifest.json write (host-side) doesn't EACCES against
+            # a root-owned dir created by the container.
+            train_run_id = wh.mint_ulid()
+            target = wh.run_dir("train", train_run_id)
+            target.mkdir(parents=True, exist_ok=True)
+
+            try:
+                c_data = wh.host_to_container_warehouse(processed_path)
+                c_out = wh.host_to_container_warehouse(target)
+            except ValueError as e:
+                QMessageBox.warning(self, "Path translation failed", str(e))
+                return
+
+            argv = [
+                "ns-train", params["method"],
+                "--experiment-name", self._project.id,
+                "--data", c_data,
+                "--output-dir", c_out,
+                "--max-num-iterations", str(params["max_num_iterations"]),
+                "--steps-per-save", str(params["steps_per_save"]),
+                "--vis", params["vis"],
+            ]
+            if "viewer" in params["vis"]:
+                argv.extend([
+                    "--viewer.websocket-host", "0.0.0.0",
+                    "--viewer.quit-on-train-completion",
+                    "True" if params["quit_on_train_completion"] else "False",
+                ])
+            if params["extra_flags"]:
+                try:
+                    extras = shlex.split(params["extra_flags"])
+                except ValueError as e:
+                    QMessageBox.warning(self, "Bad extra flags", str(e))
+                    return
+                argv.extend(extras)
+
+            # Dataparser subcommand goes last — tyro binds every subsequent
+            # flag to the dataparser, so method/pipeline flags have to precede
+            # it. The default (nerfstudio-data) is implicit when omitted, so
+            # we only emit non-default names to keep the generated command
+            # minimal.
+            if self._project.dataparser == "colmap":
+                argv.append("colmap")
+                # Always forward the stored path rather than relying on
+                # ColmapDataParserConfig's default ("colmap/sparse/0"), which
+                # doesn't match the plain-COLMAP ("sparse/0") layout.
+                argv.extend(["--colmap-path", _colmap_rel(self._project)])
+            elif self._project.dataparser != "nerfstudio-data":
+                argv.append(self._project.dataparser)
+
+            display = (
+                f"docker exec {CONTAINER_NAME} "
+                + " ".join(shlex.quote(a) for a in argv)
+            )
+
+            spec = JobSpec(
+                kind="train",
+                display_cmd=display,
+                container_argv=argv,
+                kill_pattern="ns-train",
+            )
+            self._pending_target = target
+            self._pending_run_id = train_run_id
+            self._pending_parent_process_id = parent_manifest.run_id
+            self._pending_form_params = params
+            self._pending_command = display
+            self._pending_start_time = datetime.now(timezone.utc)
+            self._pending_display_name = self._project.name or self._project.id
+            # Write-ahead log: persist the lineage breadcrumb to disk BEFORE
+            # starting the job. If the GUI dies between now and job-finish
+            # (a real failure mode that produced the existing orphan), the
+            # backfill helper can finalize the manifest from this sidecar
+            # plus the on-disk config.yml. Wide try/except: a sidecar write
+            # failure is non-fatal — we'd rather miss the breadcrumb than
+            # refuse to run training.
+            try:
+                wh.write_pending_train(
+                    target,
+                    run_id=train_run_id,
+                    parent_process_id=parent_manifest.run_id,
+                    started_at=self._pending_start_time,
+                    command=display,
+                    display_name=self._pending_display_name,
+                    form_params=params,
+                    dataparser=self._project.dataparser,
+                    experiment_name=self._project.id,
+                )
+            except Exception as e:
+                # Surface but don't block — print to stderr-equivalent via
+                # the job log line stream so it's at least visible in the
+                # output drawer.
+                self._jobs.line.emit(
+                    f"[warn] pending sidecar write failed: {e!r}"
+                )
+            self.viser_card.hide()
+            self.output_lbl.setText(str(target))
+            self._jobs.start(spec)
+            started = True
+        finally:
+            if not started:
+                # Any pre-start bailout: discard the pending target and let
+                # the user click Run again.
+                self._clear_pending_state()
+                self.run_btn.setEnabled(True)
 
     def _on_cancel(self) -> None:
         self._jobs.cancel()
@@ -771,9 +898,31 @@ class _Form(QWidget):
     # ---- job signals (filtered by kind) ----
     def _wire_jobs(self) -> None:
         self._jobs.started.connect(self._on_job_started)
+        self._jobs.line.connect(self._on_job_line)
         self._jobs.finished.connect(self._on_job_finished)
         self._jobs.cancelled.connect(self._on_job_cancelled)
         self._jobs.failed.connect(self._on_job_failed)
+
+    def _on_job_line(self, line: str) -> None:
+        """Watch ns-train's stdout for the 'Training Finished' banner that
+        nerfstudio prints when the last iteration completes. With
+        --viewer.quit-on-train-completion False (our default), the process
+        stays alive past this point to keep viser running, so the
+        process-exit handler will never fire unless the user clicks Cancel.
+        Detecting the banner lets us finalize the manifest at the real
+        end-of-training event instead."""
+        if self._training_finalized:
+            return
+        if not self._running_mine:
+            return
+        if _TRAINING_DONE_RE.search(line) is None:
+            return
+        wrote = self._finalize_training_run()
+        if wrote:
+            # Process is still alive (viewer kept open). Surface the new
+            # state so the user knows the lineage was recorded — clicking
+            # Cancel from here is now just dismissing the viewer.
+            set_pill(self.status_pill, "✓ Trained · viewer alive", "success")
 
     def _on_job_started(self, spec: JobSpec) -> None:
         if spec.kind != "train":
@@ -789,6 +938,74 @@ class _Form(QWidget):
         if "viewer" in self._collect_params()["vis"]:
             self._viser_poll.start()
 
+    def _finalize_training_run(self) -> bool:
+        """Persist the TrainManifest, clear the pending sidecar, and update
+        last_train_run_id. Idempotent: safe to call from both the
+        Training-Finished-banner detector AND the process-exit handler;
+        the first caller wins, the second is a no-op (see
+        `self._training_finalized`).
+
+        Returns True if the manifest was newly written, False otherwise."""
+
+        if self._training_finalized:
+            return False
+        target = self._pending_target
+        if (
+            target is None
+            or self._pending_run_id is None
+            or self._pending_parent_process_id is None
+            or self._pending_form_params is None
+            or self._pending_start_time is None
+        ):
+            return False
+
+        duration = (
+            datetime.now(timezone.utc) - self._pending_start_time
+        ).total_seconds()
+        nested = wh.find_train_run_subdir(target)
+        # `nested` is .../<train_ULID>/<exp_name>/<method>/<ts>/ — we only
+        # need the leaf name for params.timestamp_dir.
+        timestamp_dir = nested.name if nested is not None else ""
+
+        try:
+            train_params = wh.train_params_from_form(
+                self._pending_form_params,
+                experiment_name=self._project.id,
+                dataparser=self._project.dataparser,
+                timestamp_dir=timestamp_dir,
+            )
+            wh.write_train_manifest(
+                output_dir=target,
+                run_id=self._pending_run_id,
+                parent_process_id=self._pending_parent_process_id,
+                display_name=self._pending_display_name or target.name,
+                params=train_params,
+                command=self._pending_command or "",
+                duration_seconds=duration,
+                start_time=self._pending_start_time,
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Manifest write failed",
+                f"ns-train succeeded but the TrainManifest couldn't "
+                f"be written:\n{e}\n\nThe run on disk is intact; "
+                f"the pending sidecar will let a future backfill pass "
+                f"reconstruct the manifest.",
+            )
+            return False
+
+        # Manifest persisted — pending sidecar's job is done. Removing it
+        # preserves the "manifest.json present = success" invariant.
+        try:
+            wh.clear_pending_train(target)
+        except Exception:
+            pass
+        self._store.update_last_train_run_id(
+            self._project.id, self._pending_run_id
+        )
+        self._training_finalized = True
+        return True
+
     def _on_job_finished(self, code: int) -> None:
         if not self._running_mine:
             self._reset_idle()
@@ -797,9 +1014,25 @@ class _Form(QWidget):
         self._viser_poll.stop()
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        if self._training_finalized:
+            # Banner detector already wrote the manifest while the process
+            # was alive; this exit is just the viewer being closed. Don't
+            # try to re-write — the lineage record is intact.
+            self._clear_pending_state()
+            set_pill(self.status_pill, "Done", "success")
+            return
         if code == 0:
+            # ns-train exited with code 0 but we never saw the "Training
+            # Finished" banner (e.g., user cancelled cleanly, or ns-train
+            # version doesn't print that exact text). Treat as success and
+            # write the manifest if we can.
+            self._finalize_training_run()
+            self._clear_pending_state()
             set_pill(self.status_pill, "Done", "success")
         else:
+            # Non-zero exit: do NOT write a manifest. The pending sidecar
+            # remains as the canonical "attempted but unfinalized" marker.
+            self._clear_pending_state()
             set_pill(self.status_pill, f"Failed · exit {code}", "error")
 
     def _on_job_cancelled(self) -> None:
@@ -811,7 +1044,14 @@ class _Form(QWidget):
         self.viser_card.hide()
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
-        set_pill(self.status_pill, "Cancelled", "error")
+        if self._training_finalized:
+            # The banner already fired and the manifest is on disk. This
+            # cancel is just the user closing the viewer after training
+            # completed — show success, not Cancelled.
+            set_pill(self.status_pill, "Done", "success")
+        else:
+            set_pill(self.status_pill, "Cancelled", "error")
+        self._clear_pending_state()
 
     def _on_job_failed(self, msg: str) -> None:
         if not self._running_mine:
@@ -820,9 +1060,30 @@ class _Form(QWidget):
         self._running_mine = False
         self._viser_poll.stop()
         self.viser_card.hide()
+        self._clear_pending_state()
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Failed to start", "error")
+
+    def _clear_pending_state(self) -> None:
+        """Drop all per-run state stashed by _on_run. Called from every
+        terminal job-signal handler (finished/cancelled/failed) and on
+        pre-start bailout so we never carry stale IDs into the next click."""
+        self._pending_target = None
+        self._pending_run_id = None
+        self._pending_parent_process_id = None
+        self._pending_form_params = None
+        self._pending_command = None
+        self._pending_start_time = None
+        self._pending_display_name = None
+
+    def _refresh_next_target(self) -> None:
+        """Update the output readout with the warehouse policy: every Run
+        mints a fresh ULID under data_v2/trained/. Updated again to the
+        actual host path once _on_run reserves a target."""
+        self.output_lbl.setText(
+            f"{WAREHOUSE_DIR}/trained/<new ULID>/"
+        )
 
     def _reset_idle(self) -> None:
         """Called when another kind's job ends — restore our idle UI."""

@@ -1,0 +1,1309 @@
+{
+  "$defs": {
+    "ExportManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "display_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Host"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "object"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Metrics",
+          "type": "object"
+        },
+        "checksums": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Checksums",
+          "type": "object"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notes"
+        },
+        "provenance": {
+          "default": "declared",
+          "enum": [
+            "declared",
+            "backfilled"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "stage": {
+          "const": "export",
+          "default": "export",
+          "title": "Stage",
+          "type": "string"
+        },
+        "parent": {
+          "$ref": "#/$defs/Parent"
+        },
+        "params": {
+          "$ref": "#/$defs/ExportParams"
+        }
+      },
+      "required": [
+        "run_id",
+        "created_at",
+        "parent",
+        "params"
+      ],
+      "title": "ExportManifest",
+      "type": "object"
+    },
+    "ExportParams": {
+      "additionalProperties": false,
+      "description": "Arguments handed to `ns-export gaussian-splat` or the custom\n`ns-export-splatfactow` wrapper. For splatfacto-w runs, also captures\nwhich appearance embedding was baked into the per-gaussian SH.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "splat",
+            "pcd",
+            "mesh"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "exporter": {
+          "title": "Exporter",
+          "type": "string"
+        },
+        "source_checkpoint_step": {
+          "minimum": 0,
+          "title": "Source Checkpoint Step",
+          "type": "integer"
+        },
+        "appearance_embedding_strategy": {
+          "anyOf": [
+            {
+              "enum": [
+                "average_training_cameras",
+                "specific_camera",
+                "manual"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Appearance Embedding Strategy"
+        },
+        "appearance_embedding_camera_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Appearance Embedding Camera Id"
+        }
+      },
+      "required": [
+        "kind",
+        "exporter",
+        "source_checkpoint_step"
+      ],
+      "title": "ExportParams",
+      "type": "object"
+    },
+    "Host": {
+      "additionalProperties": true,
+      "description": "Reproducibility surface \u2014 captured at write time. Every field is\noptional because backfilled manifests may not have all of it, but\ndeclared (live-written) manifests should populate as much as possible.\n`extra='allow'` so callers can record extra environment without a\nschema bump.",
+      "properties": {
+        "hostname": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hostname"
+        },
+        "os": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Os"
+        },
+        "gpu": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu"
+        },
+        "cuda_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cuda Version"
+        },
+        "docker_image": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Docker Image"
+        },
+        "colmap_commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Colmap Commit"
+        },
+        "nerfstudio_commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Nerfstudio Commit"
+        },
+        "gsplat_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gsplat Version"
+        }
+      },
+      "title": "Host",
+      "type": "object"
+    },
+    "Parent": {
+      "additionalProperties": false,
+      "description": "Declared lineage pointer. The `run_id` references another manifest's\ntop-level `run_id`. Stage is denormalized for cheap joins without a\nsecond lookup.",
+      "properties": {
+        "stage": {
+          "enum": [
+            "source",
+            "process",
+            "train",
+            "export",
+            "render"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage",
+        "run_id"
+      ],
+      "title": "Parent",
+      "type": "object"
+    },
+    "ProcessManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "display_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Host"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "object"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Metrics",
+          "type": "object"
+        },
+        "checksums": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Checksums",
+          "type": "object"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notes"
+        },
+        "provenance": {
+          "default": "declared",
+          "enum": [
+            "declared",
+            "backfilled"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "stage": {
+          "const": "process",
+          "default": "process",
+          "title": "Stage",
+          "type": "string"
+        },
+        "parent": {
+          "$ref": "#/$defs/Parent"
+        },
+        "params": {
+          "$ref": "#/$defs/ProcessParams"
+        }
+      },
+      "required": [
+        "run_id",
+        "created_at",
+        "parent",
+        "params"
+      ],
+      "title": "ProcessManifest",
+      "type": "object"
+    },
+    "ProcessParams": {
+      "additionalProperties": false,
+      "description": "The arguments handed to `ns-process-data {video|images}`. Mirrors\nthe flags the Process tab exposes.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "video",
+            "images"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "matching_method": {
+          "enum": [
+            "sequential",
+            "vocab_tree",
+            "exhaustive"
+          ],
+          "title": "Matching Method",
+          "type": "string"
+        },
+        "num_frames_target": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Num Frames Target"
+        },
+        "num_downscales": {
+          "default": 3,
+          "title": "Num Downscales",
+          "type": "integer"
+        },
+        "camera_type": {
+          "default": "perspective",
+          "enum": [
+            "perspective",
+            "fisheye",
+            "equirectangular"
+          ],
+          "title": "Camera Type",
+          "type": "string"
+        },
+        "refine_intrinsics": {
+          "default": true,
+          "title": "Refine Intrinsics",
+          "type": "boolean"
+        },
+        "same_dimensions": {
+          "default": true,
+          "title": "Same Dimensions",
+          "type": "boolean"
+        },
+        "use_gpu": {
+          "default": true,
+          "title": "Use Gpu",
+          "type": "boolean"
+        },
+        "use_sfm_depth": {
+          "default": false,
+          "title": "Use Sfm Depth",
+          "type": "boolean"
+        },
+        "crop_factor": {
+          "anyOf": [
+            {
+              "maxItems": 4,
+              "minItems": 4,
+              "prefixItems": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Crop Factor"
+        },
+        "percent_radius_crop": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Percent Radius Crop"
+        },
+        "images_per_equirect": {
+          "anyOf": [
+            {
+              "enum": [
+                8,
+                14
+              ],
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Images Per Equirect"
+        },
+        "random_seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Random Seed"
+        },
+        "eval_random_seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Eval Random Seed"
+        },
+        "eval_data": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Eval Data"
+        },
+        "extra_flags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Extra Flags",
+          "type": "array"
+        }
+      },
+      "required": [
+        "mode",
+        "matching_method"
+      ],
+      "title": "ProcessParams",
+      "type": "object"
+    },
+    "RenderManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "display_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Host"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "object"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Metrics",
+          "type": "object"
+        },
+        "checksums": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Checksums",
+          "type": "object"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notes"
+        },
+        "provenance": {
+          "default": "declared",
+          "enum": [
+            "declared",
+            "backfilled"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "stage": {
+          "const": "render",
+          "default": "render",
+          "title": "Stage",
+          "type": "string"
+        },
+        "parent": {
+          "$ref": "#/$defs/Parent"
+        },
+        "params": {
+          "$ref": "#/$defs/RenderParams"
+        }
+      },
+      "required": [
+        "run_id",
+        "created_at",
+        "parent",
+        "params"
+      ],
+      "title": "RenderManifest",
+      "type": "object"
+    },
+    "RenderParams": {
+      "additionalProperties": false,
+      "description": "Arguments handed to `ns-render camera-path`. The camera path JSON\nitself lives under the processed run's `camera_paths/` dir; we record\nthe relpath so the render can be reproduced.",
+      "properties": {
+        "camera_path_filename": {
+          "title": "Camera Path Filename",
+          "type": "string"
+        },
+        "fps": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fps"
+        },
+        "resolution_width": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolution Width"
+        },
+        "resolution_height": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolution Height"
+        },
+        "frame_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Frame Count"
+        },
+        "duration_seconds": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration Seconds"
+        }
+      },
+      "required": [
+        "camera_path_filename"
+      ],
+      "title": "RenderParams",
+      "type": "object"
+    },
+    "SourceManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "display_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Host"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "object"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Metrics",
+          "type": "object"
+        },
+        "checksums": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Checksums",
+          "type": "object"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notes"
+        },
+        "provenance": {
+          "default": "declared",
+          "enum": [
+            "declared",
+            "backfilled"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "stage": {
+          "const": "source",
+          "default": "source",
+          "title": "Stage",
+          "type": "string"
+        },
+        "parent": {
+          "default": null,
+          "title": "Parent",
+          "type": "null"
+        },
+        "params": {
+          "$ref": "#/$defs/SourceParams"
+        }
+      },
+      "required": [
+        "run_id",
+        "created_at",
+        "params"
+      ],
+      "title": "SourceManifest",
+      "type": "object"
+    },
+    "SourceParams": {
+      "additionalProperties": false,
+      "description": "The original artifact a project started from. There is no upstream.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "video",
+            "image_folder",
+            "imported_dataset"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "original_filename": {
+          "title": "Original Filename",
+          "type": "string"
+        },
+        "size_bytes": {
+          "minimum": 0,
+          "title": "Size Bytes",
+          "type": "integer"
+        },
+        "duration_seconds": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration Seconds"
+        },
+        "fps": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fps"
+        },
+        "width": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Width"
+        },
+        "height": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Height"
+        },
+        "codec": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Codec"
+        },
+        "frame_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Frame Count"
+        },
+        "image_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image Count"
+        },
+        "extensions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Extensions"
+        },
+        "heic_originals_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Heic Originals Count"
+        },
+        "dataset_format": {
+          "anyOf": [
+            {
+              "enum": [
+                "colmap",
+                "nerfstudio-data",
+                "other"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dataset Format"
+        }
+      },
+      "required": [
+        "kind",
+        "original_filename",
+        "size_bytes"
+      ],
+      "title": "SourceParams",
+      "type": "object"
+    },
+    "TrainManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "display_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Host"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "object"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Metrics",
+          "type": "object"
+        },
+        "checksums": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Checksums",
+          "type": "object"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notes"
+        },
+        "provenance": {
+          "default": "declared",
+          "enum": [
+            "declared",
+            "backfilled"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "stage": {
+          "const": "train",
+          "default": "train",
+          "title": "Stage",
+          "type": "string"
+        },
+        "parent": {
+          "$ref": "#/$defs/Parent"
+        },
+        "params": {
+          "$ref": "#/$defs/TrainParams"
+        }
+      },
+      "required": [
+        "run_id",
+        "created_at",
+        "parent",
+        "params"
+      ],
+      "title": "TrainManifest",
+      "type": "object"
+    },
+    "TrainParams": {
+      "additionalProperties": false,
+      "description": "Arguments handed to `ns-train <method>`. Captures both the live\nknobs the GUI exposes and the dataparser routing.",
+      "properties": {
+        "method": {
+          "enum": [
+            "splatfacto",
+            "splatfacto-big",
+            "splatfacto-mcmc",
+            "splatfacto-w",
+            "splatfacto-w-light"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "experiment_name": {
+          "title": "Experiment Name",
+          "type": "string"
+        },
+        "timestamp_dir": {
+          "title": "Timestamp Dir",
+          "type": "string"
+        },
+        "max_num_iterations": {
+          "minimum": 1,
+          "title": "Max Num Iterations",
+          "type": "integer"
+        },
+        "steps_per_save": {
+          "minimum": 1,
+          "title": "Steps Per Save",
+          "type": "integer"
+        },
+        "vis": {
+          "enum": [
+            "viewer",
+            "tensorboard",
+            "viewer+tensorboard"
+          ],
+          "title": "Vis",
+          "type": "string"
+        },
+        "viewer_websocket_host": {
+          "default": "0.0.0.0",
+          "title": "Viewer Websocket Host",
+          "type": "string"
+        },
+        "viewer_quit_on_train_completion": {
+          "default": false,
+          "title": "Viewer Quit On Train Completion",
+          "type": "boolean"
+        },
+        "dataparser": {
+          "enum": [
+            "nerfstudio-data",
+            "colmap"
+          ],
+          "title": "Dataparser",
+          "type": "string"
+        },
+        "extra_flags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Extra Flags",
+          "type": "array"
+        }
+      },
+      "required": [
+        "method",
+        "experiment_name",
+        "timestamp_dir",
+        "max_num_iterations",
+        "steps_per_save",
+        "vis",
+        "dataparser"
+      ],
+      "title": "TrainParams",
+      "type": "object"
+    }
+  },
+  "discriminator": {
+    "mapping": {
+      "export": "#/$defs/ExportManifest",
+      "process": "#/$defs/ProcessManifest",
+      "render": "#/$defs/RenderManifest",
+      "source": "#/$defs/SourceManifest",
+      "train": "#/$defs/TrainManifest"
+    },
+    "propertyName": "stage"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/SourceManifest"
+    },
+    {
+      "$ref": "#/$defs/ProcessManifest"
+    },
+    {
+      "$ref": "#/$defs/TrainManifest"
+    },
+    {
+      "$ref": "#/$defs/ExportManifest"
+    },
+    {
+      "$ref": "#/$defs/RenderManifest"
+    }
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/AlexJumaW99/docker_splat_v2/manifest_schema/v1.0",
+  "title": "docker_splat_v2 Manifest",
+  "description": "Per-stage manifest for the docker_splat_v2 warehouse. Schema version 1.0. Every artifact directory (source, processed, train, export, render) contains one manifest.json validated against this schema."
+}

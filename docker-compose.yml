@@ -82,6 +82,12 @@ services:
       # the repo to any host path still Just Works.
       - ./data:/workspace
 
+      # --- Bind mount: ULID-keyed warehouse (manifest-driven) -----
+      # New artifact root used by the GUI's manifest-aware writers.
+      # Legacy artifacts continue to live under ./data (/workspace);
+      # everything written after the warehouse migration lands here.
+      - ./data_v2:/warehouse
+
       # --- Named volumes: runtime-generated caches ---------------
       # None of these exist in the image; they're populated on first
       # use and survive `docker compose down`. PyTorch's extension
