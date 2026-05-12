@@ -23,7 +23,14 @@ from typing import Literal
 from PySide6.QtCore import QObject, Signal
 from pydantic import BaseModel, Field
 
+from app import warehouse as wh
 from app.config import DATA_DIR, PROJECTS_FILE, WAREHOUSE_DIR
+from app.manifest import (
+    ExportManifest,
+    RenderManifest,
+    TrainManifest,
+    load_manifest,
+)
 from app.paths import unique_path
 
 
@@ -302,17 +309,30 @@ def _rm_file(path: Path) -> None:
 
 @dataclass
 class ProjectDataScan:
-    """Result of scanning the filesystem for all data tied to a project."""
+    """Result of scanning the filesystem for all data tied to a project.
+
+    Carries both legacy (`data/`) artifacts and warehouse (`data_v2/`)
+    artifacts. The fields without a `warehouse_` prefix refer to legacy
+    layout; the warehouse fields each hold one ULID directory per artifact
+    (which itself contains `manifest.json` + the payload(s))."""
     processed_dirs: list[Path] = field(default_factory=list)
     outputs_dir: Path | None = None
-    export_files: list[Path] = field(default_factory=list)
     render_dirs: list[Path] = field(default_factory=list)
+    # Warehouse-keyed artifacts whose lineage (TrainManifest.parent.run_id /
+    # ExportManifest.parent.run_id / RenderManifest.parent.run_id) descends
+    # from this project's processed ULID.
+    warehouse_train_dirs: list[Path] = field(default_factory=list)
+    warehouse_export_dirs: list[Path] = field(default_factory=list)
+    warehouse_render_dirs: list[Path] = field(default_factory=list)
     total_bytes: int = 0
 
     @property
     def has_data(self) -> bool:
-        return bool(self.processed_dirs or self.outputs_dir
-                     or self.export_files or self.render_dirs)
+        return bool(
+            self.processed_dirs or self.outputs_dir or self.render_dirs
+            or self.warehouse_train_dirs or self.warehouse_export_dirs
+            or self.warehouse_render_dirs
+        )
 
     def summary_lines(self) -> list[str]:
         lines: list[str] = []
@@ -324,23 +344,79 @@ class ProjectDataScan:
                 if self.outputs_dir.is_dir() else []
             lines.append(f"Training outputs: {self.outputs_dir.name}/"
                          + (f" ({', '.join(methods)})" if methods else ""))
-        if self.export_files:
-            lines.append(f"Exported .ply files ({len(self.export_files)}): "
-                         + ", ".join(f.name for f in self.export_files))
         if self.render_dirs:
             names = ", ".join(p.name for p in self.render_dirs)
             lines.append(f"Rendered videos ({len(self.render_dirs)}): {names}")
+        if self.warehouse_train_dirs:
+            lines.append(
+                f"Warehouse train runs ({len(self.warehouse_train_dirs)}): "
+                + ", ".join(p.name[:8] + "…" for p in self.warehouse_train_dirs)
+            )
+        if self.warehouse_export_dirs:
+            kinds: dict[str, int] = {}
+            for d in self.warehouse_export_dirs:
+                kinds[d.parent.name] = kinds.get(d.parent.name, 0) + 1
+            tally = ", ".join(f"{k}: {v}" for k, v in sorted(kinds.items()))
+            lines.append(
+                f"Warehouse exports ({len(self.warehouse_export_dirs)}): "
+                f"{tally}"
+            )
+        if self.warehouse_render_dirs:
+            lines.append(
+                f"Warehouse renders ({len(self.warehouse_render_dirs)}): "
+                + ", ".join(p.name[:8] + "…" for p in self.warehouse_render_dirs)
+            )
         if self.total_bytes:
             lines.append(f"Total size: {_fmt_size(self.total_bytes)}")
         return lines
 
 
+def _project_warehouse_train_ulids(project: Project) -> set[str]:
+    """Return the set of train ULIDs in `data_v2/trained/` whose
+    `parent.run_id` matches this project's processed ULID. Empty when the
+    project is legacy (processed_dir not under WAREHOUSE_DIR) or when no
+    warehouse train runs descend from this project yet."""
+
+    processed = Path(project.processed_dir).resolve()
+    try:
+        processed.relative_to(WAREHOUSE_DIR.resolve())
+    except ValueError:
+        return set()
+    processed_ulid = processed.name
+    if not re.fullmatch(wh.ULID_PATTERN, processed_ulid):
+        return set()
+
+    trained_root = WAREHOUSE_DIR / "trained"
+    if not trained_root.is_dir():
+        return set()
+
+    ulids: set[str] = set()
+    for sub in trained_root.iterdir():
+        mf = sub / "manifest.json"
+        if not mf.is_file():
+            continue
+        try:
+            m = load_manifest(mf)
+        except Exception:
+            continue
+        if not isinstance(m, TrainManifest):
+            continue
+        if m.parent is not None and m.parent.run_id == processed_ulid:
+            ulids.add(m.run_id)
+    return ulids
+
+
 def scan_project_data(project: Project) -> ProjectDataScan:
-    """Inventory all filesystem artifacts associated with *project*."""
+    """Inventory all filesystem artifacts associated with *project*.
+
+    Walks both the legacy `data/` tree (processed/, outputs/, renders/)
+    and the warehouse `data_v2/` tree (trained/, exports/, renders/),
+    filtering warehouse artifacts by manifest lineage so we never claim
+    another project's exports."""
     scan = ProjectDataScan()
     pid = project.id
 
-    # -- processed dirs: the stored one + any sibling _splat* variants --
+    # -- legacy processed dirs: the stored one + any sibling _splat* variants --
     processed_parent = DATA_DIR / "processed"
     seen: set[Path] = set()
     stored = Path(project.processed_dir)
@@ -354,22 +430,16 @@ def scan_project_data(project: Project) -> ProjectDataScan:
                 seen.add(d.resolve())
     scan.processed_dirs = sorted(seen)
 
-    # -- training outputs --
+    # -- legacy training outputs --
     out = DATA_DIR / "outputs" / pid
     if out.is_dir():
         scan.outputs_dir = out
 
-    # -- exported .ply files --
-    exports_dir = DATA_DIR / "exports" / "splat"
-    if exports_dir.is_dir():
-        for f in exports_dir.iterdir():
-            if not f.is_file() or f.suffix.lower() != ".ply":
-                continue
-            if f.name.startswith(f"{pid}_"):
-                scan.export_files.append(f)
-        scan.export_files.sort()
+    # Legacy `data/exports/splat/*.ply` is intentionally not scanned anymore.
+    # Per the warehouse migration: those files stay on disk but are no
+    # longer surfaced by the GUI; new exports live under data_v2/exports/.
 
-    # -- render dirs (keyed by processed_dir basename) --
+    # -- legacy render dirs (keyed by processed_dir basename) --
     renders_parent = DATA_DIR / "renders"
     if renders_parent.is_dir():
         basenames = {p.name for p in scan.processed_dirs}
@@ -378,18 +448,63 @@ def scan_project_data(project: Project) -> ProjectDataScan:
                 scan.render_dirs.append(d)
         scan.render_dirs.sort()
 
+    # -- warehouse train runs descending from this project's processed ULID --
+    train_ulids = _project_warehouse_train_ulids(project)
+    if train_ulids:
+        scan.warehouse_train_dirs = sorted(
+            WAREHOUSE_DIR / "trained" / tid for tid in train_ulids
+        )
+
+    # -- warehouse exports (any kind) whose parent.run_id is in train_ulids --
+    exports_root = WAREHOUSE_DIR / "exports"
+    if exports_root.is_dir() and train_ulids:
+        for kind_dir in exports_root.iterdir():
+            if not kind_dir.is_dir():
+                continue
+            for sub in kind_dir.iterdir():
+                mf = sub / "manifest.json"
+                if not mf.is_file():
+                    continue
+                try:
+                    m = load_manifest(mf)
+                except Exception:
+                    continue
+                if not isinstance(m, ExportManifest):
+                    continue
+                if m.parent is not None and m.parent.run_id in train_ulids:
+                    scan.warehouse_export_dirs.append(sub)
+        scan.warehouse_export_dirs.sort()
+
+    # -- warehouse renders whose parent.run_id is in train_ulids --
+    renders_root = WAREHOUSE_DIR / "renders"
+    if renders_root.is_dir() and train_ulids:
+        for sub in renders_root.iterdir():
+            mf = sub / "manifest.json"
+            if not mf.is_file():
+                continue
+            try:
+                m = load_manifest(mf)
+            except Exception:
+                continue
+            if not isinstance(m, RenderManifest):
+                continue
+            if m.parent is not None and m.parent.run_id in train_ulids:
+                scan.warehouse_render_dirs.append(sub)
+        scan.warehouse_render_dirs.sort()
+
     # -- total size --
     total = 0
     for d in scan.processed_dirs:
         total += _dir_size(d)
     if scan.outputs_dir:
         total += _dir_size(scan.outputs_dir)
-    for f in scan.export_files:
-        try:
-            total += f.stat().st_size
-        except OSError:
-            pass
     for d in scan.render_dirs:
+        total += _dir_size(d)
+    for d in scan.warehouse_train_dirs:
+        total += _dir_size(d)
+    for d in scan.warehouse_export_dirs:
+        total += _dir_size(d)
+    for d in scan.warehouse_render_dirs:
         total += _dir_size(d)
     scan.total_bytes = total
 
@@ -722,10 +837,11 @@ class ProjectStore(QObject):
             if scan.outputs_dir:
                 dirs.append(scan.outputs_dir)
             dirs.extend(scan.render_dirs)
+            dirs.extend(scan.warehouse_train_dirs)
+            dirs.extend(scan.warehouse_export_dirs)
+            dirs.extend(scan.warehouse_render_dirs)
             for d in dirs:
                 _rm_tree(d)
-            for f in scan.export_files:
-                _rm_file(f)
 
         self._root.projects = [
             proj for proj in self._root.projects if proj.id != project_id

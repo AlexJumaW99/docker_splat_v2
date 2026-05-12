@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
-"""Scan the data/ tree and (re)build catalog.db.
+"""Scan the data/ + data_v2/ trees and (re)build catalog.db.
 
 The catalog is a thin index over the filesystem: paths + relationships, no
-file contents. Files stay in data/{processed,outputs,renders,exports}/; the
-DB just tells downstream tools (e.g. vizer) which artifacts belong together.
+file contents. Two parallel artifact stores are indexed in a single DB:
 
-Stored paths are always relative to the data root (the directory that
-contains catalog.db), so the same DB is usable from the host and from any
-container that mounts the data dir.
+* Legacy tree at `data/`: tables `sources`, `processed_runs`, `train_runs`,
+  `exports`, `renders`. Links derived from filename / folder conventions.
+* Warehouse tree at `data_v2/`: tables `warehouse_sources`,
+  `warehouse_processed`, `warehouse_train`, `warehouse_exports`,
+  `warehouse_renders`. ULID-keyed; lineage links come from each
+  `manifest.json`'s explicit `parent.run_id` field — no filename
+  parsing, no convention matching.
+
+Stored paths are always relative to the root the table belongs to (the
+legacy tables relative to `--data-root`, the warehouse tables relative to
+`--warehouse-root`), so the same DB is usable from any consumer that
+mounts either tree.
 
 Usage:
-    python scan_catalog.py                       # scan ./data, write ./data/catalog.db
-    python scan_catalog.py --data-root /path     # scan a different root
-    python scan_catalog.py --quiet               # suppress per-table summaries
-    python scan_catalog.py --dry-run             # parse + report, don't write
+    python scan_catalog.py                          # scan ./data + ./data_v2
+    python scan_catalog.py --data-root /path        # legacy tree
+    python scan_catalog.py --warehouse-root /path   # warehouse tree
+    python scan_catalog.py --quiet                  # suppress per-table summaries
+    python scan_catalog.py --dry-run                # parse + report, don't write
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -39,7 +49,7 @@ from typing import Iterable, Optional
 # A meta table records when the catalog was last built and the schema
 # version, so consumers can detect a stale or incompatible DB.
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -114,7 +124,81 @@ CREATE INDEX IF NOT EXISTS idx_train_exp_method  ON train_runs(exp_name, method)
 CREATE INDEX IF NOT EXISTS idx_exports_train     ON exports(train_run_id);
 CREATE INDEX IF NOT EXISTS idx_exports_parsed    ON exports(exp_name, method, timestamp_dir);
 CREATE INDEX IF NOT EXISTS idx_renders_processed ON renders(processed_run_id);
+
+-- -------------------------------------------------------------------------
+-- Warehouse tables (data_v2/). One row per manifest.json found on disk;
+-- ULID is the primary key and `parent_run_id` is the manifest's declared
+-- lineage pointer. No filename parsing — joins are by ULID.
+-- All `*_path` columns are POSIX relpaths relative to the warehouse root.
+-- -------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS warehouse_sources (
+    run_id        TEXT PRIMARY KEY CHECK(length(run_id) = 26),
+    display_name  TEXT,
+    kind          TEXT NOT NULL,                -- "video" | "image_folder" | "imported_dataset"
+    created_at    TEXT NOT NULL,                -- ISO 8601 UTC
+    path          TEXT NOT NULL,                -- relpath to source artifact (or its dir)
+    size_bytes    INTEGER,
+    mtime         INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS warehouse_processed (
+    run_id            TEXT PRIMARY KEY CHECK(length(run_id) = 26),
+    parent_run_id     TEXT NOT NULL,            -- soft FK -> warehouse_sources(run_id)
+    display_name      TEXT,
+    created_at        TEXT NOT NULL,
+    transforms_json   TEXT,                     -- relpath to transforms.json or NULL
+    colmap_sparse     TEXT,                     -- relpath to colmap/sparse/0 or NULL
+    images_dir        TEXT,                     -- relpath to images/ or NULL
+    mtime             INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS warehouse_train (
+    run_id              TEXT PRIMARY KEY CHECK(length(run_id) = 26),
+    parent_run_id       TEXT NOT NULL,          -- soft FK -> warehouse_processed(run_id)
+    display_name        TEXT,
+    created_at          TEXT NOT NULL,
+    method              TEXT NOT NULL,
+    experiment_name     TEXT NOT NULL,
+    timestamp_dir       TEXT,
+    config_yml          TEXT,
+    latest_checkpoint   TEXT,
+    latest_step         INTEGER,
+    mtime               INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS warehouse_exports (
+    run_id                 TEXT PRIMARY KEY CHECK(length(run_id) = 26),
+    parent_run_id          TEXT NOT NULL,       -- soft FK -> warehouse_train(run_id)
+    display_name           TEXT,
+    created_at             TEXT NOT NULL,
+    kind                   TEXT NOT NULL,       -- "splat" | "pcd" | "mesh"
+    exporter               TEXT NOT NULL,       -- e.g. "ns-export gaussian-splat"
+    source_checkpoint_step INTEGER NOT NULL,
+    payload_path           TEXT,                -- relpath of the primary .ply
+    payload_size           INTEGER,
+    mtime                  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS warehouse_renders (
+    run_id                  TEXT PRIMARY KEY CHECK(length(run_id) = 26),
+    parent_run_id           TEXT NOT NULL,      -- soft FK -> warehouse_train(run_id)
+    display_name            TEXT,
+    created_at              TEXT NOT NULL,
+    camera_path_filename    TEXT,
+    payload_path            TEXT,
+    payload_size            INTEGER,
+    mtime                   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_wh_processed_parent ON warehouse_processed(parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_wh_train_parent     ON warehouse_train(parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_wh_exports_parent   ON warehouse_exports(parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_wh_exports_kind     ON warehouse_exports(kind);
+CREATE INDEX IF NOT EXISTS idx_wh_renders_parent   ON warehouse_renders(parent_run_id);
 """
+
+ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 
 # ---------------------------------------------------------------------------
 # Filename parsing (kept compatible with vizer/splat_viewer.py:47-55)
@@ -386,6 +470,268 @@ def scan_renders(data_root: Path) -> list[Render]:
 
 
 # ---------------------------------------------------------------------------
+# Warehouse manifest walkers (data_v2/)
+# ---------------------------------------------------------------------------
+#
+# Each per-stage tree is shaped as:
+#   data_v2/<stage_plural>/<ULID>/manifest.json + payload(s)
+# except `exports/`, which has a kind sub-level:
+#   data_v2/exports/<kind>/<ULID>/manifest.json + payload(s)
+#
+# We read each manifest with `json.load` (no pydantic dep), pick out the
+# fields the catalog cares about, and emit a typed record. The manifest's
+# `parent.run_id` IS the lineage link — no filename heuristics.
+
+
+@dataclass
+class WarehouseSource:
+    run_id: str
+    display_name: Optional[str]
+    kind: str
+    created_at: str
+    path: Optional[str]
+    size_bytes: Optional[int]
+    mtime: int
+
+
+@dataclass
+class WarehouseProcessed:
+    run_id: str
+    parent_run_id: str
+    display_name: Optional[str]
+    created_at: str
+    transforms_json: Optional[str]
+    colmap_sparse: Optional[str]
+    images_dir: Optional[str]
+    mtime: int
+
+
+@dataclass
+class WarehouseTrain:
+    run_id: str
+    parent_run_id: str
+    display_name: Optional[str]
+    created_at: str
+    method: str
+    experiment_name: str
+    timestamp_dir: Optional[str]
+    config_yml: Optional[str]
+    latest_checkpoint: Optional[str]
+    latest_step: Optional[int]
+    mtime: int
+
+
+@dataclass
+class WarehouseExport:
+    run_id: str
+    parent_run_id: str
+    display_name: Optional[str]
+    created_at: str
+    kind: str
+    exporter: str
+    source_checkpoint_step: int
+    payload_path: Optional[str]
+    payload_size: Optional[int]
+    mtime: int
+
+
+@dataclass
+class WarehouseRender:
+    run_id: str
+    parent_run_id: str
+    display_name: Optional[str]
+    created_at: str
+    camera_path_filename: Optional[str]
+    payload_path: Optional[str]
+    payload_size: Optional[int]
+    mtime: int
+
+
+def _read_manifest(path: Path) -> Optional[dict[str, Any]]:
+    """Best-effort manifest read — returns None on missing / unreadable /
+    malformed JSON rather than raising so one bad file doesn't kill the
+    whole scan."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _payload_size(warehouse_root: Path, relpath: Optional[str]) -> Optional[int]:
+    """Stat the file at `<warehouse_root>/<relpath>`; None on missing or
+    when relpath is None."""
+    if not relpath:
+        return None
+    try:
+        return (warehouse_root / relpath).stat().st_size
+    except OSError:
+        return None
+
+
+def _picked_export_payload(outputs: dict, kind: str) -> Optional[str]:
+    """The ExportManifest convention is to record the primary payload under
+    `outputs.splat_ply` / `outputs.pcd_ply` / `outputs.mesh_ply`. We accept
+    any of those keys; first hit wins."""
+    for key in ("splat_ply", "pcd_ply", "mesh_ply"):
+        if key in outputs and isinstance(outputs[key], str):
+            return outputs[key]
+    return None
+
+
+def scan_warehouse_sources(warehouse_root: Path) -> list[WarehouseSource]:
+    out: list[WarehouseSource] = []
+    root = warehouse_root / "sources"
+    for sub in _safe_iterdir(root):
+        if not sub.is_dir() or not ULID_RE.match(sub.name):
+            continue
+        m = _read_manifest(sub / "manifest.json")
+        if m is None or m.get("stage") != "source":
+            continue
+        st = _safe_stat(sub / "manifest.json")
+        params = m.get("params") or {}
+        outputs = m.get("outputs") or {}
+        path = outputs.get("file") or outputs.get("directory")
+        out.append(WarehouseSource(
+            run_id=m["run_id"],
+            display_name=m.get("display_name"),
+            kind=params.get("kind", "imported_dataset"),
+            created_at=m.get("created_at") or "",
+            path=path if isinstance(path, str) else None,
+            size_bytes=int(params["size_bytes"]) if isinstance(params.get("size_bytes"), (int, float)) else None,
+            mtime=int(st.st_mtime) if st else 0,
+        ))
+    return out
+
+
+def scan_warehouse_processed(warehouse_root: Path) -> list[WarehouseProcessed]:
+    out: list[WarehouseProcessed] = []
+    root = warehouse_root / "processed"
+    for sub in _safe_iterdir(root):
+        if not sub.is_dir() or not ULID_RE.match(sub.name):
+            continue
+        m = _read_manifest(sub / "manifest.json")
+        if m is None or m.get("stage") != "process":
+            continue
+        parent = m.get("parent") or {}
+        if not isinstance(parent, dict) or parent.get("stage") != "source":
+            continue
+        outputs = m.get("outputs") or {}
+        st = _safe_stat(sub / "manifest.json")
+        out.append(WarehouseProcessed(
+            run_id=m["run_id"],
+            parent_run_id=parent["run_id"],
+            display_name=m.get("display_name"),
+            created_at=m.get("created_at") or "",
+            transforms_json=outputs.get("transforms_json"),
+            colmap_sparse=outputs.get("colmap_sparse"),
+            images_dir=outputs.get("images_dir"),
+            mtime=int(st.st_mtime) if st else 0,
+        ))
+    return out
+
+
+def scan_warehouse_train(warehouse_root: Path) -> list[WarehouseTrain]:
+    out: list[WarehouseTrain] = []
+    root = warehouse_root / "trained"
+    for sub in _safe_iterdir(root):
+        if not sub.is_dir() or not ULID_RE.match(sub.name):
+            continue
+        m = _read_manifest(sub / "manifest.json")
+        if m is None or m.get("stage") != "train":
+            continue
+        parent = m.get("parent") or {}
+        if not isinstance(parent, dict) or parent.get("stage") != "process":
+            continue
+        params = m.get("params") or {}
+        outputs = m.get("outputs") or {}
+        metrics = m.get("metrics") or {}
+        st = _safe_stat(sub / "manifest.json")
+        latest_step = metrics.get("latest_step")
+        out.append(WarehouseTrain(
+            run_id=m["run_id"],
+            parent_run_id=parent["run_id"],
+            display_name=m.get("display_name"),
+            created_at=m.get("created_at") or "",
+            method=params.get("method", ""),
+            experiment_name=params.get("experiment_name", ""),
+            timestamp_dir=params.get("timestamp_dir"),
+            config_yml=outputs.get("config_yml"),
+            latest_checkpoint=outputs.get("latest_checkpoint"),
+            latest_step=int(latest_step) if isinstance(latest_step, (int, float)) else None,
+            mtime=int(st.st_mtime) if st else 0,
+        ))
+    return out
+
+
+def scan_warehouse_exports(warehouse_root: Path) -> list[WarehouseExport]:
+    out: list[WarehouseExport] = []
+    root = warehouse_root / "exports"
+    # Two-level layout: exports/<kind>/<ULID>/manifest.json
+    for kind_dir in _safe_iterdir(root):
+        if not kind_dir.is_dir():
+            continue
+        for sub in _safe_iterdir(kind_dir):
+            if not sub.is_dir() or not ULID_RE.match(sub.name):
+                continue
+            m = _read_manifest(sub / "manifest.json")
+            if m is None or m.get("stage") != "export":
+                continue
+            parent = m.get("parent") or {}
+            if not isinstance(parent, dict) or parent.get("stage") != "train":
+                continue
+            params = m.get("params") or {}
+            outputs = m.get("outputs") or {}
+            st = _safe_stat(sub / "manifest.json")
+            payload_path = _picked_export_payload(outputs, params.get("kind", ""))
+            out.append(WarehouseExport(
+                run_id=m["run_id"],
+                parent_run_id=parent["run_id"],
+                display_name=m.get("display_name"),
+                created_at=m.get("created_at") or "",
+                kind=params.get("kind", kind_dir.name),
+                exporter=params.get("exporter", ""),
+                source_checkpoint_step=int(params.get("source_checkpoint_step", 0)),
+                payload_path=payload_path,
+                payload_size=_payload_size(warehouse_root, payload_path),
+                mtime=int(st.st_mtime) if st else 0,
+            ))
+    return out
+
+
+def scan_warehouse_renders(warehouse_root: Path) -> list[WarehouseRender]:
+    out: list[WarehouseRender] = []
+    root = warehouse_root / "renders"
+    for sub in _safe_iterdir(root):
+        if not sub.is_dir() or not ULID_RE.match(sub.name):
+            continue
+        m = _read_manifest(sub / "manifest.json")
+        if m is None or m.get("stage") != "render":
+            continue
+        parent = m.get("parent") or {}
+        if not isinstance(parent, dict) or parent.get("stage") != "train":
+            continue
+        params = m.get("params") or {}
+        outputs = m.get("outputs") or {}
+        payload_path = outputs.get("video")
+        st = _safe_stat(sub / "manifest.json")
+        out.append(WarehouseRender(
+            run_id=m["run_id"],
+            parent_run_id=parent["run_id"],
+            display_name=m.get("display_name"),
+            created_at=m.get("created_at") or "",
+            camera_path_filename=params.get("camera_path_filename"),
+            payload_path=payload_path if isinstance(payload_path, str) else None,
+            payload_size=_payload_size(warehouse_root, payload_path if isinstance(payload_path, str) else None),
+            mtime=int(st.st_mtime) if st else 0,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Linking heuristics
 # ---------------------------------------------------------------------------
 
@@ -514,13 +860,36 @@ def link_render_to_processed(render: Render, processed_by_name: dict[str, int]) 
 # Build
 # ---------------------------------------------------------------------------
 
-def build_catalog(db_path: Path, data_root: Path, *, quiet: bool = False) -> dict[str, int]:
-    """(Re)build the catalog at db_path. Returns per-table row counts."""
+def build_catalog(
+    db_path: Path,
+    data_root: Path,
+    warehouse_root: Optional[Path] = None,
+    *,
+    quiet: bool = False,
+) -> dict[str, int]:
+    """(Re)build the catalog at db_path. Returns per-table row counts.
+
+    `warehouse_root` is optional — when omitted the warehouse_* tables are
+    populated empty. This keeps the CLI usable in deployments that don't
+    have a data_v2/ tree."""
     sources = scan_sources(data_root)
     processed = scan_processed(data_root)
     trains = scan_train_runs(data_root)
     exports = scan_exports(data_root)
     renders = scan_renders(data_root)
+
+    if warehouse_root is not None and warehouse_root.is_dir():
+        wh_sources = scan_warehouse_sources(warehouse_root)
+        wh_processed = scan_warehouse_processed(warehouse_root)
+        wh_train = scan_warehouse_train(warehouse_root)
+        wh_exports = scan_warehouse_exports(warehouse_root)
+        wh_renders = scan_warehouse_renders(warehouse_root)
+    else:
+        wh_sources = []
+        wh_processed = []
+        wh_train = []
+        wh_exports = []
+        wh_renders = []
 
     conn = sqlite3.connect(db_path)
     try:
@@ -535,12 +904,20 @@ def build_catalog(db_path: Path, data_root: Path, *, quiet: bool = False) -> dic
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
             if row is None or row[0] != str(SCHEMA_VERSION):
-                for t in ("renders", "exports", "train_runs",
+                for t in ("warehouse_renders", "warehouse_exports",
+                          "warehouse_train", "warehouse_processed",
+                          "warehouse_sources",
+                          "renders", "exports", "train_runs",
                           "processed_runs", "sources", "meta"):
                     conn.execute(f"DROP TABLE IF EXISTS {t}")
                 conn.commit()
         conn.executescript(SCHEMA_SQL)
         with conn:                          # one transaction, atomic from reader POV
+            conn.execute("DELETE FROM warehouse_renders")
+            conn.execute("DELETE FROM warehouse_exports")
+            conn.execute("DELETE FROM warehouse_train")
+            conn.execute("DELETE FROM warehouse_processed")
+            conn.execute("DELETE FROM warehouse_sources")
             conn.execute("DELETE FROM renders")
             conn.execute("DELETE FROM exports")
             conn.execute("DELETE FROM train_runs")
@@ -616,21 +993,87 @@ def build_catalog(db_path: Path, data_root: Path, *, quiet: bool = False) -> dic
                     (pid, r.project_name, r.rel_path, r.filename, r.size_bytes, r.mtime),
                 )
 
+            # warehouse_*: insert by manifest ULID. The parent_run_id links
+            # are stored as plain strings rather than FKs because we ingest
+            # in topological order but a partial warehouse (e.g. a train run
+            # whose parent processed manifest was hand-deleted) shouldn't
+            # cause the whole row to be rejected.
+            for s in wh_sources:
+                conn.execute(
+                    "INSERT OR REPLACE INTO warehouse_sources(run_id, "
+                    "display_name, kind, created_at, path, size_bytes, mtime) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (s.run_id, s.display_name, s.kind, s.created_at,
+                     s.path, s.size_bytes, s.mtime),
+                )
+            for pr in wh_processed:
+                conn.execute(
+                    "INSERT OR REPLACE INTO warehouse_processed(run_id, "
+                    "parent_run_id, display_name, created_at, "
+                    "transforms_json, colmap_sparse, images_dir, mtime) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (pr.run_id, pr.parent_run_id, pr.display_name,
+                     pr.created_at, pr.transforms_json, pr.colmap_sparse,
+                     pr.images_dir, pr.mtime),
+                )
+            for tr in wh_train:
+                conn.execute(
+                    "INSERT OR REPLACE INTO warehouse_train(run_id, "
+                    "parent_run_id, display_name, created_at, method, "
+                    "experiment_name, timestamp_dir, config_yml, "
+                    "latest_checkpoint, latest_step, mtime) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (tr.run_id, tr.parent_run_id, tr.display_name,
+                     tr.created_at, tr.method, tr.experiment_name,
+                     tr.timestamp_dir, tr.config_yml, tr.latest_checkpoint,
+                     tr.latest_step, tr.mtime),
+                )
+            for ex in wh_exports:
+                conn.execute(
+                    "INSERT OR REPLACE INTO warehouse_exports(run_id, "
+                    "parent_run_id, display_name, created_at, kind, "
+                    "exporter, source_checkpoint_step, payload_path, "
+                    "payload_size, mtime) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ex.run_id, ex.parent_run_id, ex.display_name,
+                     ex.created_at, ex.kind, ex.exporter,
+                     ex.source_checkpoint_step, ex.payload_path,
+                     ex.payload_size, ex.mtime),
+                )
+            for r in wh_renders:
+                conn.execute(
+                    "INSERT OR REPLACE INTO warehouse_renders(run_id, "
+                    "parent_run_id, display_name, created_at, "
+                    "camera_path_filename, payload_path, payload_size, mtime) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r.run_id, r.parent_run_id, r.display_name,
+                     r.created_at, r.camera_path_filename, r.payload_path,
+                     r.payload_size, r.mtime),
+                )
+
             # meta
             now = int(time.time())
             conn.execute("DELETE FROM meta")
+            meta_rows = [
+                ("schema_version", str(SCHEMA_VERSION)),
+                ("scanned_at", str(now)),
+                ("data_root", str(data_root.resolve())),
+            ]
+            if warehouse_root is not None:
+                meta_rows.append(
+                    ("warehouse_root", str(warehouse_root.resolve()))
+                )
             conn.executemany(
-                "INSERT INTO meta(key, value) VALUES (?, ?)",
-                [
-                    ("schema_version", str(SCHEMA_VERSION)),
-                    ("scanned_at", str(now)),
-                    ("data_root", str(data_root.resolve())),
-                ],
+                "INSERT INTO meta(key, value) VALUES (?, ?)", meta_rows,
             )
 
         counts = {
             t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            for t in ("sources", "processed_runs", "train_runs", "exports", "renders")
+            for t in (
+                "sources", "processed_runs", "train_runs", "exports", "renders",
+                "warehouse_sources", "warehouse_processed", "warehouse_train",
+                "warehouse_exports", "warehouse_renders",
+            )
         }
     finally:
         conn.close()
@@ -648,12 +1091,36 @@ def build_catalog(db_path: Path, data_root: Path, *, quiet: bool = False) -> dic
                     c2.execute("SELECT COUNT(*) FROM exports WHERE train_run_id IS NULL").fetchone()[0],
                 "renders without processed":
                     c2.execute("SELECT COUNT(*) FROM renders WHERE processed_run_id IS NULL").fetchone()[0],
+                "wh_processed without wh_source":
+                    c2.execute(
+                        "SELECT COUNT(*) FROM warehouse_processed wp "
+                        "LEFT JOIN warehouse_sources ws ON ws.run_id = wp.parent_run_id "
+                        "WHERE ws.run_id IS NULL"
+                    ).fetchone()[0],
+                "wh_train without wh_processed":
+                    c2.execute(
+                        "SELECT COUNT(*) FROM warehouse_train wt "
+                        "LEFT JOIN warehouse_processed wp ON wp.run_id = wt.parent_run_id "
+                        "WHERE wp.run_id IS NULL"
+                    ).fetchone()[0],
+                "wh_exports without wh_train":
+                    c2.execute(
+                        "SELECT COUNT(*) FROM warehouse_exports we "
+                        "LEFT JOIN warehouse_train wt ON wt.run_id = we.parent_run_id "
+                        "WHERE wt.run_id IS NULL"
+                    ).fetchone()[0],
+                "wh_renders without wh_train":
+                    c2.execute(
+                        "SELECT COUNT(*) FROM warehouse_renders wr "
+                        "LEFT JOIN warehouse_train wt ON wt.run_id = wr.parent_run_id "
+                        "WHERE wt.run_id IS NULL"
+                    ).fetchone()[0],
             }
         finally:
             c2.close()
         print(f"[catalog] {db_path}")
         for t, n in counts.items():
-            print(f"  {t:20s} {n}")
+            print(f"  {t:24s} {n}")
         print("[catalog] orphans:")
         for label, n in stats.items():
             print(f"  {label:32s} {n}")
@@ -666,10 +1133,19 @@ def build_catalog(db_path: Path, data_root: Path, *, quiet: bool = False) -> dic
 # ---------------------------------------------------------------------------
 
 def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Scan data/ and (re)build catalog.db")
+    p = argparse.ArgumentParser(
+        description="Scan data/ + data_v2/ and (re)build catalog.db"
+    )
     p.add_argument("--data-root", type=Path,
                    default=Path(__file__).resolve().parent / "data",
-                   help="Data directory (default: ./data)")
+                   help="Legacy data directory (default: ./data)")
+    p.add_argument("--warehouse-root", type=Path,
+                   default=Path(__file__).resolve().parent / "data_v2",
+                   help="Manifest-driven warehouse directory (default: ./data_v2). "
+                   "Pass --no-warehouse to skip the warehouse_* tables.")
+    p.add_argument("--no-warehouse", action="store_true",
+                   help="Skip scanning the warehouse root; the warehouse_* "
+                   "tables will be created but empty.")
     p.add_argument("--db-path", type=Path, default=None,
                    help="Output DB path (default: <data-root>/catalog.db)")
     p.add_argument("--quiet", action="store_true", help="Suppress summary output")
@@ -682,6 +1158,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"error: --data-root {data_root} is not a directory", file=sys.stderr)
         return 2
 
+    warehouse_root: Optional[Path] = None
+    if not args.no_warehouse:
+        candidate = args.warehouse_root.resolve()
+        if candidate.is_dir():
+            warehouse_root = candidate
+        elif args.warehouse_root != p.get_default("warehouse_root"):
+            # Only error out when the user explicitly passed --warehouse-root.
+            # The default is allowed to silently miss so the script still works
+            # on hosts without a data_v2/ tree.
+            print(
+                f"error: --warehouse-root {candidate} is not a directory",
+                file=sys.stderr,
+            )
+            return 2
+
     db_path: Path = (args.db_path or (data_root / "catalog.db")).resolve()
 
     if args.dry_run:
@@ -690,15 +1181,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         trains = scan_train_runs(data_root)
         exports = scan_exports(data_root)
         renders = scan_renders(data_root)
+        if warehouse_root is not None:
+            wh_sources = scan_warehouse_sources(warehouse_root)
+            wh_processed = scan_warehouse_processed(warehouse_root)
+            wh_train = scan_warehouse_train(warehouse_root)
+            wh_exports = scan_warehouse_exports(warehouse_root)
+            wh_renders = scan_warehouse_renders(warehouse_root)
+        else:
+            wh_sources = wh_processed = wh_train = wh_exports = wh_renders = []
         print(f"[dry-run] would write {db_path}")
-        print(f"  sources         {len(sources)}")
-        print(f"  processed_runs  {len(processed)}")
-        print(f"  train_runs      {len(trains)}")
-        print(f"  exports         {len(exports)}")
-        print(f"  renders         {len(renders)}")
+        print(f"  legacy data_root      {data_root}")
+        print(f"    sources             {len(sources)}")
+        print(f"    processed_runs      {len(processed)}")
+        print(f"    train_runs          {len(trains)}")
+        print(f"    exports             {len(exports)}")
+        print(f"    renders             {len(renders)}")
+        if warehouse_root is not None:
+            print(f"  warehouse_root        {warehouse_root}")
+            print(f"    warehouse_sources   {len(wh_sources)}")
+            print(f"    warehouse_processed {len(wh_processed)}")
+            print(f"    warehouse_train     {len(wh_train)}")
+            print(f"    warehouse_exports   {len(wh_exports)}")
+            print(f"    warehouse_renders   {len(wh_renders)}")
+        else:
+            print("  warehouse_root        (skipped)")
         return 0
 
-    build_catalog(db_path, data_root, quiet=args.quiet)
+    build_catalog(db_path, data_root, warehouse_root, quiet=args.quiet)
     return 0
 
 

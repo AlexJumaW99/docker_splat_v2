@@ -230,7 +230,7 @@ First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif (~
 | Dashboard | live  | Polls Docker + `splat-ns-v2` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
 | Process   | live  | Form-driven `ns-process-data` (video or images). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF photos (iPhone) to maximum-quality JPEG with EXIF preserved before processing; originals are stashed in a `heic_originals/` subfolder. |
 | Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
-| Exports   | live  | Form-driven PLY export and `ns-render camera-path` (video from viser keyframe JSON). Auto-routes to `ns-export-splatfactow` for `splatfacto-w` / `splatfacto-w-light` runs (upstream `ns-export gaussian-splat` doesn't handle them) and to `ns-export gaussian-splat` for everything else. Auto-suffixes duplicate filenames (`_2`, `_3`, …) to prevent overwrites. |
+| Exports   | live  | Form-driven PLY export and `ns-render camera-path` (video from viser keyframe JSON). Each artifact lands in its own ULID directory — `data_v2/exports/splat/<EXPORT_ULID>/<name>.ply` and `data_v2/renders/<RENDER_ULID>/<name>.mp4` — alongside a `manifest.json` whose `parent.run_id` is the train ULID; collisions are impossible by construction. Auto-routes to `ns-export-splatfactow` for `splatfacto-w` / `splatfacto-w-light` runs (upstream `ns-export gaussian-splat` doesn't handle them) and to `ns-export gaussian-splat` for everything else. |
 | Viewers   | live  | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
 | Runs      | stub  | Placeholder for a training-run browser over `data/outputs/`.                                                                                  |
 
@@ -258,22 +258,39 @@ run it descends from:
 
 ```
 data_v2/
-├── sources/<source_ULID>/        # original video or image folder
-│   └── manifest.json             # SourceManifest, parent = null (root)
-├── processed/<process_ULID>/     # ns-process-data output
-│   └── manifest.json             # ProcessManifest, parent.run_id = <source_ULID>
-└── trained/<train_ULID>/         # ns-train output (nested per nerfstudio)
-    ├── <project>/<method>/<timestamp>/    # config.yml, ckpts, tfevents
-    └── manifest.json             # TrainManifest, parent.run_id = <process_ULID>
+├── sources/<source_ULID>/                          # original video or image folder
+│   └── manifest.json                               # SourceManifest, parent = null (root)
+├── processed/<process_ULID>/                       # ns-process-data output
+│   └── manifest.json                               # ProcessManifest, parent.run_id = <source_ULID>
+├── trained/<train_ULID>/                           # ns-train output (nested per nerfstudio)
+│   ├── <project>/<method>/<timestamp>/             # config.yml, ckpts, tfevents
+│   └── manifest.json                               # TrainManifest, parent.run_id = <process_ULID>
+├── exports/<kind>/<export_ULID>/                   # ns-export output (kind: splat | pcd | mesh)
+│   ├── <name>.ply                                  # primary payload (renamed from ns-export's `splat.ply`)
+│   └── manifest.json                               # ExportManifest, parent.run_id = <train_ULID>
+└── renders/<render_ULID>/                          # ns-render camera-path output
+    ├── <name>.mp4                                  # rendered video
+    ├── camera_path.json                            # snapshot of the keyframe path used (for reproducibility)
+    └── manifest.json                               # RenderManifest, parent.run_id = <train_ULID>
 ```
 
-Lineage is **declared**, not inferred — to trace a `.ckpt` back to its
-source video, read `manifest.json` for the train run, follow
-`parent.run_id` into `data_v2/processed/`, then follow that manifest's
-`parent.run_id` into `data_v2/sources/`. Three file reads, no tooling
-required. The full JSON Schema for all five manifest stages is at
-[`gui/app/manifest_schema.json`](gui/app/manifest_schema.json) (Draft
-2020-12, frozen at v1.0).
+Lineage is **declared**, not inferred — to trace a `.ply` back to its
+source video, read `manifest.json` for the export, follow `parent.run_id`
+into `data_v2/trained/`, then into `data_v2/processed/`, then into
+`data_v2/sources/`. Four file reads, no tooling required (the same walk
+works for an `.mp4` via `data_v2/renders/`). The full JSON Schema for all
+five manifest stages is at [`gui/app/manifest_schema.json`](gui/app/manifest_schema.json)
+(Draft 2020-12, frozen at v1.0).
+
+**The `mesh/` and `pointcloud/` export sub-folders exist by convention
+but are not wired today.** `ns-export poisson`, `tsdf`, `marching-cubes`,
+and `pointcloud` all require the volumetric-NeRF model interface
+(`pipeline.model(ray_bundle)` returning depth-along-rays, or an SDF
+field), which `SplatfactoModel` doesn't implement — see
+[`nerfstudio/scripts/exporter.py`](https://github.com/nerfstudio-project/nerfstudio/blob/main/nerfstudio/scripts/exporter.py).
+Mesh from a Gaussian scene currently requires retraining with 2DGS
+(unlocked by the gsplat 1.5.3 upgrade) and using the 2DGS repo's TSDF
+extractor, or a separate tool such as SuGaR / GS2Mesh.
 
 **Incomplete runs are first-class.** When the Train tab starts a run it
 writes a `pending.json` sidecar *before* `ns-train` launches. If the GUI
@@ -764,7 +781,7 @@ Once trained, export to a portable PLY that can be opened in any Gaussian Splatt
 
 ### Via the GUI Exports tab (recommended)
 
-Open the **Exports** tab, pick a project + run from the dropdown, and click **Export .ply**. The GUI writes each PLY under `data/exports/splat/` with a unique filename derived from the run (`<project>_<method>_<timestamp>.ply`) and auto-suffixes (`_2`, `_3`, …) on collision so repeat exports never overwrite. The right exporter is picked automatically based on the run's training method, so you never need to think about `splatfacto-w` vs. built-in splatfacto.
+Open the **Exports** tab, pick a project + run from the dropdown, and click **Export .ply**. The GUI mints an `EXPORT_ULID`, writes the PLY at `data_v2/exports/splat/<EXPORT_ULID>/<name>.ply` (defaulting `<name>` to `<display_name>_<method>_<timestamp>` so the file is still self-describing if copied out), and drops a `manifest.json` next to it whose `parent.run_id` is the train ULID — so every export carries full lineage back to the source video without filename parsing. Each export lives in its own ULID directory, so two clicks on the same run never overwrite each other. The right exporter is picked automatically based on the run's training method, so you never need to think about `splatfacto-w` vs. built-in splatfacto. The run picker is sourced from `data_v2/trained/*/manifest.json` filtered by the project's processed ULID; legacy projects (whose `processed_dir` predates the warehouse) see a gated empty state asking you to reprocess + retrain via the warehouse-aware tabs first.
 
 ### Via the CLI — built-in splatfacto / -big / -mcmc
 
@@ -824,7 +841,7 @@ Same tab as PLY export. Below the PLY card is a **Render camera-path video** car
 2. Pick a camera-path JSON from the project's `camera_paths/` folder (auto-populated).
 3. Click **Render video**.
 
-Output lands under `data/renders/<project>/<camera-path-stem>.mp4`, auto-suffixed on collision.
+Output lands at `data_v2/renders/<RENDER_ULID>/<name>.mp4` alongside (a) a snapshot of the `camera_path.json` actually used — so the render stays reproducible even if the original keyframe file is later edited — and (b) a `manifest.json` whose `parent.run_id` is the train ULID. Each render lives in its own ULID directory, so collisions are impossible.
 
 ### Via the CLI
 

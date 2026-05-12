@@ -1,24 +1,34 @@
 """
 Exports view — runs ns-export gaussian-splat and ns-render camera-path inside
-splat-ns.
+splat-ns, writing every artifact into the ULID-keyed warehouse with a
+manifest that records lineage back to the train run.
 
-Two artifacts per trained run:
+Two artifacts per trained run, both warehouse-keyed and manifest-tracked:
 
-* `.ply` splat — ns-export always writes `splat.ply` into its --output-dir, so
-  we export into a hidden per-job temp dir and rename to `<unique>.ply`. A
-  shell trap cleans the temp dir on cancel / error.
-* `.mp4` video — ns-render writes directly to --output-path, so we just
-  mkdir -p the parent and pick a non-colliding filename host-side.
+* `.ply` splat — exported under
+  `data_v2/exports/splat/<EXPORT_ULID>/<stem>.ply` alongside a
+  `manifest.json` whose `parent.run_id` is the train ULID. ns-export
+  always writes `splat.ply` into its --output-dir; we rename to the
+  user's stem inside the same ULID dir so the on-disk name is
+  human-meaningful while lineage is encoded in the manifest, not the
+  filename. The `mesh/` and `pointcloud/` sub-folders are reserved by
+  the warehouse layout but not wired up here — `ns-export
+  poisson/tsdf/marching-cubes/pointcloud` all require the volumetric-NeRF
+  model interface that `SplatfactoModel` doesn't implement.
+* `.mp4` video — rendered under `data_v2/renders/<RENDER_ULID>/<stem>.mp4`
+  with its own `manifest.json` (parent = train ULID). A snapshot of the
+  camera-path JSON used is dropped into the same dir for reproducibility.
 
-Both cards share the same run picker. Only one JobManager job runs at a time,
-so a single Cancel button + status pill covers both.
+Both cards share the same run picker. Only one JobManager job runs at a
+time, so a single Cancel button + status pill covers both.
 """
 from __future__ import annotations
 
 import re
 import shlex
+import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -28,42 +38,45 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
-from app.config import CONTAINER_NAME, DATA_DIR
+from app import warehouse as wh
+from app.config import CONTAINER_NAME, WAREHOUSE_DIR
 from app.jobs import JobManager, JobSpec
-from app.paths import unique_path
+from app.manifest import ExportParams, RenderParams, TrainManifest, load_manifest
 from app.store import Project, ProjectStore
-from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
+from app.widgets import HelpBadge, ProjectBar, card, pill, section_title, set_pill
 
 
 _HELP = {
     "run": (
         "Training run",
-        "A finished ns-train run under "
-        "<code>data/outputs/&lt;project&gt;/&lt;method&gt;/&lt;timestamp&gt;/</code>. "
-        "Each run has its own <code>config.yml</code> + checkpoints; pick the "
-        "run you want to export a .ply from or render a video of. Latest "
-        "runs appear first."
+        "A finished ns-train run from this project under "
+        "<code>data_v2/trained/&lt;ULID&gt;/</code>. Latest runs appear first; "
+        "pick the run you want to export a .ply from or render a video of. "
+        "Each run's <code>manifest.json</code> encodes the full lineage chain "
+        "back to the source video."
     ),
     "ply_name": (
         "Export filename",
-        "Name for the exported <code>.ply</code> under "
-        "<code>data/exports/splat/</code>. Don't include the extension. "
-        "If the name already exists, the GUI appends <code>_2</code>, "
-        "<code>_3</code>\u2026 automatically \u2014 nothing is ever overwritten."
+        "Name for the exported <code>.ply</code>. Lands at "
+        "<code>data_v2/exports/splat/&lt;EXPORT_ULID&gt;/&lt;name&gt;.ply</code> "
+        "next to a <code>manifest.json</code> recording lineage to the train run. "
+        "Each export gets its own ULID directory, so collisions can't happen — "
+        "the name is purely for human readability."
     ),
     "camera_path": (
         "Camera path",
         "A keyframe path saved from viser's keyframe editor, stored as "
         "<code>&lt;processed_dir&gt;/camera_paths/*.json</code>. Open the run "
-        "in viser, build a path, click <b>Save</b>, then hit \u21bb here to "
-        "rescan. The render uses the path's keyframes + easing verbatim."
+        "in viser, build a path, click <b>Save</b>, then hit ↻ here to "
+        "rescan. The render uses the path verbatim, and a copy of the JSON is "
+        "snapshotted next to the rendered video for reproducibility."
     ),
     "video_name": (
         "Render filename",
-        "Name for the rendered <code>.mp4</code> under "
-        "<code>data/renders/&lt;project&gt;/</code>. Don't include the "
-        "extension; duplicates auto-suffix with <code>_2</code>, "
-        "<code>_3</code>\u2026 so nothing is overwritten."
+        "Name for the rendered <code>.mp4</code>. Lands at "
+        "<code>data_v2/renders/&lt;RENDER_ULID&gt;/&lt;name&gt;.mp4</code> with "
+        "a <code>manifest.json</code> whose <code>parent.run_id</code> is the "
+        "train ULID. Each render gets its own ULID directory — no collisions."
     ),
 }
 
@@ -72,10 +85,6 @@ def _hb(key: str) -> HelpBadge:
     title, body = _HELP[key]
     return HelpBadge(title, body)
 
-
-OUTPUTS_DIR = DATA_DIR / "outputs"
-EXPORTS_DIR = DATA_DIR / "exports" / "splat"
-RENDERS_DIR = DATA_DIR / "renders"
 
 # splatfacto-w / -light need a different exporter because SplatfactoWModel
 # doesn't subclass SplatfactoModel and computes SH coefficients per-frame
@@ -87,16 +96,11 @@ _SPLATFACTOW_METHODS = frozenset({"splatfacto-w", "splatfacto-w-light"})
 
 # ---------- path helpers ----------
 
-def _host_to_container(path: Path) -> str:
-    """Translate a host path under DATA_DIR to its /workspace-mounted form."""
-    rel = path.resolve().relative_to(DATA_DIR.resolve())
-    return f"/workspace/{rel.as_posix()}"
-
 
 def _sanitize_stem(raw: str, ext: str) -> str:
     """Strip a trailing extension the user may have typed, drop path
-    separators, and trim whitespace. We only ever write into the
-    format-specific output dir, so slashes are never meaningful here."""
+    separators, and trim whitespace. We only ever write into a fresh ULID
+    directory, so slashes are never meaningful here."""
     s = raw.strip()
     if ext and s.lower().endswith(ext.lower()):
         s = s[:-len(ext)]
@@ -108,63 +112,129 @@ def _sanitize_stem(raw: str, ext: str) -> str:
 
 @dataclass(frozen=True)
 class _Run:
-    project_id: str
-    method: str         # e.g. "splatfacto"
-    timestamp: str      # e.g. "2026-04-20_020610"
-    config_path: Path   # absolute host path to config.yml
+    """One trained warehouse run this project can export from. Identity is
+    the train ULID; the dropdown label includes a short prefix so two runs
+    with the same method + timestamp (rare same-minute re-train) stay
+    distinguishable."""
+
+    train_run_id: str        # ULID under data_v2/trained/
+    method: str              # e.g. "splatfacto-big" or "splatfacto-mcmc"
+    timestamp_dir: str       # e.g. "2026-04-20_020610"
+    display_name: str        # TrainManifest.display_name, seeds the default stem
+    config_path: Path        # absolute host path to config.yml
 
     @property
     def label(self) -> str:
-        return f"{self.method} · {self.timestamp}"
+        return (
+            f"{self.method} · {self.timestamp_dir}  "
+            f"({self.train_run_id[:8]}…)"
+        )
 
     @property
     def container_config(self) -> str:
-        return _host_to_container(self.config_path)
+        return wh.host_to_container_warehouse(self.config_path)
 
 
-# upstream nerfstudio writes both `splatfacto` and `splatfacto-mcmc` runs under
-# `<experiment>/splatfacto/<timestamp>/` (method_name='splatfacto' for both),
-# differing only by `strategy: mcmc` vs `strategy: default` inside config.yml.
-# We peek at that field so the Exports dropdown labels mcmc runs accurately
-# and .ply filenames derived from `run.method` carry the strategy through.
+# upstream nerfstudio writes both `splatfacto` and `splatfacto-mcmc` runs
+# under the same `splatfacto` method dir, differing only by `strategy:`
+# inside config.yml. We peek so the dropdown labels mcmc runs accurately.
 _STRATEGY_RE = re.compile(r"^\s*strategy:\s*([A-Za-z_-]+)\s*$", re.MULTILINE)
 
 
-def _method_from_config(dir_method: str, config_path: Path) -> str:
-    if dir_method != "splatfacto":
-        return dir_method
+def _method_from_config(declared: str, config_path: Path) -> str:
+    """Refine a TrainManifest.params.method against config.yml's `strategy:`
+    field — only matters for the splatfacto / splatfacto-mcmc split."""
+    if declared != "splatfacto":
+        return declared
     try:
         text = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return dir_method
+        return declared
     m = _STRATEGY_RE.search(text)
     if m and m.group(1) == "mcmc":
         return "splatfacto-mcmc"
-    return dir_method
+    return declared
 
 
-def _discover_runs(project_id: str) -> list[_Run]:
-    root = OUTPUTS_DIR / project_id
-    if not root.is_dir():
+def _project_processed_ulid(project: Project) -> str | None:
+    """Return the ULID of the project's processed run when its `processed_dir`
+    lives under WAREHOUSE_DIR; None for legacy projects whose processed
+    folder predates the warehouse. The Exports tab uses None to render a
+    gated empty state instead of a broken run dropdown."""
+    processed = Path(project.processed_dir).resolve()
+    try:
+        processed.relative_to(WAREHOUSE_DIR.resolve())
+    except ValueError:
+        return None
+    name = processed.name
+    if not re.fullmatch(wh.ULID_PATTERN, name):
+        return None
+    return name
+
+
+def _discover_runs(project: Project) -> list[_Run]:
+    """Walk `data_v2/trained/*/manifest.json` for TrainManifests whose
+    `parent.run_id` == this project's processed ULID. Sorted newest-first
+    (ULID lexicographic sort = chronological sort). Legacy projects return
+    [] — they need to reprocess + retrain via the warehouse-aware tabs."""
+
+    parent_id = _project_processed_ulid(project)
+    if parent_id is None:
         return []
+
+    trained_root = WAREHOUSE_DIR / "trained"
+    if not trained_root.is_dir():
+        return []
+
     runs: list[_Run] = []
-    for method_dir in (p for p in root.iterdir() if p.is_dir()):
-        for ts_dir in (p for p in method_dir.iterdir() if p.is_dir()):
-            cfg = ts_dir / "config.yml"
-            if cfg.is_file():
-                runs.append(_Run(
-                    project_id=project_id,
-                    method=_method_from_config(method_dir.name, cfg),
-                    timestamp=ts_dir.name,
-                    config_path=cfg,
-                ))
-    # ns-train's timestamp folders sort lexically = chronologically.
-    runs.sort(key=lambda r: (r.timestamp, r.method), reverse=True)
+    for sub in trained_root.iterdir():
+        manifest_path = sub / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            m = load_manifest(manifest_path)
+        except Exception:
+            continue
+        if not isinstance(m, TrainManifest):
+            continue
+        if m.parent is None or m.parent.run_id != parent_id:
+            continue
+
+        # Locate config.yml via the manifest's outputs map first, then fall
+        # back to walking the run dir for older manifests that didn't record
+        # `config_yml` under `outputs`.
+        cfg_rel = m.outputs.get("config_yml")
+        cfg_path: Path | None = None
+        if cfg_rel:
+            cand = WAREHOUSE_DIR / cfg_rel
+            if cand.is_file():
+                cfg_path = cand
+        if cfg_path is None:
+            nested = wh.find_train_run_subdir(sub)
+            if nested is not None:
+                cand = nested / "config.yml"
+                if cand.is_file():
+                    cfg_path = cand
+        if cfg_path is None:
+            continue
+
+        runs.append(_Run(
+            train_run_id=m.run_id,
+            method=_method_from_config(m.params.method, cfg_path),
+            timestamp_dir=m.params.timestamp_dir,
+            display_name=m.display_name or m.run_id,
+            config_path=cfg_path,
+        ))
+
+    runs.sort(key=lambda r: r.train_run_id, reverse=True)
     return runs
 
 
 def _default_ply_stem(run: _Run) -> str:
-    return f"{run.project_id}_{run.method}_{run.timestamp}"
+    """Default filename stem for an export. Mirrors the legacy convention
+    (display_name + method + timestamp) so files copied out of the warehouse
+    remain self-describing even without the manifest."""
+    return f"{run.display_name}_{run.method}_{run.timestamp_dir}"
 
 
 # ---------- camera-path discovery ----------
@@ -183,13 +253,6 @@ def _discover_camera_paths(project: Project) -> list[Path]:
     paths = [p for p in cp_dir.glob("*.json") if p.is_file()]
     paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return paths
-
-
-def _renders_out_dir(project: Project) -> Path:
-    """Per-project host folder for rendered videos. Uses the processed folder's
-    basename so the layout mirrors the 'renders/hrm_splat/…' pattern that
-    ns-render's default viser export already uses."""
-    return RENDERS_DIR / Path(project.processed_dir).name
 
 
 # ---------- empty states ----------
@@ -222,7 +285,9 @@ class _EmptyState(QWidget):
 
 
 class _NoRunsState(QWidget):
-    """Active project has no finished runs. Offers a jump to Train."""
+    """Active project has no warehouse-keyed train runs to expose. Two cases:
+    (a) genuinely no runs yet, or (b) a legacy project whose processed
+    folder predates the warehouse migration. Both route the user to Train."""
 
     request_train = Signal()
 
@@ -238,15 +303,27 @@ class _NoRunsState(QWidget):
         title.setObjectName("PageTitle")
         title.setAlignment(Qt.AlignCenter)
 
-        sub = QLabel(
-            f"'{project.name}' has no finished training runs under\n"
-            f"{OUTPUTS_DIR / project.id}\n\n"
-            "Train a model first, then come back to export its splat."
-        )
+        is_legacy = _project_processed_ulid(project) is None
+        if is_legacy:
+            body = (
+                f"'{project.name}' is pointed at a legacy processed folder:\n"
+                f"{project.processed_dir}\n\n"
+                "Exports now require warehouse-keyed train runs so lineage "
+                "can be traced via manifest.json. Reprocess via the Process "
+                "tab, then retrain to make the run exportable."
+            )
+        else:
+            body = (
+                f"'{project.name}' has no finished training runs under\n"
+                f"{WAREHOUSE_DIR / 'trained'}/ with this project's "
+                f"processed ULID.\n\n"
+                "Train a model first, then come back to export its splat."
+            )
+        sub = QLabel(body)
         sub.setProperty("role", "caption")
         sub.setWordWrap(True)
         sub.setAlignment(Qt.AlignCenter)
-        sub.setMaximumWidth(560)
+        sub.setMaximumWidth(620)
 
         btn = QPushButton("Go to Train →")
         btn.setProperty("role", "primary")
@@ -280,6 +357,24 @@ class _Form(QWidget):
         # buttons owns the currently running job, for cancel / pill routing.
         self._running_kind: str | None = None
 
+        # Pending-state for the manifest write that fires on 0-exit. Captured
+        # at job-start time so the on-finish handler doesn't have to re-derive
+        # ULIDs, paths, params, or commands from UI state that may have
+        # changed mid-run. Mirrors the pattern in views/train.py.
+        self._pending_run: _Run | None = None
+        self._pending_export_ulid: str | None = None
+        self._pending_export_dir: Path | None = None
+        self._pending_export_payload: str | None = None   # filename in the ULID dir
+        self._pending_export_params: ExportParams | None = None
+        self._pending_export_command: str | None = None
+        self._pending_render_ulid: str | None = None
+        self._pending_render_dir: Path | None = None
+        self._pending_render_payload: str | None = None
+        self._pending_render_params: RenderParams | None = None
+        self._pending_render_command: str | None = None
+        self._pending_start_time: datetime | None = None
+        self._pending_display_name: str | None = None
+
         self._build()
         self._select_run(0)
         self._refresh_camera_paths()
@@ -308,8 +403,9 @@ class _Form(QWidget):
         title.setObjectName("PageTitle")
         sub = QLabel(
             "Export a trained run as a .ply splat, or render a video from a "
-            "saved viser keyframe path. Output filenames auto-suffix to avoid "
-            "overwrites."
+            "saved viser keyframe path. Outputs land in the ULID-keyed "
+            "warehouse under data_v2/exports/ and data_v2/renders/, each with "
+            "a manifest.json recording lineage back to the train run."
         )
         sub.setProperty("role", "caption")
         sub.setWordWrap(True)
@@ -511,19 +607,16 @@ class _Form(QWidget):
         stem = _sanitize_stem(self.ply_name_edit.text(), ".ply")
         if not stem:
             stem = _default_ply_stem(self._current_run())
-        target = unique_path(EXPORTS_DIR, stem, ".ply")
-        self.ply_target_line.setText(str(target))
-        desired = f"{stem}.ply"
-        if target.name != desired:
-            self.ply_target_caption.setText(
-                f"'{desired}' already exists — will save as '{target.name}' "
-                "to avoid overwrites."
-            )
-        else:
-            self.ply_target_caption.setText(
-                "Filename is free. Re-running the export will auto-suffix "
-                "instead of overwriting."
-            )
+        # We can't know the export ULID until the user actually clicks Export,
+        # so the preview shows the parent dir with a placeholder. The actual
+        # target is logged to the output drawer once the job starts.
+        preview_parent = WAREHOUSE_DIR / "exports" / "splat" / "<EXPORT_ULID>"
+        self.ply_target_line.setText(str(preview_parent / f"{stem}.ply"))
+        self.ply_target_caption.setText(
+            "EXPORT_ULID is minted at job start. The file lands in a fresh "
+            "ULID directory alongside a manifest.json recording lineage back "
+            "to the train run — collisions are impossible."
+        )
 
     # ---- camera-path management ----
     def _refresh_camera_paths(self) -> None:
@@ -591,19 +684,13 @@ class _Form(QWidget):
         stem = _sanitize_stem(self.video_name_edit.text(), ".mp4")
         if not stem:
             stem = cp.stem
-        out_dir = _renders_out_dir(self._project)
-        target = unique_path(out_dir, stem, ".mp4")
-        self.video_target_line.setText(str(target))
-        desired = f"{stem}.mp4"
-        if target.name != desired:
-            self.video_target_caption.setText(
-                f"'{desired}' already exists in {out_dir} — will save as "
-                f"'{target.name}' to avoid overwrites."
-            )
-        else:
-            self.video_target_caption.setText(
-                f"Filename is free. Will land in {out_dir}."
-            )
+        preview_parent = WAREHOUSE_DIR / "renders" / "<RENDER_ULID>"
+        self.video_target_line.setText(str(preview_parent / f"{stem}.mp4"))
+        self.video_target_caption.setText(
+            "RENDER_ULID is minted at job start. The .mp4 lands in a fresh "
+            "ULID directory next to a snapshot of the camera_path.json used "
+            "and a manifest.json with lineage to the train run."
+        )
 
     # ---- preflight (shared) ----
     def _preflight(self) -> _Run | None:
@@ -642,50 +729,67 @@ class _Form(QWidget):
 
         stem = _sanitize_stem(self.ply_name_edit.text(), ".ply") \
             or _default_ply_stem(run)
-        host_target = unique_path(EXPORTS_DIR, stem, ".ply")
-        final_name = host_target.name
+        payload_name = f"{stem}.ply"
 
-        # Both exporters write `splat.ply` into their --output-dir, so we
-        # export into a private tmp subdir and rename. A trap cleans the tmp
-        # on success, cancel, or error so nothing stale accumulates.
-        tmp_tag = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        c_exports = "/workspace/exports/splat"
-        c_tmp = f"{c_exports}/.tmp_{tmp_tag}"
-        c_final = f"{c_exports}/{final_name}"
+        # Mint the export ULID, pre-create its dir host-side (so the post-run
+        # manifest write doesn't EACCES against a root-owned container dir).
+        export_ulid = wh.mint_ulid()
+        out_dir = wh.export_dir("splat", export_ulid)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        c_out_dir = wh.host_to_container_warehouse(out_dir)
         c_config = run.container_config
 
+        # ns-export writes `splat.ply` inside --output-dir; rename to the
+        # user's stem so the on-disk name carries meaning. ULID dir
+        # guarantees uniqueness regardless of stem.
         if run.method in _SPLATFACTOW_METHODS:
+            exporter_label = "ns-export-splatfactow"
             exporter_cmd = (
                 "ns-export-splatfactow "
                 f"--load-config {shlex.quote(c_config)} "
-                "--output-dir \"$TMP\""
-            )
-            display_cmd = (
-                f"ns-export-splatfactow "
-                f"--load-config {shlex.quote(c_config)} "
-                f"--output-dir {shlex.quote(c_exports)}"
+                f"--output-dir {shlex.quote(c_out_dir)}"
             )
         else:
+            exporter_label = "ns-export gaussian-splat"
             exporter_cmd = (
                 "ns-export gaussian-splat "
                 f"--load-config {shlex.quote(c_config)} "
-                "--output-dir \"$TMP\""
-            )
-            display_cmd = (
-                f"ns-export gaussian-splat "
-                f"--load-config {shlex.quote(c_config)} "
-                f"--output-dir {shlex.quote(c_exports)}"
+                f"--output-dir {shlex.quote(c_out_dir)}"
             )
 
+        # `set -e` so the rename failure surfaces as a non-zero exit (don't
+        # write a manifest claiming the .ply landed when it didn't).
         shell_cmd = (
             "set -e; "
-            f"TMP={shlex.quote(c_tmp)}; "
-            "trap 'rm -rf \"$TMP\"' EXIT; "
-            f"mkdir -p {shlex.quote(c_exports)} \"$TMP\"; "
             f"{exporter_cmd}; "
-            f"mv \"$TMP/splat.ply\" {shlex.quote(c_final)}"
+            f"mv {shlex.quote(c_out_dir)}/splat.ply "
+            f"{shlex.quote(c_out_dir)}/{shlex.quote(payload_name)}"
         )
-        display = f"docker exec {CONTAINER_NAME} {display_cmd}   # → {final_name}"
+        display = (
+            f"docker exec {CONTAINER_NAME} {exporter_cmd}   "
+            f"# → {out_dir}/{payload_name}"
+        )
+
+        # Derive source_checkpoint_step from the parent train run's nested
+        # dir so the manifest records exactly which ckpt was exported.
+        nested = wh.find_train_run_subdir(WAREHOUSE_DIR / "trained" / run.train_run_id)
+        ckpt = wh.find_latest_checkpoint(nested) if nested is not None else None
+        source_step = ckpt[1] if ckpt is not None else 0
+
+        params = ExportParams(
+            kind="splat",
+            exporter=exporter_label,
+            source_checkpoint_step=source_step,
+        )
+
+        self._stash_export_pending(
+            run=run,
+            export_ulid=export_ulid,
+            export_dir_path=out_dir,
+            payload_name=payload_name,
+            params=params,
+            command=display,
+        )
 
         self._jobs.start(JobSpec(
             kind="export",
@@ -710,21 +814,34 @@ class _Form(QWidget):
             return
 
         stem = _sanitize_stem(self.video_name_edit.text(), ".mp4") or cp.stem
-        out_dir = _renders_out_dir(self._project)
-        host_target = unique_path(out_dir, stem, ".mp4")
-        final_name = host_target.name
+        payload_name = f"{stem}.mp4"
 
+        render_ulid = wh.mint_ulid()
+        out_dir = wh.run_dir("render", render_ulid)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Snapshot the camera_path JSON next to the rendered video so the
+        # render is reproducible without depending on the original (mutable)
+        # file under the project's processed dir.
+        snapshot_name = "camera_path.json"
+        try:
+            shutil.copy2(cp, out_dir / snapshot_name)
+        except OSError as e:
+            QMessageBox.warning(
+                self, "Camera path snapshot failed",
+                f"Couldn't copy {cp} into {out_dir}:\n{e}\n\n"
+                "Render aborted.",
+            )
+            return
+
+        c_out_dir = wh.host_to_container_warehouse(out_dir)
+        c_out_path = f"{c_out_dir}/{payload_name}"
+        c_camera = wh.host_to_container_warehouse(out_dir / snapshot_name)
         c_config = run.container_config
-        c_camera = _host_to_container(cp)
-        c_out_dir = _host_to_container(out_dir) if out_dir.exists() \
-            else f"/workspace/renders/{out_dir.name}"
-        c_out_path = f"{c_out_dir}/{final_name}"
 
-        # ns-render writes straight to --output-path, so no tmp shuffle.
-        # We still mkdir -p in case this is the project's first render.
+        # ns-render writes straight to --output-path — no tmp shuffle needed.
         shell_cmd = (
             "set -e; "
-            f"mkdir -p {shlex.quote(c_out_dir)}; "
             "ns-render camera-path "
             f"--load-config {shlex.quote(c_config)} "
             f"--camera-path-filename {shlex.quote(c_camera)} "
@@ -737,6 +854,19 @@ class _Form(QWidget):
             f"--output-path {shlex.quote(c_out_path)}"
         )
 
+        params = RenderParams(
+            camera_path_filename=wh.to_warehouse_relpath(out_dir / snapshot_name),
+        )
+
+        self._stash_render_pending(
+            run=run,
+            render_ulid=render_ulid,
+            render_dir_path=out_dir,
+            payload_name=payload_name,
+            params=params,
+            command=display,
+        )
+
         self._jobs.start(JobSpec(
             kind="render",
             display_cmd=display,
@@ -746,6 +876,136 @@ class _Form(QWidget):
 
     def _on_cancel(self) -> None:
         self._jobs.cancel()
+
+    # ---- pending state (manifest write-ahead) ----
+    def _stash_export_pending(
+        self,
+        *,
+        run: _Run,
+        export_ulid: str,
+        export_dir_path: Path,
+        payload_name: str,
+        params: ExportParams,
+        command: str,
+    ) -> None:
+        self._clear_pending()
+        self._pending_run = run
+        self._pending_export_ulid = export_ulid
+        self._pending_export_dir = export_dir_path
+        self._pending_export_payload = payload_name
+        self._pending_export_params = params
+        self._pending_export_command = command
+        self._pending_start_time = datetime.now(timezone.utc)
+        self._pending_display_name = Path(payload_name).stem
+
+    def _stash_render_pending(
+        self,
+        *,
+        run: _Run,
+        render_ulid: str,
+        render_dir_path: Path,
+        payload_name: str,
+        params: RenderParams,
+        command: str,
+    ) -> None:
+        self._clear_pending()
+        self._pending_run = run
+        self._pending_render_ulid = render_ulid
+        self._pending_render_dir = render_dir_path
+        self._pending_render_payload = payload_name
+        self._pending_render_params = params
+        self._pending_render_command = command
+        self._pending_start_time = datetime.now(timezone.utc)
+        self._pending_display_name = Path(payload_name).stem
+
+    def _clear_pending(self) -> None:
+        self._pending_run = None
+        self._pending_export_ulid = None
+        self._pending_export_dir = None
+        self._pending_export_payload = None
+        self._pending_export_params = None
+        self._pending_export_command = None
+        self._pending_render_ulid = None
+        self._pending_render_dir = None
+        self._pending_render_payload = None
+        self._pending_render_params = None
+        self._pending_render_command = None
+        self._pending_start_time = None
+        self._pending_display_name = None
+
+    def _duration(self) -> float | None:
+        if self._pending_start_time is None:
+            return None
+        return (datetime.now(timezone.utc) - self._pending_start_time).total_seconds()
+
+    def _finalize_export(self) -> Path | None:
+        """Write the ExportManifest. Returns the on-disk payload path on
+        success, or None if a required pending field is missing."""
+        if (
+            self._pending_run is None
+            or self._pending_export_ulid is None
+            or self._pending_export_dir is None
+            or self._pending_export_payload is None
+            or self._pending_export_params is None
+            or self._pending_start_time is None
+        ):
+            return None
+        try:
+            wh.write_export_manifest(
+                output_dir=self._pending_export_dir,
+                run_id=self._pending_export_ulid,
+                parent_train_id=self._pending_run.train_run_id,
+                display_name=self._pending_display_name or self._pending_export_ulid,
+                params=self._pending_export_params,
+                command=self._pending_export_command or "",
+                duration_seconds=self._duration(),
+                start_time=self._pending_start_time,
+                payload_filename=self._pending_export_payload,
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Export manifest write failed",
+                f"ns-export succeeded but the ExportManifest couldn't be "
+                f"written:\n{e}\n\nThe .ply on disk is intact at\n"
+                f"{self._pending_export_dir}/{self._pending_export_payload}.",
+            )
+            return None
+        return self._pending_export_dir / self._pending_export_payload
+
+    def _finalize_render(self) -> Path | None:
+        if (
+            self._pending_run is None
+            or self._pending_render_ulid is None
+            or self._pending_render_dir is None
+            or self._pending_render_payload is None
+            or self._pending_render_params is None
+            or self._pending_start_time is None
+        ):
+            return None
+        try:
+            wh.write_render_manifest(
+                output_dir=self._pending_render_dir,
+                run_id=self._pending_render_ulid,
+                parent_train_id=self._pending_run.train_run_id,
+                display_name=self._pending_display_name or self._pending_render_ulid,
+                params=self._pending_render_params,
+                command=self._pending_render_command or "",
+                duration_seconds=self._duration(),
+                start_time=self._pending_start_time,
+                payload_filename=self._pending_render_payload,
+                extra_outputs={
+                    "camera_path": self._pending_render_params.camera_path_filename,
+                },
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Render manifest write failed",
+                f"ns-render succeeded but the RenderManifest couldn't be "
+                f"written:\n{e}\n\nThe .mp4 on disk is intact at\n"
+                f"{self._pending_render_dir}/{self._pending_render_payload}.",
+            )
+            return None
+        return self._pending_render_dir / self._pending_render_payload
 
     # ---- job signals ----
     def _wire_jobs(self) -> None:
@@ -783,16 +1043,26 @@ class _Form(QWidget):
         self._set_action_buttons_enabled(True)
         if kind is None:
             set_pill(self.status_pill, "Ready", "neutral")
+            self._clear_pending()
             return
         if code == 0:
             if kind == "export":
-                set_pill(self.status_pill, "Exported", "success")
+                payload = self._finalize_export()
+                if payload is not None:
+                    set_pill(self.status_pill, "Exported", "success")
+                else:
+                    set_pill(self.status_pill, "Exported · manifest skipped", "warning")
                 self._refresh_ply_target()
             else:  # render
-                set_pill(self.status_pill, "Rendered", "success")
+                payload = self._finalize_render()
+                if payload is not None:
+                    set_pill(self.status_pill, "Rendered", "success")
+                else:
+                    set_pill(self.status_pill, "Rendered · manifest skipped", "warning")
                 self._refresh_video_target()
         else:
             set_pill(self.status_pill, f"Failed · exit {code}", "error")
+        self._clear_pending()
 
     def _on_job_cancelled(self) -> None:
         kind = self._running_kind
@@ -803,6 +1073,7 @@ class _Form(QWidget):
             set_pill(self.status_pill, "Ready", "neutral")
         else:
             set_pill(self.status_pill, "Cancelled", "error")
+        self._clear_pending()
 
     def _on_job_failed(self, _msg: str) -> None:
         kind = self._running_kind
@@ -813,6 +1084,7 @@ class _Form(QWidget):
             set_pill(self.status_pill, "Ready", "neutral")
         else:
             set_pill(self.status_pill, "Failed to start", "error")
+        self._clear_pending()
 
 
 # ---------- top-level view ----------
@@ -871,7 +1143,7 @@ class ExportsView(QWidget):
             self.stack.addWidget(_EmptyState())
             return
 
-        runs = _discover_runs(active.id)
+        runs = _discover_runs(active)
         if not runs:
             gate = _NoRunsState(active)
             gate.request_train.connect(lambda: self.request_navigate.emit(2))

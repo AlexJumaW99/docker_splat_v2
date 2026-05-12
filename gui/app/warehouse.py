@@ -31,11 +31,13 @@ from app.config import (
 )
 from app.manifest import (
     ExportManifest,
+    ExportParams,
     Host,
     Parent,
     ProcessManifest,
     ProcessParams,
     RenderManifest,
+    RenderParams,
     SourceManifest,
     SourceParams,
     TrainManifest,
@@ -100,6 +102,30 @@ def run_dir(stage: str, run_id: str) -> Path:
     """Absolute host path to a single run's directory under the warehouse."""
 
     return stage_root(stage) / run_id
+
+
+# Output-type sub-folders under the "export" stage. ns-export's mesh
+# variants write directories of related files (mesh.ply + .obj + .mtl +
+# texture PNGs), so the export stage uses a two-level layout
+# (`exports/<kind>/<ULID>/`) where every export — regardless of kind —
+# is contained in its own ULID directory. The kind sub-level is the
+# user-facing separation requested for the warehouse.
+ExportKind = Literal["splat", "pcd", "mesh"]
+
+
+def export_dir(kind: ExportKind, run_id: str) -> Path:
+    """Absolute host path to one export run's directory under
+    `WAREHOUSE_DIR/exports/<kind>/<run_id>/`. Diverges from `run_dir()`
+    by interposing `<kind>/` so the on-disk tree is human-browsable and
+    a future mesh export's texture sidecars stay grouped with their ply."""
+
+    if kind not in ("splat", "pcd", "mesh"):
+        raise ValueError(
+            f"export kind must be one of splat|pcd|mesh, got {kind!r}"
+        )
+    parent = WAREHOUSE_DIR / _STAGE_DIRS["export"] / kind
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / run_id
 
 
 def to_warehouse_relpath(absolute: Path) -> str:
@@ -1111,6 +1137,144 @@ def backfill_train_manifest(train_dir: Path) -> TrainManifest:
     # The pending sidecar has now served its purpose — replace-then-remove
     # mirrors the success-handler contract.
     clear_pending_train(train_dir)
+    return manifest
+
+
+# ---------------------------------------------------------------- export manifest
+
+
+# Logical key used in the manifest's `outputs` map for each export kind's
+# primary payload .ply file. Consumers grep `outputs.splat_ply` /
+# `outputs.pcd_ply` / `outputs.mesh_ply` to locate the artifact without
+# scanning the directory.
+_EXPORT_PAYLOAD_KEY: dict[str, str] = {
+    "splat": "splat_ply",
+    "pcd":   "pcd_ply",
+    "mesh":  "mesh_ply",
+}
+
+
+def write_export_manifest(
+    *,
+    output_dir: Path,
+    run_id: str,
+    parent_train_id: str,
+    display_name: str,
+    params: ExportParams,
+    command: str,
+    duration_seconds: float | None,
+    start_time: datetime,
+    payload_filename: str,
+) -> ExportManifest:
+    """Build + persist an ExportManifest at `output_dir/manifest.json`.
+
+    `output_dir` is the absolute host path returned by `export_dir()`
+    (`data_v2/exports/<kind>/<run_id>/`). The exporter has just written
+    `<payload_filename>` there — `splat.ply` for `ns-export gaussian-splat`,
+    `point_cloud.ply` / `poisson_mesh.ply` / `mesh.obj` / etc. for the NeRF
+    exporters. Any additional files in the directory are recorded as
+    `sidecar:<basename>` outputs so mesh-export texture atlases come along
+    for the ride. The manifest is written last, atomically, so its
+    presence is the canonical "this export succeeded" signal.
+    """
+
+    output_dir = Path(output_dir)
+    outputs: dict[str, str] = {}
+    checksums: dict[str, str] = {}
+
+    payload = output_dir / payload_filename
+    payload_key = _EXPORT_PAYLOAD_KEY[params.kind]
+    if payload.is_file():
+        outputs[payload_key] = to_warehouse_relpath(payload)
+        checksums[outputs[payload_key]] = sha256_file(payload)
+
+    # Pick up any sidecar files (texture atlas, .obj/.mtl, point-cloud helper).
+    # Skips the payload itself (recorded above), the manifest we're about to
+    # write, and any leftover tmp files. Sorted for deterministic output.
+    for p in sorted(output_dir.iterdir()):
+        if not p.is_file():
+            continue
+        if p.name in (payload_filename, "manifest.json"):
+            continue
+        if p.name.endswith(".tmp"):
+            continue
+        outputs[f"sidecar:{p.name}"] = to_warehouse_relpath(p)
+
+    metrics: dict[str, float] = {}
+    if duration_seconds is not None:
+        metrics["export_duration_seconds"] = float(duration_seconds)
+    if payload.is_file():
+        metrics["payload_size_bytes"] = float(payload.stat().st_size)
+
+    manifest = ExportManifest(
+        run_id=run_id,
+        parent=Parent(stage="train", run_id=parent_train_id),
+        display_name=display_name,
+        created_at=start_time,
+        host=host_info(),
+        command=command,
+        params=params,
+        outputs=outputs,
+        metrics=metrics,
+        checksums=checksums,
+    )
+    dump_manifest(manifest, output_dir / "manifest.json")
+    return manifest
+
+
+# ---------------------------------------------------------------- render manifest
+
+
+def write_render_manifest(
+    *,
+    output_dir: Path,
+    run_id: str,
+    parent_train_id: str,
+    display_name: str,
+    params: RenderParams,
+    command: str,
+    duration_seconds: float | None,
+    start_time: datetime,
+    payload_filename: str,
+    extra_outputs: dict[str, str] | None = None,
+) -> RenderManifest:
+    """Build + persist a RenderManifest at `output_dir/manifest.json`.
+
+    `output_dir` is the absolute host path to the render run's folder
+    under `data_v2/renders/<run_id>/`. `payload_filename` is whatever
+    name `ns-render` wrote (typically `render.mp4` or the user-supplied
+    stem). `extra_outputs` is a logical-name → relpath dict for files
+    the caller pre-staged into `output_dir` before the job ran (most
+    commonly a snapshot of the camera_path.json used)."""
+
+    output_dir = Path(output_dir)
+    outputs: dict[str, str] = dict(extra_outputs or {})
+    checksums: dict[str, str] = {}
+
+    payload = output_dir / payload_filename
+    if payload.is_file():
+        outputs["video"] = to_warehouse_relpath(payload)
+        checksums[outputs["video"]] = sha256_file(payload)
+
+    metrics: dict[str, float] = {}
+    if duration_seconds is not None:
+        metrics["render_duration_seconds"] = float(duration_seconds)
+    if payload.is_file():
+        metrics["payload_size_bytes"] = float(payload.stat().st_size)
+
+    manifest = RenderManifest(
+        run_id=run_id,
+        parent=Parent(stage="train", run_id=parent_train_id),
+        display_name=display_name,
+        created_at=start_time,
+        host=host_info(),
+        command=command,
+        params=params,
+        outputs=outputs,
+        metrics=metrics,
+        checksums=checksums,
+    )
+    dump_manifest(manifest, output_dir / "manifest.json")
     return manifest
 
 

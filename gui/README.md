@@ -21,7 +21,7 @@ First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif
 | Dashboard | live     | Polls the Docker daemon, `splat-ns-v2` container, and GPU (via `nvidia-smi`). Shows the exact `docker build` / `docker create` commands if the container is missing, with copy buttons — never runs them for you. |
 | Process   | live     | Form-driven `ns-process-data` (video or images). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF (iPhone) to max-quality JPEG with EXIF preserved; originals stashed in `heic_originals/`. |
 | Train     | live     | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle, advanced raw-flag passthrough. Detects when the viser port becomes live and deep-links to `http://localhost:7007`. |
-| Exports   | live     | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (MP4 from viser keyframe JSON). Writes to `data/exports/splat/` and `data/renders/<project>/`; auto-suffixes on filename collisions so repeat exports never overwrite. |
+| Exports   | live     | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (MP4 from viser keyframe JSON). Each artifact lands in its own ULID directory under the warehouse — `data_v2/exports/splat/<EXPORT_ULID>/` for splats, `data_v2/renders/<RENDER_ULID>/` for videos — with a `manifest.json` whose `parent.run_id` is the train ULID. Collisions are impossible by construction. `mesh/` and `pointcloud/` sub-folders are reserved by the layout but not wired: `ns-export poisson / tsdf / marching-cubes / pointcloud` all require the volumetric-NeRF model interface, which `SplatfactoModel` doesn't implement. |
 | Viewers   | live     | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
 | Runs      | stub     | Placeholder for a training-run browser over `data/outputs/`.                                                                                 |
 
@@ -48,16 +48,18 @@ to `~/.config/docker_splat_v2_gui/projects.json`.
 
 ## Lineage & manifests
 
-Process and Train runs write into the ULID-keyed warehouse at
-`~/docker-stacks/docker_splat_v2/data_v2/` (bind-mounted into the container
-at `/warehouse/`). Each run carries a `manifest.json` declaring its
-upstream parent run, so a `.ckpt` traces back to its source video through
-three file reads with no tooling required:
+Process, Train, Export, and Render runs all write into the ULID-keyed
+warehouse at `~/docker-stacks/docker_splat_v2/data_v2/` (bind-mounted into
+the container at `/warehouse/`). Each run carries a `manifest.json`
+declaring its upstream parent run, so a `.ply` (or `.mp4`) traces back to
+its source video through four file reads with no tooling required:
 
 ```
-data_v2/sources/<source_ULID>/manifest.json     # stage=source, parent=null
-data_v2/processed/<process_ULID>/manifest.json  # stage=process, parent.run_id=<source_ULID>
-data_v2/trained/<train_ULID>/manifest.json      # stage=train,   parent.run_id=<process_ULID>
+data_v2/sources/<source_ULID>/manifest.json              # stage=source,  parent=null
+data_v2/processed/<process_ULID>/manifest.json           # stage=process, parent.run_id=<source_ULID>
+data_v2/trained/<train_ULID>/manifest.json               # stage=train,   parent.run_id=<process_ULID>
+data_v2/exports/<kind>/<export_ULID>/manifest.json       # stage=export,  parent.run_id=<train_ULID>   (kind: splat | pcd | mesh)
+data_v2/renders/<render_ULID>/manifest.json              # stage=render,  parent.run_id=<train_ULID>
 ```
 
 The schema (Pydantic v2 + JSON Schema Draft 2020-12, frozen at v1.0) lives
