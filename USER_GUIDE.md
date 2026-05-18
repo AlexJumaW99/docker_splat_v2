@@ -555,8 +555,8 @@ Columns: step, iteration time, remaining time estimate, gaussian count. The gaus
 | `splatfacto` | Default — balanced quality and speed. Good starting point for most videos. |
 | `splatfacto-big` | Larger gaussian capacity. Use for detailed scenes where the default caps out. Slower and hungrier on VRAM. |
 | `splatfacto-mcmc` | MCMC-based densification. More stable gaussian counts; sometimes cleaner results on sparse-view scenes. Requires the git-pinned nerfstudio from Stage 5. |
-| `splatfacto-w` | ["In the wild" splatfacto](https://github.com/KevinXu02/splatfacto-w) — handles scenes with transient occluders and varying appearance/lighting across captures. Good for outdoor or crowd-tourism-style datasets. |
-| `splatfacto-w-light` | Lighter-weight variant of `splatfacto-w` with a smaller appearance MLP. Faster and less VRAM-hungry; trade-off is appearance modeling fidelity. |
+| `splatfacto-w` | ["In the wild" splatfacto](https://github.com/KevinXu02/splatfacto-w) — handles scenes with transient occluders and varying appearance/lighting across captures. Good for outdoor or crowd-tourism-style datasets. The image ships a patched `nerfw_dataparser.py` that fixes upstream's hardcoded phototourism paths so splatfacto-w works with any COLMAP-processed dataset (not just phototourism). Also patched for gsplat 1.5.3 compatibility (radii shape change). |
+| `splatfacto-w-light` | Lighter-weight variant of `splatfacto-w` with a smaller appearance MLP. Faster and less VRAM-hungry; trade-off is appearance modeling fidelity. Uses nerfstudio's standard `NerfstudioDataParser`, so it is unaffected by the NerfW dataparser patches. |
 
 Swap the first positional argument of `ns-train` to pick one (e.g. `ns-train splatfacto-big --data …`).
 
@@ -630,6 +630,24 @@ ns-train splatfacto \
 ```
 
 The `colmap` subcommand and its `--colmap-path` flag must come **after** all the `ns-train` method flags. Argument order matters to tyro.
+
+### CLI recipe — splatfacto-w with a COLMAP folder
+
+`splatfacto-w` uses its own `splatfactow_dataparser` (not the built-in `colmap` dataparser), so the subcommand name changes:
+
+```bash
+ns-train splatfacto-w \
+  --data /workspace/processed/ballroom_splat \
+  --output-dir /workspace/outputs \
+  --max-num-iterations 7000 \
+  --vis viewer+tensorboard \
+  --viewer.websocket-host 0.0.0.0 \
+  --viewer.quit-on-train-completion False \
+  splatfactow_dataparser \
+  --colmap-path colmap/sparse/0
+```
+
+Note the subcommand is `splatfactow_dataparser` (not `colmap`). The `--colmap-path` flag is the same — a relative path under `--data` pointing at the COLMAP sparse model directory. The GUI's Train tab handles this automatically. `splatfacto-w-light` does **not** need this — it uses the standard nerfstudio dataparser.
 
 ### Via the GUI
 
@@ -939,6 +957,12 @@ If you still see a 2-frame `transforms.json`:
 3. Inspect `/workspace/processed/<run>/colmap/sparse/` — you should see multiple numeric subfolders. `colmap model_analyzer --path /workspace/processed/<run>/colmap/sparse/0` should report a large `Registered images` count.
 4. As a last resort, rerun `ns-process-data` with `--skip-colmap --colmap-model-path sparse/<N>` pointing at the real submap.
 
+### `splatfacto-w` fails with `FileNotFoundError: dense/sparse/cameras.bin`
+
+Cause: you're running an image without the NerfW dataparser patch. Upstream `splatfactow/nerfw_dataparser.py` hardcodes phototourism-specific paths (`dense/sparse/`, `dense/images/`), asserts PINHOLE cameras only, and requires a TSV split file — none of which exist in a standard `ns-process-data` output.
+
+Fix: already patched in the v4.4 Dockerfile. If you see this, your image was built from a pre-v4.4 Dockerfile. Rebuild with `docker build --target nerfstudio -t splat-nerfstudio-v2 .` and recreate the container. Also ensure the GUI's Train tab (or your CLI invocation) uses the `splatfactow_dataparser --colmap-path <rel>` subcommand, not `--pipeline.datamanager.dataparser.colmap-path`.
+
 ### "Aborted (core dumped)" at the end of training
 
 Observed occasionally on first-ever training run in a fresh container, specifically at Python process shutdown after the `🎉 Training Finished 🎉` banner. Training completed successfully and all data was written to disk before the crash — checkpoint and TensorBoard logs are intact. Does not reproduce on subsequent runs in the same container. Likely related to first-run JIT compilation timing. Not a blocker; if it happens on a run, simply re-run — subsequent runs are clean.
@@ -1006,6 +1030,17 @@ ns-train splatfacto \
   --vis viewer+tensorboard \
   --viewer.websocket-host 0.0.0.0 \
   --viewer.quit-on-train-completion False
+
+# Train splatfacto-w (uses its own dataparser subcommand)
+ns-train splatfacto-w \
+  --data /workspace/processed/yourvideo_splat \
+  --output-dir /workspace/outputs \
+  --max-num-iterations 7000 \
+  --vis viewer+tensorboard \
+  --viewer.websocket-host 0.0.0.0 \
+  --viewer.quit-on-train-completion False \
+  splatfactow_dataparser \
+  --colmap-path colmap/sparse/0
 
 # Launch TensorBoard in a second shell
 tensorboard --logdir /workspace/outputs --bind_all --port 6006

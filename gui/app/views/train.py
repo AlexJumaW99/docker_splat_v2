@@ -25,7 +25,7 @@ from app import docker_service as dock
 from app import warehouse as wh
 from app.config import CONTAINER_NAME, VISER_PORT, WAREHOUSE_DIR
 from app.jobs import JobManager, JobSpec
-from app.store import Project, ProjectStore, source_kind
+from app.store import Project, ProjectStore, detect_colmap_path, source_kind
 from app.widgets import HelpBadge, ProjectBar, card, labeled, pill, section_title, set_pill
 
 
@@ -126,6 +126,7 @@ METHODS = [
     "splatfacto-w", "splatfacto-w-light",
 ]
 VIS_MODES = ["viewer+tensorboard", "viewer", "tensorboard"]
+_SPLATFACTOW_METHODS = frozenset({"splatfacto-w", "splatfacto-w-light"})
 
 
 # nerfstudio prints a rich Panel with "🎉 Training Finished 🎉" in the title
@@ -817,7 +818,16 @@ class _Form(QWidget):
             # it. The default (nerfstudio-data) is implicit when omitted, so
             # we only emit non-default names to keep the generated command
             # minimal.
-            if self._project.dataparser == "colmap":
+            if params["method"] in _SPLATFACTOW_METHODS:
+                # splatfacto-w's registered default is NerfWDataParser whose
+                # colmap_path defaults to "dense/sparse". Override via the
+                # splatfactow_dataparser subcommand so it finds our layout.
+                cp = detect_colmap_path(Path(self._project.processed_dir))
+                if cp:
+                    argv.extend([
+                        "splatfactow_dataparser", "--colmap-path", cp,
+                    ])
+            elif self._project.dataparser == "colmap":
                 argv.append("colmap")
                 # Always forward the stored path rather than relying on
                 # ColmapDataParserConfig's default ("colmap/sparse/0"), which

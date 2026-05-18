@@ -204,6 +204,21 @@ ARG SPLATFACTOW_COMMIT=119a3bfb3aa03669278e174ff11c4dfdcbcf97d7
 RUN pip install --no-cache-dir --no-deps \
         "splatfacto-w @ git+https://github.com/KevinXu02/splatfacto-w.git@${SPLATFACTOW_COMMIT}"
 
+# v4.4: patched NerfW dataparser. Upstream hardcodes phototourism-only paths
+# (dense/sparse, dense/images, PINHOLE assertion, mandatory TSV split file).
+# Our overlay uses config.colmap_path, auto-detects images dir, accepts
+# OPENCV cameras, and falls back to fraction-based eval split when no TSV
+# exists — so splatfacto-w works with standard COLMAP/nerfstudio layouts.
+COPY image_bin/nerfw_dataparser.py \
+     /usr/local/lib/python3.12/dist-packages/splatfactow/nerfw_dataparser.py
+
+# v4.4b: gsplat 1.5.3 returns radii as [C, N, 2] (per-axis); splatfactow's
+# custom densification expects [N]. Collapse with amax so visible_mask
+# and max_2Dsize indexing stay consistent.
+RUN sed -i \
+        's|self\.radii = info\["radii"\]\[0\]  # \[N\]|self.radii = info["radii"][0].amax(dim=-1)  # [N] — gsplat >=1.5 returns [N,2]|' \
+        /usr/local/lib/python3.12/dist-packages/splatfactow/splatfactow_model.py
+
 # v4.1: splatfacto-w-aware .ply exporter. Upstream `ns-export gaussian-splat`
 # hard-asserts `isinstance(pipeline.model, SplatfactoModel)`; SplatfactoWModel
 # inherits from Model directly, and splatfacto-w stores SH coefficients as an
