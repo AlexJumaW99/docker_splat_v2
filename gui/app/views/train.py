@@ -177,6 +177,17 @@ def _dataset_meta_text(project: Project) -> str:
 
 
 def _count_frames(processed_dir: str) -> int | None:
+    from app.manifest import ProcessManifest, load_manifest
+    manifest_path = Path(processed_dir) / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            m = load_manifest(manifest_path)
+            if isinstance(m, ProcessManifest):
+                count = m.metrics.get("extracted_frame_count")
+                if count is not None:
+                    return int(count)
+        except Exception:
+            pass
     images = Path(processed_dir) / "images"
     if not images.is_dir():
         return None

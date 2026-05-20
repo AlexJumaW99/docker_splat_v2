@@ -684,11 +684,23 @@ class DeleteProjectDialog(QDialog):
         if self.confirm_edit.text().strip() != self._project.name:
             return
         try:
-            self._store.delete(
+            failed = self._store.delete(
                 self._project.id,
                 delete_data=self.data_cb.isChecked(),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Delete failed", str(e))
             return
+        if failed:
+            paths = "\n".join(str(p) for p in failed)
+            QMessageBox.warning(
+                self,
+                "Some files could not be deleted",
+                "The following directories are owned by the Docker container "
+                "and could not be removed (is the container running?):\n\n"
+                f"{paths}\n\n"
+                "Start the container and delete the project again, or remove "
+                "them manually with:\n"
+                f"  sudo rm -rf {' '.join(str(p) for p in failed)}",
+            )
         self.accept()

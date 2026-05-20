@@ -33,6 +33,7 @@ from app.manifest import (
     ExportManifest,
     ExportParams,
     Host,
+    Manifest,
     Parent,
     ProcessManifest,
     ProcessParams,
@@ -44,9 +45,19 @@ from app.manifest import (
     TrainParams,
     ULID_PATTERN,
     _MANIFEST_ADAPTER,
-    dump_manifest,
+    dump_manifest as _raw_dump_manifest,
     load_manifest,
 )
+
+
+# ---------------------------------------------------------------- index-aware manifest write
+
+
+def dump_manifest(manifest: Manifest, path: str | Path) -> None:
+    """Write a manifest atomically, then refresh the in-memory index."""
+    _raw_dump_manifest(manifest, path)
+    from app.manifest_index import get_index
+    get_index().refresh()
 
 
 # ---------------------------------------------------------------- constants
@@ -248,32 +259,40 @@ def host_info(refresh: bool = False) -> Host:
     return host
 
 
+# ---------------------------------------------------------------- parent validation
+
+
+def _validate_parent_exists(parent_stage: str, parent_run_id: str) -> None:
+    """Verify the parent run's manifest.json exists on disk. Raises
+    FileNotFoundError with a clear message if the lineage target is missing."""
+
+    if parent_stage == "export":
+        # Exports use a two-level layout; check all kind subdirs.
+        exports_root = WAREHOUSE_DIR / _STAGE_DIRS["export"]
+        if exports_root.is_dir():
+            for kind_dir in exports_root.iterdir():
+                candidate = kind_dir / parent_run_id / "manifest.json"
+                if candidate.is_file():
+                    return
+    else:
+        parent_dir = run_dir(parent_stage, parent_run_id)
+        if (parent_dir / "manifest.json").is_file():
+            return
+    raise FileNotFoundError(
+        f"Parent {parent_stage}/{parent_run_id} has no manifest.json. "
+        f"Refusing to write a child manifest with a broken lineage pointer."
+    )
+
+
 # ---------------------------------------------------------------- source lookup
 
 
 def find_source_by_checksum(checksum: str) -> SourceManifest | None:
-    """Scan data_v2/sources/*/manifest.json for an existing SourceManifest
-    whose checksum dict contains the given value. Returns None if not found.
-    Linear in the number of registered sources — fine for the foreseeable
-    future; promote to a catalog.db lookup when this list grows beyond a
-    few hundred."""
+    """Look up a source by SHA-256 checksum via the ManifestIndex.
+    Returns the existing SourceManifest if found, None otherwise."""
 
-    root = WAREHOUSE_DIR / _STAGE_DIRS["source"]
-    if not root.is_dir():
-        return None
-    for sub in root.iterdir():
-        manifest_path = sub / "manifest.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            m = load_manifest(manifest_path)
-        except Exception:
-            continue
-        if m.stage != "source":
-            continue
-        if checksum in m.checksums.values():
-            return m
-    return None
+    from app.manifest_index import get_index
+    return get_index().source_by_checksum(checksum)
 
 
 def _copy_source_file(src: Path, dst_dir: Path) -> Path:
@@ -466,6 +485,8 @@ def write_process_manifest(
     dump_manifest), so its presence is the canonical "this run succeeded"
     signal.
     """
+
+    _validate_parent_exists("source", parent_source_id)
 
     metrics = collect_process_metrics(output_dir)
     if duration_seconds is not None:
@@ -707,6 +728,8 @@ def write_train_manifest(
     Atomic via .tmp + rename (dump_manifest) — manifest presence is the
     canonical "this run succeeded" marker.
     """
+
+    _validate_parent_exists("process", parent_process_id)
 
     nested = find_train_run_subdir(output_dir)
     latest_ckpt = find_latest_checkpoint(nested) if nested is not None else None
@@ -1178,6 +1201,8 @@ def write_export_manifest(
     presence is the canonical "this export succeeded" signal.
     """
 
+    _validate_parent_exists("train", parent_train_id)
+
     output_dir = Path(output_dir)
     outputs: dict[str, str] = {}
     checksums: dict[str, str] = {}
@@ -1247,6 +1272,8 @@ def write_render_manifest(
     the caller pre-staged into `output_dir` before the job ran (most
     commonly a snapshot of the camera_path.json used)."""
 
+    _validate_parent_exists("train", parent_train_id)
+
     output_dir = Path(output_dir)
     outputs: dict[str, str] = dict(extra_outputs or {})
     checksums: dict[str, str] = {}
@@ -1276,6 +1303,59 @@ def write_render_manifest(
     )
     dump_manifest(manifest, output_dir / "manifest.json")
     return manifest
+
+
+# ---------------------------------------------------------------- stale pending detection
+
+
+def find_stale_pending(max_age_hours: float = 24.0) -> list[Path]:
+    """Return train dirs with pending.json but no manifest.json, older
+    than *max_age_hours*. These are abandoned runs that can be backfilled
+    or cleaned up."""
+
+    trained_root = WAREHOUSE_DIR / "trained"
+    if not trained_root.is_dir():
+        return []
+    stale: list[Path] = []
+    cutoff = time.time() - (max_age_hours * 3600)
+    for sub in trained_root.iterdir():
+        if not sub.is_dir():
+            continue
+        pending = sub / PENDING_FILENAME
+        manifest = sub / "manifest.json"
+        if pending.is_file() and not manifest.is_file():
+            try:
+                if pending.stat().st_mtime < cutoff:
+                    stale.append(sub)
+            except OSError:
+                continue
+    return sorted(stale)
+
+
+# ---------------------------------------------------------------- checksum verification
+
+
+def verify_manifest_checksums(
+    manifest: "Manifest",
+    warehouse_dir: Path = WAREHOUSE_DIR,
+) -> list[tuple[str, str, str]]:
+    """Verify all checksums in a manifest. Returns a list of
+    (relpath, expected, actual) tuples for mismatches. Empty = all OK.
+
+    Not called automatically — hashing a multi-GB checkpoint is too
+    expensive for routine reads. Exposed as a CLI subcommand and as
+    a pre-export integrity check."""
+
+    mismatches: list[tuple[str, str, str]] = []
+    for relpath, expected in manifest.checksums.items():
+        full = warehouse_dir / relpath
+        if not full.is_file():
+            mismatches.append((relpath, expected, "MISSING"))
+            continue
+        actual = sha256_file(full)
+        if actual != expected:
+            mismatches.append((relpath, expected, actual))
+    return mismatches
 
 
 # ---------------------------------------------------------------- CLI
@@ -1309,17 +1389,81 @@ def _cli_backfill_train(argv: list[str]) -> int:
     return rc
 
 
+def _cli_verify(argv: list[str]) -> int:
+    """Verify checksums for one or more manifest.json files."""
+    if not argv:
+        print("usage: python -m app.warehouse verify <manifest.json> [...]")
+        return 2
+    rc = 0
+    for raw in argv:
+        mf = Path(raw).resolve()
+        try:
+            m = load_manifest(mf)
+        except Exception as e:
+            print(f"FAILED  {mf}: {e!r}")
+            rc = 1
+            continue
+        mismatches = verify_manifest_checksums(m)
+        if mismatches:
+            rc = 1
+            for relpath, expected, actual in mismatches:
+                print(f"MISMATCH  {relpath}  expected={expected}  actual={actual}")
+        else:
+            n = len(m.checksums)
+            print(f"OK  {mf}  ({n} checksum(s) verified)")
+    return rc
+
+
+def _cli_stale_pending(_argv: list[str]) -> int:
+    """List stale pending.json files (no manifest, >24h old)."""
+    stale = find_stale_pending()
+    if not stale:
+        print("No stale pending runs found.")
+        return 0
+    print(f"Found {len(stale)} stale pending run(s):")
+    for d in stale:
+        pending = load_pending_train(d)
+        label = pending.display_name if pending else "?"
+        print(f"  {d.name}  ({label})")
+    return 0
+
+
+def _cli_orphans(_argv: list[str]) -> int:
+    """List manifests whose parent.run_id doesn't resolve."""
+    from app.manifest_index import get_index
+    orphans = get_index().orphans()
+    if not orphans:
+        print("No orphaned manifests found. Warehouse is clean.")
+        return 0
+    print(f"Found {len(orphans)} orphan(s):")
+    for m in orphans:
+        parent = m.parent if hasattr(m, "parent") and m.parent else None
+        pid = f"{parent.stage}/{parent.run_id}" if parent else "?"
+        print(f"  {m.stage}/{m.run_id}  parent={pid}  (MISSING)")
+    return 1
+
+
 if __name__ == "__main__":
-    # Tiny dispatcher — keeps the surface small. Add subcommands here as new
-    # one-shot operations show up (e.g. catalog-rebuild, lineage-trace).
     import sys
-    if len(sys.argv) >= 2 and sys.argv[1] == "backfill-train":
-        sys.exit(_cli_backfill_train(sys.argv[2:]))
+    cmds = {
+        "backfill-train": _cli_backfill_train,
+        "verify": _cli_verify,
+        "stale-pending": _cli_stale_pending,
+        "orphans": _cli_orphans,
+    }
+    if len(sys.argv) >= 2 and sys.argv[1] in cmds:
+        sys.exit(cmds[sys.argv[1]](sys.argv[2:]))
     print(
         "usage: python -m app.warehouse <command> [args]\n\n"
         "commands:\n"
         "  backfill-train <train_dir> [<train_dir> ...]\n"
         "      Reconstruct manifest.json for an orphan run from its config.yml\n"
-        "      and (optionally) pending.json. provenance=\"backfilled\"."
+        "      and (optionally) pending.json. provenance=\"backfilled\".\n"
+        "  verify <manifest.json> [...]\n"
+        "      Verify SHA-256 checksums recorded in one or more manifests.\n"
+        "  stale-pending\n"
+        "      List train runs with pending.json but no manifest (>24h old).\n"
+        "  orphans\n"
+        "      List manifests whose parent.run_id doesn't resolve."
     )
     sys.exit(2)

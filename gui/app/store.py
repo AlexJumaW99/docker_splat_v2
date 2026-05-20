@@ -24,13 +24,14 @@ from PySide6.QtCore import QObject, Signal
 from pydantic import BaseModel, Field
 
 from app import warehouse as wh
-from app.config import DATA_DIR, PROJECTS_FILE, WAREHOUSE_DIR
-from app.manifest import (
-    ExportManifest,
-    RenderManifest,
-    TrainManifest,
-    load_manifest,
+from app.config import (
+    CONTAINER_WAREHOUSE,
+    CONTAINER_WORKSPACE,
+    DATA_DIR,
+    PROJECTS_FILE,
+    WAREHOUSE_DIR,
 )
+from app.manifest_index import get_index
 from app.paths import unique_path
 
 
@@ -250,12 +251,19 @@ def _fmt_size(n: int) -> str:
 
 
 def _host_to_container(path: Path) -> str | None:
-    """Map a host path to its /workspace equivalent, or None if outside DATA_DIR."""
+    """Map a host path to its container equivalent, or None if outside both
+    DATA_DIR (/workspace) and WAREHOUSE_DIR (/warehouse)."""
+    resolved = path.resolve()
     try:
-        rel = path.resolve().relative_to(DATA_DIR.resolve())
+        rel = resolved.relative_to(WAREHOUSE_DIR.resolve())
+        return f"{CONTAINER_WAREHOUSE}/{rel.as_posix()}"
+    except ValueError:
+        pass
+    try:
+        rel = resolved.relative_to(DATA_DIR.resolve())
+        return f"{CONTAINER_WORKSPACE}/{rel.as_posix()}"
     except ValueError:
         return None
-    return f"/workspace/{rel.as_posix()}"
 
 
 def _docker_rm(container_path: str) -> bool:
@@ -275,19 +283,24 @@ def _docker_rm(container_path: str) -> bool:
         return False
 
 
-def _rm_tree(path: Path) -> None:
-    """Remove a directory, using docker exec for root-owned files."""
+def _rm_tree(path: Path) -> bool:
+    """Remove a directory, using docker exec for root-owned files.
+
+    Returns True if the directory was successfully removed (or didn't exist).
+    """
     if not path.is_dir():
-        return
+        return True
     c_path = _host_to_container(path)
     if c_path and _docker_rm(c_path):
         _log.info("deleted (via container): %s", path)
-        return
+        return True
     try:
         shutil.rmtree(path)
         _log.info("deleted: %s", path)
+        return True
     except OSError as e:
         _log.warning("failed to delete %s: %s", path, e)
+        return False
 
 
 def _rm_file(path: Path) -> None:
@@ -324,6 +337,7 @@ class ProjectDataScan:
     warehouse_train_dirs: list[Path] = field(default_factory=list)
     warehouse_export_dirs: list[Path] = field(default_factory=list)
     warehouse_render_dirs: list[Path] = field(default_factory=list)
+    warehouse_source_dirs: list[Path] = field(default_factory=list)
     total_bytes: int = 0
 
     @property
@@ -331,7 +345,7 @@ class ProjectDataScan:
         return bool(
             self.processed_dirs or self.outputs_dir or self.render_dirs
             or self.warehouse_train_dirs or self.warehouse_export_dirs
-            or self.warehouse_render_dirs
+            or self.warehouse_render_dirs or self.warehouse_source_dirs
         )
 
     def summary_lines(self) -> list[str]:
@@ -366,6 +380,11 @@ class ProjectDataScan:
                 f"Warehouse renders ({len(self.warehouse_render_dirs)}): "
                 + ", ".join(p.name[:8] + "…" for p in self.warehouse_render_dirs)
             )
+        if self.warehouse_source_dirs:
+            lines.append(
+                f"Warehouse sources ({len(self.warehouse_source_dirs)}): "
+                + ", ".join(p.name[:8] + "…" for p in self.warehouse_source_dirs)
+            )
         if self.total_bytes:
             lines.append(f"Total size: {_fmt_size(self.total_bytes)}")
         return lines
@@ -386,24 +405,7 @@ def _project_warehouse_train_ulids(project: Project) -> set[str]:
     if not re.fullmatch(wh.ULID_PATTERN, processed_ulid):
         return set()
 
-    trained_root = WAREHOUSE_DIR / "trained"
-    if not trained_root.is_dir():
-        return set()
-
-    ulids: set[str] = set()
-    for sub in trained_root.iterdir():
-        mf = sub / "manifest.json"
-        if not mf.is_file():
-            continue
-        try:
-            m = load_manifest(mf)
-        except Exception:
-            continue
-        if not isinstance(m, TrainManifest):
-            continue
-        if m.parent is not None and m.parent.run_id == processed_ulid:
-            ulids.add(m.run_id)
-    return ulids
+    return {m.run_id for m in get_index().trains_for_process(processed_ulid)}
 
 
 def scan_project_data(project: Project) -> ProjectDataScan:
@@ -455,42 +457,48 @@ def scan_project_data(project: Project) -> ProjectDataScan:
             WAREHOUSE_DIR / "trained" / tid for tid in train_ulids
         )
 
-    # -- warehouse exports (any kind) whose parent.run_id is in train_ulids --
-    exports_root = WAREHOUSE_DIR / "exports"
-    if exports_root.is_dir() and train_ulids:
-        for kind_dir in exports_root.iterdir():
-            if not kind_dir.is_dir():
-                continue
-            for sub in kind_dir.iterdir():
-                mf = sub / "manifest.json"
-                if not mf.is_file():
-                    continue
-                try:
-                    m = load_manifest(mf)
-                except Exception:
-                    continue
-                if not isinstance(m, ExportManifest):
-                    continue
-                if m.parent is not None and m.parent.run_id in train_ulids:
-                    scan.warehouse_export_dirs.append(sub)
+    # -- warehouse exports + renders via ManifestIndex --
+    if train_ulids:
+        idx = get_index()
+        from app.manifest import ExportManifest, RenderManifest
+        for tid in train_ulids:
+            for em in idx.exports_for_train(tid):
+                kind = em.params.kind
+                d = WAREHOUSE_DIR / "exports" / kind / em.run_id
+                if d.is_dir():
+                    scan.warehouse_export_dirs.append(d)
+            for rm in idx.renders_for_train(tid):
+                d = WAREHOUSE_DIR / "renders" / rm.run_id
+                if d.is_dir():
+                    scan.warehouse_render_dirs.append(d)
         scan.warehouse_export_dirs.sort()
-
-    # -- warehouse renders whose parent.run_id is in train_ulids --
-    renders_root = WAREHOUSE_DIR / "renders"
-    if renders_root.is_dir() and train_ulids:
-        for sub in renders_root.iterdir():
-            mf = sub / "manifest.json"
-            if not mf.is_file():
-                continue
-            try:
-                m = load_manifest(mf)
-            except Exception:
-                continue
-            if not isinstance(m, RenderManifest):
-                continue
-            if m.parent is not None and m.parent.run_id in train_ulids:
-                scan.warehouse_render_dirs.append(sub)
         scan.warehouse_render_dirs.sort()
+
+    # -- warehouse source dirs (the copied video/images in data_v2/sources/) --
+    # Trace from processed → source via parent pointer.  Only include the
+    # source dir when no *other* processed manifest also references it (the
+    # warehouse deduplicates sources by SHA-256, so two projects using the
+    # same video share one source ULID).
+    processed = Path(project.processed_dir).resolve()
+    try:
+        processed.relative_to(WAREHOUSE_DIR.resolve())
+        processed_ulid = processed.name
+    except ValueError:
+        processed_ulid = None
+    if processed_ulid and re.fullmatch(wh.ULID_PATTERN, processed_ulid):
+        idx = get_index()
+        from app.manifest import ProcessManifest
+        proc_manifest = idx.get(processed_ulid)
+        if isinstance(proc_manifest, ProcessManifest):
+            source_ulid = proc_manifest.parent.run_id
+            other_refs = [
+                m for m in idx.children_of(source_ulid)
+                if isinstance(m, ProcessManifest) and m.run_id != processed_ulid
+            ]
+            if not other_refs:
+                src_dir = WAREHOUSE_DIR / "sources" / source_ulid
+                if src_dir.is_dir():
+                    scan.warehouse_source_dirs.append(src_dir)
 
     # -- total size --
     total = 0
@@ -505,6 +513,8 @@ def scan_project_data(project: Project) -> ProjectDataScan:
     for d in scan.warehouse_export_dirs:
         total += _dir_size(d)
     for d in scan.warehouse_render_dirs:
+        total += _dir_size(d)
+    for d in scan.warehouse_source_dirs:
         total += _dir_size(d)
     scan.total_bytes = total
 
@@ -819,18 +829,24 @@ class ProjectStore(QObject):
         store[name] = params
         self._save()
 
-    def delete(self, project_id: str, delete_data: bool = False) -> None:
+    def delete(
+        self, project_id: str, delete_data: bool = False
+    ) -> list[Path]:
         """Remove a project from the store, optionally deleting all its data.
 
         Data created by ns-process-data / ns-train inside the container is
         owned by root. We delete via ``docker exec rm -rf`` when the container
         is running (same privilege that created the files). Falls back to
         ``shutil.rmtree`` for user-owned dirs or when the container is down.
+
+        Returns a (possibly empty) list of directories that could not be
+        removed — typically root-owned dirs when the container is not running.
         """
         p = self.get(project_id)
         if p is None:
             raise ValueError(f"No project with id '{project_id}'.")
 
+        failed: list[Path] = []
         if delete_data:
             scan = scan_project_data(p)
             dirs = list(scan.processed_dirs)
@@ -840,8 +856,10 @@ class ProjectStore(QObject):
             dirs.extend(scan.warehouse_train_dirs)
             dirs.extend(scan.warehouse_export_dirs)
             dirs.extend(scan.warehouse_render_dirs)
+            dirs.extend(scan.warehouse_source_dirs)
             for d in dirs:
-                _rm_tree(d)
+                if not _rm_tree(d):
+                    failed.append(d)
 
         self._root.projects = [
             proj for proj in self._root.projects if proj.id != project_id
@@ -855,3 +873,4 @@ class ProjectStore(QObject):
         self.projects_changed.emit()
         if was_active:
             self.active_changed.emit(self.active)
+        return failed

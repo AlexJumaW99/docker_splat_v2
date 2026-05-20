@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 
 SCHEMA_VERSION: Literal["1.0"] = "1.0"
@@ -234,11 +234,29 @@ class ProcessManifest(_CommonManifestFields):
     parent: Parent
     params: ProcessParams
 
+    @model_validator(mode="after")
+    def _check_parent_stage(self) -> "ProcessManifest":
+        if self.parent.stage != "source":
+            raise ValueError(
+                f"ProcessManifest parent.stage must be 'source', "
+                f"got '{self.parent.stage}'"
+            )
+        return self
+
 
 class TrainManifest(_CommonManifestFields):
     stage: Literal["train"] = "train"
     parent: Parent
     params: TrainParams
+
+    @model_validator(mode="after")
+    def _check_parent_stage(self) -> "TrainManifest":
+        if self.parent.stage != "process":
+            raise ValueError(
+                f"TrainManifest parent.stage must be 'process', "
+                f"got '{self.parent.stage}'"
+            )
+        return self
 
 
 class ExportManifest(_CommonManifestFields):
@@ -246,11 +264,29 @@ class ExportManifest(_CommonManifestFields):
     parent: Parent
     params: ExportParams
 
+    @model_validator(mode="after")
+    def _check_parent_stage(self) -> "ExportManifest":
+        if self.parent.stage != "train":
+            raise ValueError(
+                f"ExportManifest parent.stage must be 'train', "
+                f"got '{self.parent.stage}'"
+            )
+        return self
+
 
 class RenderManifest(_CommonManifestFields):
     stage: Literal["render"] = "render"
     parent: Parent
     params: RenderParams
+
+    @model_validator(mode="after")
+    def _check_parent_stage(self) -> "RenderManifest":
+        if self.parent.stage != "train":
+            raise ValueError(
+                f"RenderManifest parent.stage must be 'train', "
+                f"got '{self.parent.stage}'"
+            )
+        return self
 
 
 # Discriminated union — the top-level type for `manifest.json`.
@@ -274,9 +310,20 @@ _MANIFEST_ADAPTER: TypeAdapter[Manifest] = TypeAdapter(Manifest)
 
 def load_manifest(path: str | Path) -> Manifest:
     """Read and validate a `manifest.json`. Raises pydantic.ValidationError
-    on schema mismatch."""
+    on schema mismatch, ValueError on version mismatch."""
 
     raw = Path(path).read_bytes()
+    try:
+        header = json.loads(raw)
+    except json.JSONDecodeError:
+        raise
+    version = header.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise ValueError(
+            f"Manifest at {path} has schema_version={version!r}, "
+            f"but this code supports {SCHEMA_VERSION!r}. "
+            f"Upgrade the GUI or run a migration."
+        )
     return _MANIFEST_ADAPTER.validate_json(raw)
 
 

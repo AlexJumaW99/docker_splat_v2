@@ -41,7 +41,8 @@ from app import docker_service as dock
 from app import warehouse as wh
 from app.config import CONTAINER_NAME, WAREHOUSE_DIR
 from app.jobs import JobManager, JobSpec
-from app.manifest import ExportParams, RenderParams, TrainManifest, load_manifest
+from app.manifest import ExportParams, RenderParams, TrainManifest
+from app.manifest_index import get_index
 from app.store import Project, ProjectStore
 from app.widgets import HelpBadge, ProjectBar, card, pill, section_title, set_pill
 
@@ -173,36 +174,16 @@ def _project_processed_ulid(project: Project) -> str | None:
 
 
 def _discover_runs(project: Project) -> list[_Run]:
-    """Walk `data_v2/trained/*/manifest.json` for TrainManifests whose
-    `parent.run_id` == this project's processed ULID. Sorted newest-first
-    (ULID lexicographic sort = chronological sort). Legacy projects return
-    [] — they need to reprocess + retrain via the warehouse-aware tabs."""
+    """Query the ManifestIndex for TrainManifests whose parent.run_id matches
+    this project's processed ULID. Sorted newest-first (ULID lexicographic
+    sort = chronological sort). Legacy projects return []."""
 
     parent_id = _project_processed_ulid(project)
     if parent_id is None:
         return []
 
-    trained_root = WAREHOUSE_DIR / "trained"
-    if not trained_root.is_dir():
-        return []
-
     runs: list[_Run] = []
-    for sub in trained_root.iterdir():
-        manifest_path = sub / "manifest.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            m = load_manifest(manifest_path)
-        except Exception:
-            continue
-        if not isinstance(m, TrainManifest):
-            continue
-        if m.parent is None or m.parent.run_id != parent_id:
-            continue
-
-        # Locate config.yml via the manifest's outputs map first, then fall
-        # back to walking the run dir for older manifests that didn't record
-        # `config_yml` under `outputs`.
+    for m in get_index().trains_for_process(parent_id):
         cfg_rel = m.outputs.get("config_yml")
         cfg_path: Path | None = None
         if cfg_rel:
@@ -210,6 +191,7 @@ def _discover_runs(project: Project) -> list[_Run]:
             if cand.is_file():
                 cfg_path = cand
         if cfg_path is None:
+            sub = WAREHOUSE_DIR / "trained" / m.run_id
             nested = wh.find_train_run_subdir(sub)
             if nested is not None:
                 cand = nested / "config.yml"
