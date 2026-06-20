@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
+from app import live_jobs
 from app import warehouse as wh
 from app.config import (
     CONTAINER_NAME, DATA_DIR, VIZER_CONTAINER, VIZER_VIEWER_PORT, WAREHOUSE_DIR,
@@ -416,6 +417,15 @@ class _Form(QWidget):
         self._pending_start_time: datetime | None = None
         self._pending_display_name: str | None = None
         self._running_mine = False
+        # Delegated ("Run with vizer") run state. When active, the GUI does NOT
+        # launch its own JobManager job — it hands the run to vizer via a
+        # warehouse request file and polls that file for completion. All None /
+        # False when no delegated run is in flight.
+        self._delegated_active = False
+        self._delegated_req_path: Path | None = None
+        self._delegated_target: Path | None = None
+        self._delegated_display_name: str | None = None
+        self._delegated_waits = 0
         # Async ffprobe is video-only; the images flow does a synchronous
         # iterdir() in _refresh_source_meta() and doesn't need a worker.
         self._probe_signals = _ProbeSignals()
@@ -434,6 +444,12 @@ class _Form(QWidget):
         self._vizer_timer.timeout.connect(self._poll_vizer)
         self._vizer_timer.start()
         self._poll_vizer()
+
+        # Polls the live-job request file while a delegated run is in flight.
+        # Created stopped; started by _launch_delegated, stopped on completion.
+        self._delegated_timer = QTimer(self)
+        self._delegated_timer.setInterval(1000)
+        self._delegated_timer.timeout.connect(self._poll_delegated)
 
         # Catch up if a job is already running (e.g. user switched projects
         # mid-run) so our UI reflects reality immediately.
@@ -993,6 +1009,25 @@ class _Form(QWidget):
         sw.addWidget(self.splinter_body)
         self.splinter_warn.hide()
 
+        # Live-viewing mode. "Run with vizer" delegates the run to the vizer
+        # live viewer (localhost:7070) instead of running it inside the GUI's
+        # own log drawer; "Run without vizer" is the original behavior.
+        mode_row = QHBoxLayout(); mode_row.setSpacing(10)
+        mode_lbl = QLabel("Live viewing:")
+        self.vizer_mode_combo = QComboBox()
+        self.vizer_mode_combo.addItems(["Run without vizer", "Run with vizer"])
+        self.vizer_mode_combo.setMinimumWidth(180)
+        self.vizer_mode_combo.setToolTip(
+            "Run with vizer: the same processing runs live on localhost:7070 — "
+            "watch the point cloud form in real time. Run without vizer: process "
+            "in the GUI as usual."
+        )
+        self.vizer_mode_combo.currentIndexChanged.connect(self._on_vizer_mode_changed)
+        mode_row.addWidget(mode_lbl)
+        mode_row.addWidget(self.vizer_mode_combo)
+        mode_row.addStretch(1)
+        v.addLayout(mode_row)
+
         v.addLayout(row)
 
         vizer_row = QHBoxLayout(); vizer_row.setSpacing(10)
@@ -1000,6 +1035,8 @@ class _Form(QWidget):
         self.vizer_btn.setProperty("role", "secondary")
         self.vizer_btn.setCursor(Qt.PointingHandCursor)
         self.vizer_btn.clicked.connect(self._on_open_vizer)
+        # Only clickable when "Run with vizer" is selected (default is without).
+        self.vizer_btn.setEnabled(False)
         self.vizer_pill = pill("—", "neutral")
         vizer_row.addWidget(self.vizer_btn)
         vizer_row.addStretch(1)
@@ -1319,6 +1356,12 @@ class _Form(QWidget):
                     "Another job is already running. Cancel it first.")
                 return
 
+            if self._delegated_active:
+                QMessageBox.information(self, "Busy",
+                    "A live (vizer) run is already in progress. "
+                    "Wait for it to finish.")
+                return
+
             state = dock.container_state(CONTAINER_NAME)
             if state.status != "running":
                 QMessageBox.warning(
@@ -1467,8 +1510,27 @@ class _Form(QWidget):
             self.ready_to_train.hide()
             self.splinter_warn.hide()
             self.output_lbl.setText(str(target))
-            self._jobs.start(spec)
-            started = True
+
+            # Branch on the live-viewing dropdown. "Run with vizer" hands the
+            # fully-prepared run to the vizer live viewer (it runs the
+            # subprocess, streams the live cloud + log, and writes the
+            # manifest); "Run without vizer" is the original in-GUI path. Only
+            # ONE of them ever launches the subprocess, so the shared GPU is
+            # never double-booked.
+            if self.vizer_mode_combo.currentIndex() == 1:
+                started = self._launch_delegated(
+                    argv=argv,
+                    target=target,
+                    proc_id=proc_run_id,
+                    source_id=src_manifest.run_id,
+                    params=self._pending_params,
+                    command=display,
+                    display_name=self._pending_display_name,
+                    form=params,
+                )
+            else:
+                self._jobs.start(spec)
+                started = True
         finally:
             if not started:
                 # Any pre-start bailout: discard the pending target and let
@@ -1722,6 +1784,171 @@ class _Form(QWidget):
                 return
             set_pill(self.vizer_pill, "● Starting…", "warning")
         webbrowser.open(f"http://localhost:{VIZER_VIEWER_PORT}")
+
+    def _on_vizer_mode_changed(self, idx: int) -> None:
+        """Gate the 'Watch live in vizer' button on the live-viewing dropdown:
+        clickable only when the user has chosen to run with vizer (or a
+        delegated run is already in flight)."""
+        with_vizer = idx == 1
+        self.vizer_btn.setEnabled(with_vizer or self._delegated_active)
+
+    # ---- delegated ("Run with vizer") run ----
+    def _launch_delegated(
+        self,
+        *,
+        argv: list[str],
+        target: Path,
+        proc_id: str,
+        source_id: str,
+        params,  # app.manifest.ProcessParams
+        command: str,
+        display_name: str,
+        form: dict,
+    ) -> bool:
+        """Hand a fully-prepared run to the vizer live viewer instead of running
+        it in the GUI. Ensures the viser container is up, drops the request file
+        in the shared warehouse, and starts polling it. Returns True iff the
+        handoff succeeded (caller keeps Run disabled until completion)."""
+        st = dock.container_state(VIZER_CONTAINER)
+        if st.status == "missing":
+            QMessageBox.warning(
+                self, "Vizer container not found",
+                f"No container named '{VIZER_CONTAINER}' exists, so 'Run with "
+                f"vizer' can't hand off the run.\n\nCreate it first:\n"
+                f"  cd ~/docker-stacks/vizer && docker compose up -d",
+            )
+            return False
+        if st.status != "running":
+            try:
+                dock.start_container(VIZER_CONTAINER)
+            except dock.DockerError as e:
+                QMessageBox.warning(
+                    self, "Couldn't start vizer",
+                    f"Failed to start '{VIZER_CONTAINER}':\n{e}",
+                )
+                return False
+            set_pill(self.vizer_pill, "● Starting…", "warning")
+
+        record = {
+            "proc_id": proc_id,
+            "source_id": source_id,
+            "mode": self._mode,
+            # The literal, fully-resolved ns-process-data argv (container paths).
+            # vizer execs this verbatim, so every basic AND advanced parameter is
+            # honored exactly — it never re-derives the command from `form`.
+            "argv": argv,
+            "params": params.model_dump(mode="json"),
+            "command": command,
+            "display_name": display_name,
+            "form": form,
+            "video": Path(self.source_path_edit.text()).name,
+        }
+        try:
+            req_path = live_jobs.write_request(WAREHOUSE_DIR, record)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Couldn't hand off to vizer",
+                f"Failed to write the live-job request under {WAREHOUSE_DIR}:\n{e}",
+            )
+            return False
+
+        self._delegated_active = True
+        self._delegated_req_path = req_path
+        self._delegated_target = target
+        self._delegated_display_name = display_name
+        self._delegated_waits = 0
+        set_pill(self.status_pill, "Sent to vizer…", "warning")
+        self.cancel_btn.setEnabled(False)
+        self.vizer_btn.setEnabled(True)
+        self._delegated_timer.start()
+        return True
+
+    def _poll_delegated(self) -> None:
+        """Poll the request file (1 Hz) while a delegated run is in flight and
+        reflect its state in the status pill; finalize on a terminal state."""
+        if not self._delegated_active or self._delegated_req_path is None:
+            self._delegated_timer.stop()
+            return
+        rec = live_jobs.read_record(self._delegated_req_path)
+        if rec is None:
+            # The file vanished before a terminal state was observed. Tolerate a
+            # few transient misses, then give up rather than poll forever.
+            self._delegated_waits += 1
+            if self._delegated_waits > 10:
+                self._finish_delegated(
+                    success=False,
+                    error="the live-job request file disappeared before vizer "
+                          "reported a result.",
+                )
+            return
+        state = rec.get("state")
+        if state == live_jobs.STATE_REQUESTED:
+            # Not yet claimed by vizer. Surface a hint after ~15 s; give up after
+            # ~90 s (the viser container is unreachable or unhealthy).
+            self._delegated_waits += 1
+            if self._delegated_waits == 15:
+                set_pill(self.status_pill, "Waiting for vizer…", "warning")
+            elif self._delegated_waits > 90:
+                self._finish_delegated(
+                    success=False,
+                    error="vizer didn't pick up the run within 90 s. Is the "
+                          "viser-colmap container running and healthy?",
+                )
+            return
+        self._delegated_waits = 0
+        if state == live_jobs.STATE_RUNNING:
+            set_pill(self.status_pill, "● Running in vizer", "warning")
+        elif state == live_jobs.STATE_DONE:
+            self._finish_delegated(success=True)
+        elif state == live_jobs.STATE_FAILED:
+            self._finish_delegated(success=False, error=rec.get("error"))
+
+    def _finish_delegated(self, *, success: bool, error: str | None = None) -> None:
+        """Terminal handler for a delegated run. vizer already wrote (or skipped)
+        the ProcessManifest; the GUI only repoints the project on success and
+        cleans up the request file + UI state."""
+        self._delegated_timer.stop()
+        req = self._delegated_req_path
+        target = self._delegated_target
+        self._delegated_active = False
+        self._delegated_req_path = None
+        self._delegated_target = None
+        self._delegated_display_name = None
+        self._delegated_waits = 0
+        if req is not None:
+            live_jobs.delete_request(req)
+
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        # Re-evaluate the watch button against the current dropdown selection.
+        self.vizer_btn.setEnabled(self.vizer_mode_combo.currentIndex() == 1)
+
+        if success and target is not None:
+            # vizer is the sole manifest writer for delegated runs; we must NOT
+            # write it again here. Just repoint the project so Train picks it up,
+            # mirroring the non-delegated success path (minus the manifest write).
+            try:
+                self._store.update_processed_dir(self._project.id, target)
+            except ValueError:
+                # Warehouse root not registered with the store — manifest still
+                # landed; projects.json can catch up later. (Same tolerance as
+                # _on_job_finished.)
+                pass
+            else:
+                self.output_lbl.setText(self._project.processed_dir)
+            set_pill(self.status_pill, "Done (vizer)", "success")
+            self.ready_to_train.show()
+        else:
+            set_pill(self.status_pill, "Failed in vizer", "error")
+            if error:
+                QMessageBox.warning(
+                    self, "Live run failed",
+                    f"The run delegated to vizer did not complete:\n\n{error}",
+                )
+            self.output_lbl.setText(self._project.processed_dir)
+
+        self._clear_pending_state()
+        self._refresh_next_target()
 
 
 # ---------- top-level view ----------
