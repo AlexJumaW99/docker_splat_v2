@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from app.config import DATA_DIR
+from app.config import DATA_DIR, WAREHOUSE_DIR
 from app.jobs import JobManager
 from app.store import (
     INPUT_IMAGES_DIR, Project, ProjectStore, count_heic_images, count_images,
@@ -366,11 +366,24 @@ class NewProjectDialog(QDialog):
         wv.setContentsMargins(0, 0, 0, 0)
         wv.setSpacing(6)
 
+        # Runs that exist in the warehouse but belong to no project — typically
+        # processed in vizer's own Process view, which writes the same manifests
+        # as the Process tab but has no access to projects.json. Picking one
+        # fills the folder field below; Browse… still works for anything else.
+        wv.addWidget(section_title("WAREHOUSE RUN WITHOUT A PROJECT"))
+        self.warehouse_run_combo = QComboBox()
+        self.warehouse_run_combo.activated.connect(self._on_warehouse_run_picked)
+        wv.addWidget(self.warehouse_run_combo)
+        # Name we last auto-filled from a picked run, so picking a different
+        # run replaces it but a name the user typed is never overwritten.
+        self._auto_name: str | None = None
+
+        wv.addSpacing(4)
         wv.addWidget(section_title("PROCESSED DATASET FOLDER"))
         row = QHBoxLayout(); row.setSpacing(8)
         self.import_path_edit = QLineEdit()
         self.import_path_edit.setPlaceholderText(
-            str(DATA_DIR) + "/processed/yourdataset_splat"
+            str(WAREHOUSE_DIR) + "/processed/<run id>"
         )
         self.import_path_edit.textChanged.connect(self._refresh_import_detection)
         self.import_browse_btn = QPushButton("Browse…")
@@ -387,8 +400,9 @@ class NewProjectDialog(QDialog):
         wv.addWidget(self.import_detect_lbl)
 
         note = QLabel(
-            f"Folder must live inside {DATA_DIR} and contain either "
-            "transforms.json (Nerfstudio) or sparse/0/cameras.bin (COLMAP)."
+            f"Folder must live inside {WAREHOUSE_DIR} or {DATA_DIR} and contain "
+            "either transforms.json (Nerfstudio) or sparse/0/cameras.bin (COLMAP). "
+            "A warehouse folder also needs its manifest.json."
         )
         note.setProperty("role", "caption")
         note.setWordWrap(True)
@@ -411,9 +425,10 @@ class NewProjectDialog(QDialog):
             self._refresh_images_detection(self.images_path_edit.text())
         else:  # _MODE_IMPORT
             self.hint.setText(
-                "Pick a folder that's already been processed. The project will "
-                "skip straight to the Train tab."
+                "Pick a run that's already been processed — for example one made "
+                "in vizer. The project will skip straight to the Train tab."
             )
+            self._refresh_warehouse_runs()
             self._refresh_import_detection(self.import_path_edit.text())
 
     # ---- video mode helpers ----
@@ -487,6 +502,45 @@ class NewProjectDialog(QDialog):
         )
 
     # ---- import mode helpers ----
+    def _refresh_warehouse_runs(self) -> None:
+        """Repopulate the run dropdown. Called on entering import mode, so a
+        run vizer finished while the GUI was open shows up without a restart."""
+        combo = self.warehouse_run_combo
+        combo.clear()
+        runs = self._store.unlinked_warehouse_runs()
+        combo.setEnabled(bool(runs))
+        if not runs:
+            combo.addItem("Every processed run already has a project", None)
+            return
+        combo.addItem("— pick a run —", None)
+        for m, folder in runs:
+            parts = [
+                m.display_name or m.run_id,
+                m.created_at.astimezone().strftime("%Y-%m-%d %H:%M"),
+            ]
+            frames = m.metrics.get("extracted_frame_count")
+            if frames is not None:
+                parts.append(f"{int(frames)} frames")
+            combo.addItem("  ·  ".join(parts), (str(folder), m.display_name or m.run_id))
+
+    def _on_warehouse_run_picked(self, idx: int) -> None:
+        data = self.warehouse_run_combo.itemData(idx)
+        if data is None:
+            return
+        folder, label = data
+        self.import_path_edit.setText(folder)
+        current = self.name_edit.text().strip()
+        if not current or current == self._auto_name:
+            # Two runs of the same video share a display_name, and project
+            # names must be unique — suffix rather than fail on Create.
+            taken = {p.name for p in self._store.projects}
+            name, i = label, 2
+            while name in taken:
+                name = f"{label}_{i}"
+                i += 1
+            self._auto_name = name
+            self.name_edit.setText(name)
+
     def _browse_folder(self) -> None:
         start_dir = str(DATA_DIR / "processed")
         if not Path(start_dir).exists():

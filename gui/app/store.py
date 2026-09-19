@@ -31,6 +31,7 @@ from app.config import (
     PROJECTS_FILE,
     WAREHOUSE_DIR,
 )
+from app.manifest import ProcessManifest
 from app.manifest_index import get_index
 from app.paths import unique_path
 
@@ -209,7 +210,7 @@ class Project(BaseModel):
     # (images_dir defaults to None, source_kind() returns "video").
     video_path: str | None = None
     images_dir: str | None = None
-    processed_dir: str  # absolute host path, must live under DATA_DIR
+    processed_dir: str  # absolute host path, under DATA_DIR or WAREHOUSE_DIR
     # Which ns-train dataparser this project's processed_dir uses. Defaults
     # to nerfstudio-data so legacy records (pre-import-flow) load unchanged.
     dataparser: DataparserKind = "nerfstudio-data"
@@ -692,9 +693,14 @@ class ProjectStore(QObject):
     def create_from_processed(self, name: str, processed_dir: Path) -> Project:
         """Creates a project from an already-processed dataset folder.
 
-        The folder must live under DATA_DIR (so the container can see it) and
-        hold a recognized dataparser format. No video is recorded — the Process
-        tab will render a read-only "imported" state for these projects.
+        The folder must live under DATA_DIR or WAREHOUSE_DIR (so the container
+        can see it) and hold a recognized dataparser format. A WAREHOUSE_DIR
+        folder must also carry a ProcessManifest: the Train tab refuses to run
+        without one (it is the TrainManifest's parent). That is what lets a run
+        processed outside the Process tab — vizer's own Process view writes the
+        same manifests but never sees projects.json — be adopted and trained.
+        No video is recorded — the Process tab will render a read-only
+        "imported" state for these projects.
         """
         name = name.strip()
         if not name:
@@ -704,13 +710,14 @@ class ProjectStore(QObject):
         if not resolved.is_dir():
             raise ValueError(f"Not a directory:\n{resolved}")
 
-        try:
-            resolved.relative_to(DATA_DIR.resolve())
-        except ValueError:
+        # Same two roots update_processed_dir accepts.
+        in_warehouse = resolved.is_relative_to(WAREHOUSE_DIR.resolve())
+        if not in_warehouse and not resolved.is_relative_to(DATA_DIR.resolve()):
             raise ValueError(
-                f"Processed folder must live inside {DATA_DIR}.\n\n"
-                "The container only sees that folder (it's bind-mounted as /workspace)."
-            ) from None
+                f"Processed folder must live inside {DATA_DIR} or {WAREHOUSE_DIR}.\n\n"
+                "The container only sees those folders (they're bind-mounted as "
+                f"{CONTAINER_WORKSPACE} and {CONTAINER_WAREHOUSE})."
+            )
 
         fmt = detect_dataset_format(resolved)
         if fmt is None:
@@ -718,6 +725,13 @@ class ProjectStore(QObject):
                 f"Couldn't detect a supported dataset format in:\n{resolved}\n\n"
                 "Expected either transforms.json (Nerfstudio) "
                 "or sparse/0/cameras.bin (COLMAP)."
+            )
+
+        if in_warehouse and wh.find_parent_process_manifest(resolved) is None:
+            raise ValueError(
+                f"No valid process manifest.json in:\n{resolved}\n\n"
+                "Warehouse datasets need one so a training run can record "
+                "which processed run it came from."
             )
 
         if any(Path(p.processed_dir).resolve() == resolved for p in self._root.projects):
@@ -736,6 +750,29 @@ class ProjectStore(QObject):
             dataparser=fmt,
             colmap_path=colmap_path,
         ))
+
+    def unlinked_warehouse_runs(self) -> list[tuple[ProcessManifest, Path]]:
+        """Trainable processed runs in the warehouse that no project points at,
+        newest first, as (manifest, run folder).
+
+        These are runs made outside the Process tab, which is the only place a
+        project gets repointed at its result. Rescans the warehouse first: the
+        index is otherwise refreshed only after the GUI's own writes, so a run
+        another process finished since startup would be missing from it.
+        """
+        index = get_index()
+        index.refresh()
+        linked = {Path(p.processed_dir).resolve() for p in self._root.projects}
+        runs: list[tuple[ProcessManifest, Path]] = []
+        for m in index.all_manifests():
+            if not isinstance(m, ProcessManifest):
+                continue
+            folder = wh.run_dir("process", m.run_id).resolve()
+            if folder in linked or detect_dataset_format(folder) is None:
+                continue
+            runs.append((m, folder))
+        runs.sort(key=lambda r: r[0].created_at, reverse=True)
+        return runs
 
     def update_video_path(self, project_id: str, video_path: Path) -> None:
         try:
