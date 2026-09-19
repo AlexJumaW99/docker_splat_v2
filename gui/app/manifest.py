@@ -108,7 +108,11 @@ class ProcessParams(BaseModel):
     matching_method: Literal["sequential", "vocab_tree", "exhaustive"]
     num_frames_target: int | None = None  # video only; None for images
     num_downscales: int = 3
-    camera_type: Literal["perspective", "fisheye", "equirectangular"] = "perspective"
+    # Every value `ns-process-data --camera-type` accepts, in CLI-help order —
+    # keep in sync with CAMERA_TYPES in views/process.py.
+    camera_type: Literal[
+        "perspective", "fisheye", "equirectangular", "pinhole", "simple_pinhole"
+    ] = "perspective"
     refine_intrinsics: bool = True
     same_dimensions: bool = True
     use_gpu: bool = True

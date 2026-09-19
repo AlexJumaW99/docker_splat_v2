@@ -471,7 +471,9 @@
           "enum": [
             "perspective",
             "fisheye",
-            "equirectangular"
+            "equirectangular",
+            "pinhole",
+            "simple_pinhole"
           ],
           "title": "Camera Type",
           "type": "string"
