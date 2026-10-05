@@ -87,10 +87,15 @@ RUN git -c advice.detachedHead=false clone --filter=blob:none \
 # Stage 4: gsplat — pinned to 1.5.3 (PyPI wheel, JIT-compiled at runtime)
 #
 # v4.6: pin gsplat to 1.5.3 (was: untracked git tip overwritten by
-# nerfstudio's gsplat==1.4.0 pin in Stage 5). 1.5.3 unlocks 2DGS,
-# fused-SSIM (Taming-3DGS), 3DGUT, Fisheye-GS, and F-Theta camera
-# support inside the existing splatfacto methods — all via config
-# flags on splatfacto/-big/-mcmc, no new ns-train method names.
+# nerfstudio's gsplat==1.4.0 pin in Stage 5). 1.5.3 is the latest gsplat
+# release (checked 2026-10-05; 1.6.0 exists only on main). The library
+# gains 2DGS, fused-SSIM, 3DGUT, Fisheye-GS and F-Theta cameras, but NOTE
+# (corrected 2026-10-05): nerfstudio@50e0e3c's splatfacto never passes
+# `camera_model`, `with_ut` or the 2DGS entry point to gsplat — zero
+# references in models/splatfacto.py — so none of these are reachable
+# through `ns-train splatfacto*` flags. What 1.5.3 buys the splatfacto
+# methods here is the newer rasterizer/strategy code paths, not new
+# camera models.
 #
 # Verified backward compatible against the existing splatfacto +
 # splatfacto-w callsites: rasterization() in 1.5.3 is a strict
@@ -209,6 +214,18 @@ RUN pip install --no-cache-dir --no-deps \
 # Our overlay uses config.colmap_path, auto-detects images dir, accepts
 # OPENCV cameras, and falls back to fraction-based eval split when no TSV
 # exists — so splatfacto-w works with standard COLMAP/nerfstudio layouts.
+#
+# v4.7: the v4.4 overlay still built `Cameras` without width/height (nerfstudio
+# then derives int(2*cx) x int(2*cy), wrong once COLMAP has refined the
+# principal point — 13 of 14 OPENCV datasets in the warehouse), dropped the
+# OPENCV distortion coefficients, accepted only PINHOLE/OPENCV, and always read
+# full-resolution images/. Symptoms: splatfacto-w-light asserted "The size of
+# image ... does not match the camera parameters"; splatfacto-w skipped every
+# frame recursively and on 4K data died with a misleading CUDA OOM. v4.7 reads
+# intrinsics through nerfstudio's own parse_colmap_camera_params (real size +
+# distortion, perspective-family models), rejects fisheye explicitly, and
+# picks images_<N> with the same <=1600 px rule as nerfstudio-data. See the
+# module docstring for the full upstream delta.
 COPY image_bin/nerfw_dataparser.py \
      /usr/local/lib/python3.12/dist-packages/splatfactow/nerfw_dataparser.py
 
@@ -218,6 +235,29 @@ COPY image_bin/nerfw_dataparser.py \
 RUN sed -i \
         's|self\.radii = info\["radii"\]\[0\]  # \[N\]|self.radii = info["radii"][0].amax(dim=-1)  # [N] — gsplat >=1.5 returns [N,2]|' \
         /usr/local/lib/python3.12/dist-packages/splatfactow/splatfactow_model.py
+
+# v4.7: splatfacto-w eval colour-cache guard (upstream KevinXu02/splatfacto-w
+# issue #14, open since 2024-08). SplatfactoWModel.get_outputs() reuses
+# `cached_colors` in eval whenever the eval camera index equals the last
+# *training* camera index, without checking that the gaussian count is still
+# the same. Refinement (densify/cull) runs every 100 steps, in-training eval
+# also runs every 100 steps, so whenever the randomly chosen eval image
+# happens to share the index of the last training image the cache is one
+# densification stale and gsplat asserts:
+#   AssertionError: torch.Size([112061, 16, 3])
+# Reproduced 2026-10-05: 1 of 2 identical 7k runs died at step ~2300; with 12
+# training images it dies at step ~1590 every time. The patch (3 lines) lets
+# only eval renders populate cached_colors / cached_bg_sh and requires the
+# cached tensor to match the live gaussian count. Applied with `patch` rather
+# than sed so the build FAILS if upstream drifts instead of silently
+# no-op'ing; `--forward` makes a second application a hard error too.
+COPY image_bin/splatfactow_model_cache.patch /opt/patches/splatfactow_model_cache.patch
+RUN patch --forward --batch \
+        /usr/local/lib/python3.12/dist-packages/splatfactow/splatfactow_model.py \
+        /opt/patches/splatfactow_model_cache.patch \
+    && test "$(grep -c 'self.cached_colors = None if self.training else colors' \
+        /usr/local/lib/python3.12/dist-packages/splatfactow/splatfactow_model.py)" = "1" \
+    && python -c "import py_compile; py_compile.compile('/usr/local/lib/python3.12/dist-packages/splatfactow/splatfactow_model.py', doraise=True)"
 
 # v4.1: splatfacto-w-aware .ply exporter. Upstream `ns-export gaussian-splat`
 # hard-asserts `isinstance(pipeline.model, SplatfactoModel)`; SplatfactoWModel
@@ -268,6 +308,39 @@ RUN mkdir -p /root/.local/share/nerfstudio \
         -o /root/.local/share/nerfstudio/vocab_tree.fbow \
     && echo "${VOCAB_TREE_SHA256}  /root/.local/share/nerfstudio/vocab_tree.fbow" \
         | sha256sum -c -
+
+# v4.7: bake hloc (Hierarchical-Localization) into the image so
+# `ns-process-data ... --sfm-tool hloc --feature-type superpoint_max
+# --matcher-type superpoint+lightglue` survives a container rebuild. Until
+# this step the toolbox lived only in the running container's writable
+# layer (installed by hand on 2026-09-20; visible via `docker diff`), so any
+# `docker compose up --build` silently removed the learned-feature route the
+# DRC datasets were processed with. Pins mirror exactly what that container
+# had: hloc @ HLOC_COMMIT as an editable install (hloc resolves its model
+# code relative to /opt/hloc), only the SuperGluePretrainedNetwork submodule
+# (ships the SuperPoint/SuperGlue weights; r2d2 / d2net / deep-image-retrieval
+# were never checked out, so nerfstudio's `r2d2` / `d2net-ss` feature types
+# are NOT available here), LightGlue @ LIGHTGLUE_COMMIT, pycolmap 3.13.0 as
+# hloc's SfM backend (independent of the system COLMAP binary), kornia 0.8.3
+# (+ kornia_rs 0.1.14; `adalam` needs a kornia API that 0.8.3 no longer has).
+# `--no-deps` for hloc because its remaining requirements (h5py, gdown,
+# plotly, matplotlib, scipy, tqdm, opencv-python) are already in the NGC base
+# + nerfstudio install — verified with `pip check` on 2026-10-05. Runtime
+# weights (LightGlue, NetVLAD) download on first use into the torch-hub cache
+# volume. Licence note: SuperPoint/SuperGlue weights are "academic or
+# non-profit organization noncommercial research use only" (Magic Leap);
+# `disk+lightglue` is the permissively licensed combination.
+ARG HLOC_COMMIT=c13273bd0ecc2917a35910fd843712a1c6243193
+ARG LIGHTGLUE_COMMIT=eb42fee2d71449efb0aa5c10549752b5d75384d8
+RUN git -c advice.detachedHead=false clone \
+        https://github.com/cvg/Hierarchical-Localization.git /opt/hloc \
+    && git -C /opt/hloc checkout "${HLOC_COMMIT}" \
+    && git -C /opt/hloc submodule update --init third_party/SuperGluePretrainedNetwork \
+    && pip install --no-cache-dir \
+        pycolmap==3.13.0 kornia==0.8.3 kornia_rs==0.1.14 \
+        "lightglue @ git+https://github.com/cvg/LightGlue.git@${LIGHTGLUE_COMMIT}" \
+    && pip install --no-cache-dir --no-deps -e /opt/hloc \
+    && python -c "import hloc, pycolmap, lightglue, kornia; from hloc import extract_features, match_features, pairs_from_exhaustive, pairs_from_retrieval, reconstruction; import nerfstudio.process_data.hloc_utils; print('hloc', hloc.__version__, 'pycolmap', pycolmap.__version__, 'kornia', kornia.__version__)"
 
 WORKDIR /workspace
 EXPOSE 7007 6006

@@ -477,6 +477,116 @@ else
 fi
 
 # ============================================================================
+# 17. splatfacto-w v4.7 patches (dataparser v2 overlay + eval colour-cache guard)
+#
+# Both fixes live in splatfactow/ inside the image:
+#   - nerfw_dataparser.py is a COPY overlay. We check the v2 marker (it routes
+#     intrinsics through nerfstudio's parse_colmap_camera_params and honours
+#     images_<N>), and that its public symbol still imports.
+#   - splatfactow_model.py gets `patch`-applied anchors. We check all three
+#     anchors are present exactly once, the unpatched line is gone, the radii
+#     fix from v4.4b is still there, and the file compiles.
+#   - Functional probe (CPU only, no dataset needed): build a 2-camera
+#     Cameras object the way the v2 parser does and confirm nerfstudio keeps
+#     the real width/height instead of deriving int(2*cx) x int(2*cy).
+# ============================================================================
+section "17. splatfacto-w v4.7 patches"
+
+sfw='/usr/local/lib/python3.12/dist-packages/splatfactow'
+
+v2_marker=$(dexec grep -c -F 'parse_colmap_camera_params(cam)' "$sfw/nerfw_dataparser.py" | tr -d '[:space:]')
+[ "${v2_marker:-0}" -ge 1 ] \
+    && pass "nerfw_dataparser.py v2 overlay present (uses parse_colmap_camera_params)" \
+    || fail "nerfw_dataparser.py v2 overlay" "marker missing — image_bin/nerfw_dataparser.py not COPY'd?"
+
+v2_old=$(dexec grep -c -F '_SUPPORTED_CAMERA_MODELS' "$sfw/nerfw_dataparser.py" | tr -d '[:space:]')
+[ "${v2_old:-0}" = "0" ] \
+    && pass "v4.4 PINHOLE/OPENCV-only allow-list gone" \
+    || fail "v4.4 allow-list removed" "$v2_old ref(s) remain — stale overlay"
+
+out=$(dexec python -c "from splatfactow.nerfw_dataparser import splatfactow_dataparser, NerfWDataParserConfig; print(type(splatfactow_dataparser.config).__name__)" 2>&1 | tail -1)
+[ "$out" = "NerfWDataParserConfig" ] \
+    && pass "splatfactow_dataparser spec imports" \
+    || fail "splatfactow_dataparser import" "$out"
+
+c_guard=$(dexec grep -c -F 'self.cached_colors.shape[0] == appearance_features.shape[0]' "$sfw/splatfactow_model.py" | tr -d '[:space:]')
+c_train=$(dexec grep -c -F 'self.cached_colors = None if self.training else colors'           "$sfw/splatfactow_model.py" | tr -d '[:space:]')
+c_bg=$(dexec    grep -c -F 'self.cached_bg_sh = None if self.training else bg_sh_coeffs'      "$sfw/splatfactow_model.py" | tr -d '[:space:]')
+c_old=$(dexec   grep -c -E '^\s*self\.cached_colors = colors$'                                 "$sfw/splatfactow_model.py" | tr -d '[:space:]')
+c_radii=$(dexec grep -c -F 'info["radii"][0].amax(dim=-1)'                                     "$sfw/splatfactow_model.py" | tr -d '[:space:]')
+
+[ "${c_guard:-0}" = "1" ] && pass "cache guard: gaussian-count check present"         || fail "cache guard count check" "got $c_guard"
+[ "${c_train:-0}" = "1" ] && pass "cache guard: training renders don't cache colours"  || fail "cache guard colours" "got $c_train"
+[ "${c_bg:-0}"    = "1" ] && pass "cache guard: training renders don't cache bg SH"    || fail "cache guard bg SH" "got $c_bg"
+[ "${c_old:-0}"   = "0" ] && pass "unpatched 'self.cached_colors = colors' absent"     || fail "unpatched cache line removed" "$c_old ref(s) remain"
+[ "${c_radii:-0}" = "1" ] && pass "v4.4b radii fix still present"                     || fail "radii fix present" "got $c_radii"
+
+py_ok=$(dexec python -c "import py_compile; py_compile.compile('$sfw/splatfactow_model.py', doraise=True); py_compile.compile('$sfw/nerfw_dataparser.py', doraise=True); print('OK')" 2>&1 | tail -1)
+[ "$py_ok" = "OK" ] && pass "splatfactow patched files py_compile clean" || fail "splatfactow py_compile" "$py_ok"
+
+# Functional probe: real size must survive (3840x2160 with cx=1919.5 would have
+# become 3839x2160 under the v4.4 overlay).
+out=$(dexec_in python - <<'PY' 2>&1 | tail -1
+import torch
+from nerfstudio.cameras.cameras import Cameras, CameraType
+from nerfstudio.cameras import camera_utils
+cams = Cameras(camera_to_worlds=torch.eye(4)[None, :3, :4].repeat(2, 1, 1),
+               fx=torch.tensor([3000., 3000.]), fy=torch.tensor([3000., 3000.]),
+               cx=torch.tensor([1919.5, 1921.9]), cy=torch.tensor([1085.4, 1079.1]),
+               height=torch.tensor([2160, 2160]), width=torch.tensor([3840, 3840]),
+               distortion_params=torch.stack([camera_utils.get_distortion_params(k1=-0.1, k2=0.01)] * 2),
+               camera_type=CameraType.PERSPECTIVE)
+cams.rescale_output_resolution(1.0 / 4)
+print(int(cams.width[0]), int(cams.height[0]), int(cams.width[1]), int(cams.height[1]), bool(cams.distortion_params[0, 0] != 0))
+PY
+)
+[ "$out" = "960 540 960 540 True" ] \
+    && pass "Cameras keep explicit width/height + distortion through rescale ($out)" \
+    || fail "Cameras size/distortion probe" "$out"
+
+# ============================================================================
+# 18. hloc toolbox (v4.7) — learned features for `--sfm-tool hloc`
+#
+# hloc must be importable from the image itself (not a container-layer
+# install), together with the pieces nerfstudio's hloc_utils imports and the
+# extractor/matcher modules behind the feature/matcher types that are known
+# to work in this build. r2d2 / d2net-ss / adalam are documented as
+# unavailable (submodules not checked out; kornia API), so they are not
+# asserted here.
+# ============================================================================
+section "18. hloc toolbox (v4.7)"
+
+out=$(dexec python -c "import hloc, pycolmap, lightglue, kornia; print(hloc.__version__, pycolmap.__version__, kornia.__version__)" 2>&1 | tail -1)
+echo "$out" | grep -q -E '^1\.5 3\.13\.0 0\.8\.3$' \
+    && pass "hloc 1.5 + pycolmap 3.13.0 + kornia 0.8.3 importable" \
+    || fail "hloc / pycolmap / kornia import" "$out"
+
+hloc_dir=$(dexec python -c "import hloc, os; print(os.path.dirname(hloc.__file__))" 2>&1 | tail -1)
+[ "$hloc_dir" = "/opt/hloc/hloc" ] \
+    && pass "hloc resolves to the baked /opt/hloc checkout" \
+    || fail "hloc location" "$hloc_dir"
+
+out=$(dexec_in python - <<'PY' 2>&1 | tail -1
+import importlib
+from hloc import extract_features, match_features, pairs_from_exhaustive, pairs_from_retrieval, reconstruction
+import nerfstudio.process_data.hloc_utils
+mods = [("extractors", "superpoint"), ("extractors", "disk"), ("extractors", "dog"), ("extractors", "netvlad"),
+        ("matchers", "lightglue"), ("matchers", "superglue"), ("matchers", "nearest_neighbor")]
+for kind, name in mods:
+    importlib.import_module(f"hloc.{kind}.{name}")
+print("OK", len(mods))
+PY
+)
+[ "$out" = "OK 7" ] \
+    && pass "hloc extractors/matchers behind superpoint*/disk/sift/NN*/superglue*/lightglue import" \
+    || fail "hloc module imports" "$out"
+
+out=$(dexec test -f /opt/hloc/third_party/SuperGluePretrainedNetwork/models/weights/superpoint_v1.pth && echo yes || echo no)
+[ "$out" = "yes" ] \
+    && pass "SuperPoint weights present (SuperGluePretrainedNetwork submodule checked out)" \
+    || fail "SuperPoint weights" "third_party/SuperGluePretrainedNetwork not initialised"
+
+# ============================================================================
 # Summary
 # ============================================================================
 section "Summary"

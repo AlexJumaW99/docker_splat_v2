@@ -12,7 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Phototourism dataset parser. Datasets and documentation here: http://phototour.cs.washington.edu/datasets/"""
+"""Phototourism dataset parser. Datasets and documentation here: http://phototour.cs.washington.edu/datasets/
+
+docker_splat_v2 overlay of KevinXu02/splatfacto-w's ``nerfw_dataparser.py``
+(upstream commit 119a3bf), installed over the pip package by the Dockerfile so
+``splatfacto-w`` works on standard COLMAP / ns-process-data layouts, not just
+the phototourism ``dense/`` tree it was written for. Differences from upstream:
+
+* ``colmap_path`` is honoured (upstream hardcoded ``dense/sparse``) and the
+  image directory is auto-detected (``dense/images`` or ``images``).
+* Cameras are read through nerfstudio's own ``parse_colmap_camera_params``, so
+  every perspective-family COLMAP model is accepted (SIMPLE_PINHOLE, PINHOLE,
+  SIMPLE_RADIAL, RADIAL, OPENCV) and the real image width/height plus the
+  distortion coefficients are passed on. Upstream built ``Cameras`` without a
+  size, which nerfstudio derives as ``int(2*cx) x int(2*cy)`` -- wrong as soon
+  as COLMAP has refined the principal point -- and dropped distortion, so
+  images were never undistorted. Fisheye models are rejected with a clear
+  error instead of being mis-rendered.
+* Image resolution follows the ``nerfstudio-data`` rule: an explicit
+  ``--downscale-factor``, else the smallest existing ``images_<2^k>`` folder
+  that brings the longest side to <= 1600 px (upstream always read full-res).
+* The ``<data_name>.tsv`` train/test split is optional; without it a
+  deterministic 10 % eval split is drawn (``eval_split_fraction``).
+* Images are iterated per image (upstream iterated per camera model, which
+  reads one row for a shared-intrinsics dataset).
+"""
 
 from __future__ import annotations
 import pandas as pd
@@ -33,6 +57,7 @@ from nerfstudio.data.dataparsers.base_dataparser import (
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils import colmap_parsing_utils as colmap_utils
 from nerfstudio.plugins.registry_dataparser import DataParserSpecification
+from nerfstudio.process_data.colmap_utils import parse_colmap_camera_params
 
 # TODO(1480) use pycolmap instead of colmap_parsing_utils
 # import pycolmap
@@ -43,7 +68,8 @@ from nerfstudio.data.utils.colmap_parsing_utils import (
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
-_SUPPORTED_CAMERA_MODELS = frozenset({"PINHOLE", "OPENCV"})
+# Same auto-downscale target nerfstudio-data uses (nerfstudio_dataparser.MAX_AUTO_RESOLUTION).
+_MAX_AUTO_RESOLUTION = 1600
 
 _IMAGE_DIR_CANDIDATES = ("dense/images", "images")
 
@@ -113,18 +139,25 @@ class NerfW(DataParser):
         image_filenames = []
         poses = []
         colmap_path = self.data / self.config.colmap_path
-        images_dir = _find_images_dir(self.data)
+        full_res_images_dir = _find_images_dir(self.data)
         with CONSOLE.status(
             f"[bold green]Reading phototourism images and poses for {split} split..."
         ) as _:
             cams = read_cameras_binary(colmap_path / "cameras.bin")
             imgs = read_images_binary(colmap_path / "images.bin")
 
+        images_dir, downscale = self._resolve_images_dir(full_res_images_dir, cams, imgs)
+        self._downscale_factor = downscale
+
         poses = []
         fxs = []
         fys = []
         cxs = []
         cys = []
+        widths = []
+        heights = []
+        distort = []
+        intrinsics = {}
         image_filenames = []
 
         flip = torch.eye(3)
@@ -143,10 +176,17 @@ class NerfW(DataParser):
             cam = cams[img.camera_id]
             if has_tsv and img.name not in split_data[:]["filename"].values:
                 continue
-            assert cam.model in _SUPPORTED_CAMERA_MODELS, (
-                f"Only {_SUPPORTED_CAMERA_MODELS} camera models are supported, "
-                f"got {cam.model!r}"
-            )
+            if img.camera_id not in intrinsics:
+                # Raises NotImplementedError for models nerfstudio cannot represent.
+                parsed = parse_colmap_camera_params(cam)
+                if parsed["camera_model"] != "OPENCV":
+                    raise ValueError(
+                        "The splatfacto-w dataparser supports perspective COLMAP cameras only "
+                        "(SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV); "
+                        f"got {cam.model!r}."
+                    )
+                intrinsics[img.camera_id] = parsed
+            p = intrinsics[img.camera_id]
 
             pose = torch.cat(
                 [torch.tensor(img.qvec2rotmat()), torch.tensor(img.tvec.reshape(3, 1))],
@@ -154,10 +194,15 @@ class NerfW(DataParser):
             )
             pose = torch.cat([pose, torch.tensor([[0.0, 0.0, 0.0, 1.0]])], dim=0)
             poses.append(torch.linalg.inv(pose))
-            fxs.append(torch.tensor(cam.params[0]))
-            fys.append(torch.tensor(cam.params[1]))
-            cxs.append(torch.tensor(cam.params[2]))
-            cys.append(torch.tensor(cam.params[3]))
+            fxs.append(torch.tensor(p["fl_x"]))
+            fys.append(torch.tensor(p["fl_y"]))
+            cxs.append(torch.tensor(p["cx"]))
+            cys.append(torch.tensor(p["cy"]))
+            widths.append(int(p["w"]))
+            heights.append(int(p["h"]))
+            distort.append(
+                camera_utils.get_distortion_params(k1=p["k1"], k2=p["k2"], p1=p["p1"], p2=p["p2"])
+            )
 
             image_filenames.append(images_dir / img.name)
 
@@ -234,8 +279,12 @@ class NerfW(DataParser):
             fy=fys,
             cx=cxs,
             cy=cys,
+            height=torch.tensor(heights, dtype=torch.int64),
+            width=torch.tensor(widths, dtype=torch.int64),
+            distortion_params=torch.stack(distort, dim=0),
             camera_type=CameraType.PERSPECTIVE,
         )
+        cameras.rescale_output_resolution(scaling_factor=1.0 / downscale)
         cameras = cameras[indices]
         image_filenames = [image_filenames[i] for i in indices]
         metadata = {}
@@ -255,6 +304,33 @@ class NerfW(DataParser):
         )
 
         return dataparser_outputs
+
+    def _resolve_images_dir(self, images_dir: Path, cams, imgs):
+        """Pick the image folder the way nerfstudio-data does: an explicit
+        --downscale-factor, else the smallest existing images_<2^k> folder that
+        brings the longest side to <= _MAX_AUTO_RESOLUTION px."""
+        first = next(iter(imgs.values()))
+        cam = cams[first.camera_id]
+
+        def folder(df: int) -> Path:
+            return images_dir if df == 1 else images_dir.parent / f"{images_dir.name}_{df}"
+
+        if self.config.downscale_factor is not None:
+            df = int(self.config.downscale_factor)
+        else:
+            df = 1
+            while (
+                max(cam.width, cam.height) / df > _MAX_AUTO_RESOLUTION
+                and (folder(df * 2) / first.name).exists()
+            ):
+                df *= 2
+        if not (folder(df) / first.name).exists():
+            raise FileNotFoundError(
+                f"Downscale factor {df} requested but {folder(df) / first.name} does not exist."
+            )
+        if df > 1:
+            CONSOLE.log(f"splatfacto-w dataparser: image downscale factor of {df}")
+        return folder(df), df
 
     def _load_3D_points(
         self, colmap_path: Path, transform_matrix: torch.Tensor, scale_factor: float

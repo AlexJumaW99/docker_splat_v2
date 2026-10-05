@@ -480,6 +480,25 @@ ns-process-data images \
 
 For still photos, **use `exhaustive` unless you have more than ~100 images.** With 31 photos, exhaustive takes seconds; vocab_tree can miss critical matches in scenes with repetitive geometry.
 
+### Learned features with hloc (`--sfm-tool hloc`)
+
+Image v4.7 bakes the [hloc](https://github.com/cvg/Hierarchical-Localization) toolbox into the container, so COLMAP's SIFT can be swapped for learned features when SIFT struggles (long focal lengths, low texture, strong exposure changes). In the GUI, put the flags in the Process tab's **Raw CLI flags** box; on the CLI, append them to `ns-process-data`:
+
+```bash
+ns-process-data images --data /workspace/photos --output-dir /workspace/processed/photos_splat \
+  --matching-method exhaustive \
+  --sfm-tool hloc --feature-type superpoint_max --matcher-type superpoint+lightglue
+```
+
+What works in this image (verified 2026-10-05): feature types `sift`, `superpoint_aachen`, `superpoint_max`, `superpoint_inloc`, `sosnet`, `disk`; matcher types `superglue`, `superglue-fast`, `NN-superpoint`, `NN-ratio`, `NN-mutual`, `superpoint+lightglue`, `disk+lightglue`. `r2d2`, `d2net-ss` and `adalam` are accepted by the CLI but fail to import here (hloc submodules not checked out; kornia API), so don't use them.
+
+Things to know:
+
+- Under hloc, `--matching-method exhaustive` means all pairs; `sequential` **and** `vocab_tree` both mean NetVLAD image retrieval of the 50 most similar images per frame (nerfstudio's `hloc_utils.py`). The NetVLAD weights are downloaded on the first such run.
+- The crop and circle-mask options are rejected with hloc (`Cannot use a mask with hloc`).
+- hloc runs SfM through its own `pycolmap 3.13.0`, not the system COLMAP binary, so the submap-promotion shim does not apply (hloc keeps the largest model itself). The camera model follows `--camera-type` as usual (`OPENCV` by default); focal length and distortion are refined but the principal point stays at the image centre (verified: `cx, cy = 480.0, 270.0` on a 960×540 run).
+- Licence: the SuperPoint / SuperGlue weights (`superpoint_*`, `superglue*`, `superpoint+lightglue`) are released by Magic Leap for academic or non-profit non-commercial research use only. `disk+lightglue` (DISK by EPFL, LightGlue by ETH, both Apache-2.0) is the permissively licensed combination.
+
 ### Tips for good photo captures
 
 The same principles as video apply — see [Recording videos for splatfacto](#recording-videos-for-splatfacto) — with these additions:
@@ -555,8 +574,8 @@ Columns: step, iteration time, remaining time estimate, gaussian count. The gaus
 | `splatfacto` | Default — balanced quality and speed. Good starting point for most videos. |
 | `splatfacto-big` | Larger gaussian capacity. Use for detailed scenes where the default caps out. Slower and hungrier on VRAM. |
 | `splatfacto-mcmc` | MCMC-based densification. More stable gaussian counts; sometimes cleaner results on sparse-view scenes. Requires the git-pinned nerfstudio from Stage 5. |
-| `splatfacto-w` | ["In the wild" splatfacto](https://github.com/KevinXu02/splatfacto-w) — handles scenes with transient occluders and varying appearance/lighting across captures. Good for outdoor or crowd-tourism-style datasets. The image ships a patched `nerfw_dataparser.py` that fixes upstream's hardcoded phototourism paths so splatfacto-w works with any COLMAP-processed dataset (not just phototourism). Also patched for gsplat 1.5.3 compatibility (radii shape change). |
-| `splatfacto-w-light` | Lighter-weight variant of `splatfacto-w` with a smaller appearance MLP. Faster and less VRAM-hungry; trade-off is appearance modeling fidelity. Uses nerfstudio's standard `NerfstudioDataParser`, so it is unaffected by the NerfW dataparser patches. |
+| `splatfacto-w` | ["In the wild" splatfacto](https://github.com/KevinXu02/splatfacto-w) — per-image appearance embedding, a learned background model and transient masking (from step 6000). Good for outdoor or crowd-tourism-style datasets. Needs the dataset's **COLMAP sparse model** with **perspective cameras** (SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV; fisheye is refused). The image ships a v2 `nerfw_dataparser.py` overlay (real image size + distortion, auto-picks `images_<N>` so the longest side is ≤ 1600 px, honours `--downscale-factor`) and a colour-cache patch for an upstream eval crash. Upstream's schedule assumes 55,000 iterations; eval metrics are computed on the right half of held-out images (left half is trained on), so they are not comparable with the other methods. Heavier than -light: 9.5 GiB peak at 1920×1080 in testing. |
+| `splatfacto-w-light` | Lighter-weight variant of `splatfacto-w` (smaller appearance MLP, no background model, no transient masking). Faster and less VRAM-hungry. Uses nerfstudio's standard `nerfstudio-data` / `colmap` dataparsers exactly like the built-in methods, so it runs on any processed dataset and its eval split is a true hold-out. The upstream author recommends it for non-phototourism captures. |
 
 Swap the first positional argument of `ns-train` to pick one (e.g. `ns-train splatfacto-big --data …`).
 
@@ -647,7 +666,13 @@ ns-train splatfacto-w \
   --colmap-path colmap/sparse/0
 ```
 
-Note the subcommand is `splatfactow_dataparser` (not `colmap`). The `--colmap-path` flag is the same — a relative path under `--data` pointing at the COLMAP sparse model directory. The GUI's Train tab handles this automatically. `splatfacto-w-light` does **not** need this — it uses the standard nerfstudio dataparser.
+Note the subcommand is `splatfactow_dataparser` (not `colmap`). The `--colmap-path` flag is the same — a relative path under `--data` pointing at the COLMAP sparse model directory. The GUI's Train tab handles this automatically and refuses to start `splatfacto-w` on a project that has no COLMAP sparse model. `splatfacto-w-light` does **not** need this — it uses the standard nerfstudio dataparser, exactly like `splatfacto`.
+
+What the v2 `splatfactow_dataparser` accepts and does (image v4.7 and later):
+
+- COLMAP camera models `SIMPLE_PINHOLE`, `PINHOLE`, `SIMPLE_RADIAL`, `RADIAL`, `OPENCV`. Distortion is undistorted at load time, as with `nerfstudio-data`. Fisheye models are rejected with an explicit error.
+- Image resolution follows the same rule as `nerfstudio-data`: the smallest existing `images_<N>` folder that brings the longest side to ≤ 1600 px, or an explicit `--downscale-factor N` after the subcommand (`splatfactow_dataparser --colmap-path colmap/sparse/0 --downscale-factor 2`). A dataset processed with **Downscale levels = 0** therefore trains at full resolution; at 4K that is far beyond 16 GB for splatfacto-w, so add downscale levels first.
+- With no `<data_name>.tsv` split file, a deterministic 10 % eval split is drawn; those images still train on their left half (upstream NeRF-W protocol).
 
 ### Via the GUI
 
@@ -962,6 +987,18 @@ If you still see a 2-frame `transforms.json`:
 Cause: you're running an image without the NerfW dataparser patch. Upstream `splatfactow/nerfw_dataparser.py` hardcodes phototourism-specific paths (`dense/sparse/`, `dense/images/`), asserts PINHOLE cameras only, and requires a TSV split file — none of which exist in a standard `ns-process-data` output.
 
 Fix: already patched in the v4.4 Dockerfile. If you see this, your image was built from a pre-v4.4 Dockerfile. Rebuild with `docker build --target nerfstudio -t splat-nerfstudio-v2 .` and recreate the container. Also ensure the GUI's Train tab (or your CLI invocation) uses the `splatfactow_dataparser --colmap-path <rel>` subcommand, not `--pipeline.datamanager.dataparser.colmap-path`.
+
+### `splatfacto-w-light` fails with `AssertionError: The size of image (3840, 2160) loaded does not match the camera parameters ((3838, 2161))`
+
+Cause: an image older than v4.7, where the Train tab routed `splatfacto-w-light` through the NerfW dataparser and that parser derived the image size from the principal point. Fix: rebuild (`make build && make up`), then retrain — -light now uses the standard dataparser. The same symptom from `splatfacto-w` looks different: hundreds of `Image shape … does not match camera shape` lines followed by `CUDA out of memory`. That OOM is not a VRAM problem; it is the same stale-size bug, fixed by the v4.7 dataparser overlay.
+
+### `splatfacto-w` stops at a random step with `AssertionError: torch.Size([112061, 16, 3])`
+
+Cause: upstream colour-cache bug (splatfacto-w issue #14) in images older than v4.7 — the eval render reused colours cached before a densify/cull step. Fix: rebuild to v4.7; `smoke_test.sh` §17 confirms the patch is present.
+
+### `ns-process-data … --sfm-tool hloc` fails with `you must install hloc toolbox!!`
+
+Cause: the container was created from an image older than v4.7, where hloc was only ever installed by hand into a container's writable layer. Fix: rebuild to v4.7; `smoke_test.sh` §18 confirms the toolbox imports.
 
 ### "Aborted (core dumped)" at the end of training
 

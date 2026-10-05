@@ -55,8 +55,12 @@ _HELP = {
         "VRAM.<br>"
         "<b>splatfacto-mcmc</b> \u00b7 MCMC-based densification; often "
         "higher-quality but slower.<br>"
-        "<b>splatfacto-w / -w-light</b> \u00b7 variants tuned for in-the-wild "
-        "captures with variable exposure."
+        "<b>splatfacto-w-light</b> \u00b7 in-the-wild variant with a per-image "
+        "appearance model; runs on any processed dataset.<br>"
+        "<b>splatfacto-w</b> \u00b7 full in-the-wild model (appearance + "
+        "background + transient masking). Needs the COLMAP sparse model "
+        "with perspective cameras; fisheye datasets are refused. Trains at "
+        "\u22641600 px using the dataset's downscaled copies."
     ),
     "iters": (
         "Max iterations",
@@ -126,7 +130,6 @@ METHODS = [
     "splatfacto-w", "splatfacto-w-light",
 ]
 VIS_MODES = ["viewer+tensorboard", "viewer", "tensorboard"]
-_SPLATFACTOW_METHODS = frozenset({"splatfacto-w", "splatfacto-w-light"})
 
 
 # nerfstudio prints a rich Panel with "🎉 Training Finished 🎉" in the title
@@ -829,15 +832,30 @@ class _Form(QWidget):
             # it. The default (nerfstudio-data) is implicit when omitted, so
             # we only emit non-default names to keep the generated command
             # minimal.
-            if params["method"] in _SPLATFACTOW_METHODS:
+            if params["method"] == "splatfacto-w":
                 # splatfacto-w's registered default is NerfWDataParser whose
                 # colmap_path defaults to "dense/sparse". Override via the
                 # splatfactow_dataparser subcommand so it finds our layout.
+                # splatfacto-w-light is deliberately NOT routed here: its
+                # upstream default is nerfstudio-data, which the author
+                # recommends for non-phototourism captures, so it falls
+                # through to the same dataparser logic as the built-in
+                # methods (and keeps a proper train/eval split).
                 cp = detect_colmap_path(Path(self._project.processed_dir))
-                if cp:
-                    argv.extend([
-                        "splatfactow_dataparser", "--colmap-path", cp,
-                    ])
+                if not cp:
+                    QMessageBox.warning(
+                        self, "splatfacto-w needs a COLMAP sparse model",
+                        f"'{self._project.name}' has no "
+                        "sparse/0/cameras.bin or colmap/sparse/0/cameras.bin, "
+                        "so splatfacto-w's dataparser cannot load it.\n\n"
+                        "Use splatfacto-w-light (works on any processed "
+                        "dataset), or reprocess the source through the "
+                        "Process tab to get a COLMAP model.",
+                    )
+                    return
+                argv.extend([
+                    "splatfactow_dataparser", "--colmap-path", cp,
+                ])
             elif self._project.dataparser == "colmap":
                 argv.append("colmap")
                 # Always forward the stored path rather than relying on

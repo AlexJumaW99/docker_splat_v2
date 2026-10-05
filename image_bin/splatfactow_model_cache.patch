@@ -1,0 +1,34 @@
+--- splatfactow_model.py	(gsplat>=1.5 radii fix applied by the Dockerfile sed)
++++ splatfactow_model.py	(eval colour-cache guard)
+@@ -986,14 +986,20 @@
+         else:
+             render_mode = "RGB"
+ 
+-        if use_cached_sh and self.cached_colors is not None:
++        if (
++            use_cached_sh
++            and self.cached_colors is not None
++            and self.cached_colors.shape[0] == appearance_features.shape[0]
++        ):
+             colors = self.cached_colors
+         else:
+             colors = self.color_nn(
+                 appearance_embed.repeat(appearance_features.shape[0], 1),
+                 appearance_features,
+             ).float()
+-            self.cached_colors = colors
++            # Only eval renders may populate the per-camera cache: a training render's
++            # colours are stale after the optimiser step and after densify/cull.
++            self.cached_colors = None if self.training else colors
+ 
+         render, alpha, info = rasterization(
+             means=means,
+@@ -1052,7 +1058,7 @@
+                 bg_sh_coeffs = self.bg_model.get_sh_coeffs(
+                     appearance_embedding=appearance_embed
+                 )
+-                self.cached_bg_sh = bg_sh_coeffs
++                self.cached_bg_sh = None if self.training else bg_sh_coeffs
+ 
+             background = spherical_harmonics(
+                 degrees_to_use=bg_sh_degree_to_use,
