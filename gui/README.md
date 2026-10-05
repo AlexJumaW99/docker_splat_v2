@@ -1,135 +1,139 @@
-# docker_splat_v2 · GUI
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:7C3AED,50:0EA5E9,100:76B900&height=180&section=header&text=docker_splat_v2%20%C2%B7%20GUI&fontSize=46&fontColor=FFFFFF&fontAlignY=38&desc=A%20PySide6%20desktop%20app%20that%20drives%20the%20splat-ns-v2%20container%20%E2%80%94%20forms%2C%20presets%2C%20lineage&descSize=16&descColor=ECFEFF&descAlignY=60&animation=fadeIn" width="100%"/>
+</p>
 
-A PySide6 desktop app that drives the `splat-ns-v2` container without touching
-the CLI. It's a thin, read-mostly front end over `docker exec` — the same
-`ns-process-data` / `ns-train` / `ns-export` / `ns-render` invocations you'd
-run by hand, wrapped in a form with sensible defaults and per-project state.
+<p align="center">
+  <a href="#-run-it"><img src="https://img.shields.io/badge/Run_It-7C3AED?style=for-the-badge&logo=rocket&logoColor=white" alt="Run it"/></a>
+  <a href="#-the-tabs"><img src="https://img.shields.io/badge/The_Tabs-0EA5E9?style=for-the-badge&logo=qt&logoColor=white" alt="The tabs"/></a>
+  <a href="#-projects"><img src="https://img.shields.io/badge/Projects-76B900?style=for-the-badge&logo=files&logoColor=white" alt="Projects"/></a>
+  <a href="#-lineage--manifests"><img src="https://img.shields.io/badge/Lineage-EC4899?style=for-the-badge&logo=databricks&logoColor=white" alt="Lineage"/></a>
+  <a href="#-safety-guarantees"><img src="https://img.shields.io/badge/Safety-1C3C3C?style=for-the-badge&logo=docker&logoColor=white" alt="Safety"/></a>
+</p>
 
-## Run
+<p align="center">
+  <img src="https://img.shields.io/badge/PySide6-6.11.0-41CD52?style=flat-square&logo=qt&logoColor=white"/>
+  <img src="https://img.shields.io/badge/pydantic-v2-E92063?style=flat-square&logo=pydantic&logoColor=white"/>
+  <img src="https://img.shields.io/badge/pillow--heif-%E2%89%A5_1.3-3776AB?style=flat-square&logo=python&logoColor=white"/>
+  <img src="https://img.shields.io/badge/JSON_Schema-Draft_2020--12-F59E0B?style=flat-square&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Docker-exec_only-2496ED?style=flat-square&logo=docker&logoColor=white"/>
+</p>
 
-```bash
-./run.sh
-```
+<br/>
 
-First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif
-(~90 MB). Subsequent launches are instant.
+> A **thin, read-mostly front end over `docker exec`**. Every button runs the same `ns-process-data` / `ns-train` / `ns-export` / `ns-render` / `ns-viewer` command you would type by hand — shown to you verbatim — wrapped in forms with sensible defaults, per-project presets, and a **manifest-driven warehouse** in which every artifact names the run it came from.
 
-## What works today
+---
 
-| Tab       | State    | What it does                                                                                                                                 |
-|-----------|----------|----------------------------------------------------------------------------------------------------------------------------------------------|
-| Dashboard | live     | Polls the Docker daemon, `splat-ns-v2` container, and GPU (via `nvidia-smi`). Shows the exact `docker build` / `docker create` commands if the container is missing, with copy buttons — never runs them for you. |
-| Process   | live     | Form-driven `ns-process-data` (video or images). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF (iPhone) to max-quality JPEG with EXIF preserved; originals stashed in `heic_originals/`. |
-| Train     | live     | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle, advanced raw-flag passthrough. Detects when the viser port becomes live and deep-links to `http://localhost:7007`. |
-| Exports   | live     | Form-driven `ns-export gaussian-splat` (PLY) and `ns-render camera-path` (MP4 from viser keyframe JSON). Each artifact lands in its own ULID directory under the warehouse — `data_v2/exports/splat/<EXPORT_ULID>/` for splats, `data_v2/renders/<RENDER_ULID>/` for videos — with a `manifest.json` whose `parent.run_id` is the train ULID. Collisions are impossible by construction. `mesh/` and `pointcloud/` sub-folders are reserved by the layout but not wired: `ns-export poisson / tsdf / marching-cubes / pointcloud` all require the volumetric-NeRF model interface, which `SplatfactoModel` doesn't implement. |
-| Viewers   | live     | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
-| Runs      | stub     | Placeholder for a training-run browser over `data/outputs/`.                                                                                 |
+<br/>
 
-## Projects
-
-A project bundles a dataset with its processing/training runs. Three ways to
-create one (**+ New project**):
-
-- **From video** — point at a video file inside `~/docker-stacks/docker_splat_v2/data/`.
-  The project goes through Process → Train like the CLI workflow.
-- **From images** — point at a folder of photos inside
-  `~/docker-stacks/docker_splat_v2/data/input_images/`. Supports JPEG, PNG, TIFF,
-  CR2, and HEIC/HEIF (auto-converted to JPEG). Goes Process → Train.
-- **Import processed dataset** — point at an already-processed folder inside
-  `~/docker-stacks/docker_splat_v2/data/`. The app auto-detects the layout:
-  - `transforms.json` at the root → Nerfstudio dataparser
-  - `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → COLMAP dataparser,
-    with the relative path recorded on the project so `ns-train` gets
-    `--colmap-path <rel>` at train time.
-  Imported projects skip straight to the Train tab.
-
-Per-project state (presets, last-used params, dataparser metadata) persists
-to `~/.config/docker_splat_v2_gui/projects.json`.
-
-## Lineage & manifests
-
-Process, Train, Export, and Render runs all write into the ULID-keyed
-warehouse at `~/docker-stacks/docker_splat_v2/data_v2/` (bind-mounted into
-the container at `/warehouse/`). Each run carries a `manifest.json`
-declaring its upstream parent run, so a `.ply` (or `.mp4`) traces back to
-its source video through four file reads with no tooling required:
-
-```
-data_v2/sources/<source_ULID>/manifest.json              # stage=source,  parent=null
-data_v2/processed/<process_ULID>/manifest.json           # stage=process, parent.run_id=<source_ULID>
-data_v2/trained/<train_ULID>/manifest.json               # stage=train,   parent.run_id=<process_ULID>
-data_v2/exports/<kind>/<export_ULID>/manifest.json       # stage=export,  parent.run_id=<train_ULID>   (kind: splat | pcd | mesh)
-data_v2/renders/<render_ULID>/manifest.json              # stage=render,  parent.run_id=<train_ULID>
-```
-
-The schema (Pydantic v2 + JSON Schema Draft 2020-12, frozen at v1.0) lives
-in [`app/manifest.py`](app/manifest.py) and the generated artifact at
-[`app/manifest_schema.json`](app/manifest_schema.json). The side-effect
-layer that mints ULIDs, computes checksums, copies sources, scrapes
-metrics, and writes manifests is in [`app/warehouse.py`](app/warehouse.py).
-
-### Why training also writes a `pending.json` sidecar
-
-`ns-train` typically launches with `--viewer.quit-on-train-completion False`
-so the viser viewer stays open after the last iteration. That keeps the
-process pinned alive past the actual end of training, which means a
-"manifest written on process exit" contract would never fire until the
-user closes the viewer. Even worse: if the GUI dies in that window, the
-successful run becomes an orphan on disk with no lineage breadcrumb.
-
-The Train tab works around both problems:
-
-1. **Write-ahead-log sidecar.** Before `ns-train` launches, the tab writes
-   `data_v2/trained/<ULID>/pending.json` capturing the declared parent
-   run, command, form params, and start time. The sidecar survives GUI
-   death.
-2. **`🎉 Training Finished 🎉` banner detection.** The tab watches
-   `ns-train`'s stdout for nerfstudio's completion banner and finalizes
-   the `TrainManifest` immediately when it appears — independent of
-   process exit. The pending sidecar is then deleted, preserving the
-   "`manifest.json` present = success" invariant.
-3. **Process-exit fallback.** If the banner isn't detected (older
-   nerfstudio, edited stdout, etc.) but the process eventually exits 0,
-   the manifest is written from the exit path as a fallback.
-
-### Recovering an orphan run
-
-If you ever find `data_v2/trained/<ULID>/pending.json` with no
-`manifest.json` (e.g. you killed the GUI while training was still alive),
-reconstruct the manifest from `config.yml` + the pending sidecar:
+## ⚡ Run It
 
 ```bash
-./.venv/bin/python -m app.warehouse backfill-train ../data_v2/trained/<ULID>
+cd gui && ./run.sh
 ```
 
-The CLI writes a `manifest.json` with `provenance: "backfilled"` and
-removes the pending sidecar. It works even without a pending sidecar
-(falls back to scraping `config.yml` alone) and refuses to overwrite an
-existing `manifest.json`.
+First launch creates `.venv/` and installs **PySide6 6.11.0**, **pydantic ≥ 2.5** and **pillow-heif ≥ 1.3** (about 90 MB). Later launches are instant. The app expects the `splat-ns-v2` container from the repository root's `docker compose up -d`; if it is missing, the Dashboard shows the build and create commands with copy buttons and never runs them for you.
 
-## Safety guarantees
+<br/>
 
-The Docker wrapper in `app/docker_service.py` exposes a narrow allow-list of
-subcommands:
+## 🗂️ The Tabs
 
-- Read-only: `docker version`, `docker info`, `docker inspect`,
-  `docker image inspect`, `docker port`
-- Lifecycle: `docker start`
-- Exec: `docker exec` — used by two narrow helpers (in-container port probe
-  and a `pkill`-based viser-port reclaim) plus `JobManager` for streaming
-  long-running `ns-process-data` / `ns-train` / `ns-viewer` runs. The Viewers
-  tab also uses detached `docker exec -d` to start TensorBoard.
+| Tab | State | What it does |
+| :--- | :---: | :--- |
+| **Dashboard** | live | Polls the Docker daemon, the `splat-ns-v2` container and the GPU (`nvidia-smi`). Can start a stopped container, and can start a stopped Docker daemon through a `pkexec systemctl start docker` prompt. Shows copyable `docker build` / `docker create` commands when the container is missing. |
+| **Process** | live | Form-driven `ns-process-data` for a **video** or an **image folder**. Frames target, matching method, downscale levels, camera type, crops, intrinsics refinement, seeds, SfM depth, eval video, raw CLI flags. Live `ffprobe` readout for videos; image count for folders; automatic **HEIC/HEIF → JPEG** (quality 100, EXIF kept, originals in `heic_originals/`). Optional **Run with vizer** hands the identical command to the vizer container so you can watch the point cloud form live. Warns when COLMAP splintered into several submaps. |
+| **Train** | live | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, checkpoint cadence, viser + TensorBoard mode, quit-on-completion, raw CLI flags. Picks the right dataparser subcommand for the project (`nerfstudio-data`, `colmap --colmap-path …`, or `splatfactow_dataparser` for `splatfacto-w` only) and refuses to start `splatfacto-w` on a dataset without a COLMAP sparse model. Detects when viser comes up and deep-links to `http://localhost:7007`. |
+| **Exports** | live | `ns-export gaussian-splat` (PLY) — auto-routed to the image's `ns-export-splatfactow` for the w-methods — and `ns-render camera-path` (MP4 from a viser keyframe JSON). Each artifact gets its own ULID directory and manifest. `mesh/` and `pointcloud/` are reserved by the layout but not wired: those exporters need the volumetric-NeRF model interface that `SplatfactoModel` does not implement. |
+| **Viewers** | live | Live port-status cards for viser (`:7007`) and TensorBoard (`:6006`). Run picker scoped to the active project — launch `ns-viewer` on a finished checkpoint, start / stop TensorBoard, open either in the browser. |
+| **Runs** | stub | Placeholder for a training-run browser. |
 
-It **cannot** build, create, remove, commit, tag, push, rename, stop, kill,
-or run containers. Your `splat-nerfstudio-v2` image and `splat-ns-v2` container
-are safe. If the container is missing, the Dashboard surfaces the `docker
-create` command from `USER_GUIDE.md` with a copy button — it never runs it for
-you.
+> [!TIP]
+> Every form field has a **?** help badge explaining the flag it drives and sensible ranges. **Advanced mode** reveals the raw-flag box; anything typed there is appended verbatim to the command.
 
-## Config
+<br/>
+
+## 📁 Projects
+
+A project bundles one dataset with its processing and training runs. **+ New project** offers three routes:
+
+| Route | Point it at | Then |
+| :--- | :--- | :--- |
+| **From video** | A video file inside `~/docker-stacks/docker_splat_v2/data/` | Process → Train |
+| **From images** | A folder of photos inside `data/` (conventionally `data/input_images/<scene>/`); JPEG, PNG, TIFF, CR2, HEIC/HEIF | Process → Train |
+| **Import processed dataset** | An already-processed folder inside `data_v2/` or `data/` — including runs processed in **vizer** | Straight to Train |
+
+Import auto-detects the layout: `transforms.json` at the root → `nerfstudio-data`; `sparse/0/cameras.bin` or `colmap/sparse/0/cameras.bin` → `colmap`, with the relative path stored on the project so `ns-train` receives `--colmap-path <rel>`.
+
+Per-project state — presets, last-used parameters, dataparser metadata — persists in `~/.config/docker_splat_v2_gui/projects.json`. Delete the directory to reset; it is recreated on the next launch.
+
+<br/>
+
+## 🧬 Lineage & Manifests
+
+Process, Train, Export and Render runs all write into the ULID-keyed warehouse at `~/docker-stacks/docker_splat_v2/data_v2/` (mounted in the container at `/warehouse/`). Each run carries a `manifest.json` that declares its parent, so a `.ply` or an `.mp4` traces back to its source video through four file reads and nothing else:
+
+```mermaid
+flowchart LR
+    S["📦 sources/&lt;ULID&gt;\nstage=source"] --> P["🎞️ processed/&lt;ULID&gt;\nstage=process"]
+    P --> T["🧠 trained/&lt;ULID&gt;\nstage=train"]
+    T --> E["💾 exports/&lt;kind&gt;/&lt;ULID&gt;\nstage=export"]
+    T --> R["🎬 renders/&lt;ULID&gt;\nstage=render"]
+
+    style S fill:#76B900,color:#fff,stroke:#76B900
+    style P fill:#0EA5E9,color:#fff,stroke:#0EA5E9
+    style T fill:#EC4899,color:#fff,stroke:#EC4899
+    style E fill:#7C3AED,color:#fff,stroke:#7C3AED
+    style R fill:#7C3AED,color:#fff,stroke:#7C3AED
+```
+
+The schema (Pydantic v2 + JSON Schema Draft 2020-12, frozen at v1.0) lives in [`app/manifest.py`](app/manifest.py) with the generated artifact at [`app/manifest_schema.json`](app/manifest_schema.json). The side-effect layer that mints ULIDs, computes SHA-256 checksums, copies sources, scrapes metrics and writes manifests is [`app/warehouse.py`](app/warehouse.py); [`app/manifest_index.py`](app/manifest_index.py) validates and indexes what is on disk.
+
+### Why training also writes a `pending.json`
+
+`ns-train` usually runs with `--viewer.quit-on-train-completion False`, so the process stays alive long after the last iteration to keep viser up. A manifest written "on process exit" would therefore never fire until you close the viewer — and if the GUI died in that window the finished run would be an orphan with no lineage. The Train tab solves both:
+
+1. **Write-ahead sidecar.** Before `ns-train` starts, `data_v2/trained/<ULID>/pending.json` records the parent run, the command, the form parameters and the start time.
+2. **Banner detection.** The tab watches stdout for nerfstudio's `🎉 Training Finished 🎉` banner and finalizes the `TrainManifest` the moment it appears, independent of process exit. The sidecar is then removed, preserving the invariant *manifest present = success*.
+3. **Exit fallback.** If the banner is never seen but the process exits 0, the manifest is written from the exit path.
+
+### Warehouse command line
+
+```bash
+./.venv/bin/python -m app.warehouse backfill-train ../data_v2/trained/<ULID>   # rebuild a manifest for an orphan run (provenance="backfilled")
+./.venv/bin/python -m app.warehouse verify <manifest.json> [...]               # re-check recorded SHA-256 checksums
+./.venv/bin/python -m app.warehouse stale-pending                               # train runs with pending.json but no manifest (> 24 h old)
+./.venv/bin/python -m app.warehouse orphans                                     # manifests whose parent.run_id does not resolve
+```
+
+`backfill-train` works from `config.yml` alone if the sidecar is gone and refuses to overwrite an existing manifest.
+
+<br/>
+
+## 🔒 Safety Guarantees
+
+The Docker wrapper in [`app/docker_service.py`](app/docker_service.py) exposes a deliberately narrow allow-list:
+
+| Allowed | Used for |
+| :--- | :--- |
+| `docker version`, `docker info`, `docker inspect`, `docker image inspect`, `docker port` | Read-only status on the Dashboard and Viewers tabs |
+| `docker start` | Starting a stopped `splat-ns-v2` |
+| `docker exec` | Streaming `ns-*` jobs through `JobManager`; an in-container port probe; a `pkill`-based reclaim of a stuck viser port; detached TensorBoard start / stop |
+| `pkexec systemctl start docker` | Starting a stopped Docker *daemon* after the system's own authorization prompt |
+
+It **cannot** build, create, remove, commit, tag, push, rename, stop, kill or run containers — those subcommands have no method to call. Your image and container are safe from the GUI by construction.
+
+<br/>
+
+## ⚙️ Config
 
 State lives in `~/.config/docker_splat_v2_gui/`:
 
-- `projects.json` — project list, active project, presets, last-used params.
+- `projects.json` — project list, active project, presets, last-used parameters.
 
-Delete the directory to reset. The app recreates it on next launch.
+Delete the directory to reset. The app recreates it on the next launch.
+
+<br/>
+
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:7C3AED,50:0EA5E9,100:76B900&height=100&section=footer&animation=fadeIn" width="100%"/>
+</p>

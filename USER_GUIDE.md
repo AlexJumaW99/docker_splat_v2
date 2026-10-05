@@ -541,12 +541,14 @@ See the [Real-time monitoring section](#real-time-monitoring-with-tensorboard) f
 
 ### Choosing `--max-num-iterations`
 
-| Iterations | Time (RTX 5070 Ti) | Use case |
+| Iterations | Time (RTX 5070 Ti, measured 2026-10-05 on 235 frames at 960 px) | Use case |
 |---|---|---|
-| 2000 | ~3–5 min | Quick "does it work" check |
-| 7000 | ~10–15 min | Good-quality preview |
-| 30000 (default) | ~45–60 min | Publication quality |
-| 50000+ | > 1 hr | Diminishing returns |
+| 2000 | < 1 min | Quick "does it work" check |
+| 7000 | ~1.5 min (87 s) — PSNR 31.0 on the test scene | Preview quality; the GUI's default |
+| 30000 (Nerfstudio default) | ~6 min (370 s) at 960 px, ~15 min (892 s) at 1920 px — PSNR 33.9 / 32.5 | Final quality; every schedule in the presets (densification stop, learning-rate decay) assumes 30 000 |
+| 50000+ | > 25 min | Diminishing returns for splatfacto; `splatfacto-w`'s upstream default is 55 000 |
+
+Times scale with frame count, training resolution and gaussian count: training the same scene at 1920 px took 2.4× as long as at 960 px.
 
 ### First run: gsplat JIT compilation
 
@@ -834,7 +836,7 @@ ns-export gaussian-splat \
   --output-dir /workspace/outputs/<dataset>/export
 ```
 
-Output: `splat.ply` in the specified directory. File size is typically 100–500 MB for a 7000-iteration model with ~80M gaussians. Note: running the raw CLI twice into the same `--output-dir` overwrites `splat.ply`; the GUI's Exports tab avoids this.
+Output: `splat.ply` in the specified directory. The file holds 62 float32 properties per gaussian (~248 bytes), so size tracks gaussian count: 232 k gaussians → 58 MB and 517 k → 128 MB (measured); a 7 000-iteration `splatfacto` model lands between roughly 0.3 M and 0.9 M gaussians depending on scene and resolution. Note: running the raw CLI twice into the same `--output-dir` overwrites `splat.ply`; the GUI's Exports tab avoids this.
 
 ### Via the CLI — `splatfacto-w` / `splatfacto-w-light`
 
@@ -895,7 +897,7 @@ ns-render camera-path \
   --output-path /workspace/renders/<project>/<camera-path-stem>.mp4
 ```
 
-Rendering time scales with video length and scene gaussian count. A 10-second 1080p path from an 80M-gaussian scene takes a few minutes on an RTX 5070 Ti.
+Rendering time scales with frame count, output resolution and scene gaussian count (a 7 000-iteration `splatfacto` scene holds roughly 0.3–0.9 M gaussians). The camera-path JSON carries the output resolution and frame rate: an 8-second 60 fps path at 3840×2160 is 480 frames.
 
 ---
 
@@ -1024,7 +1026,9 @@ docker create --name splat-ns-v2 --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -v ~/docker-stacks/docker_splat_v2/data:/workspace \
+  -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \
   -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2
+# (equivalent, preferred: `docker compose up -d` from the repo root)
 
 # Daily lifecycle
 docker start splat-ns-v2

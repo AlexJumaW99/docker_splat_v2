@@ -1,259 +1,383 @@
-<div align="center">
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:76B900,50:0EA5E9,100:7C3AED&height=220&section=header&text=docker_splat_v2&fontSize=58&fontColor=FFFFFF&fontAlignY=35&desc=Blackwell-native%203D%20Gaussian%20Splatting%20%E2%80%A2%20COLMAP%20%2B%20gsplat%20%2B%20Nerfstudio%20%E2%80%A2%20Video%20in%2C%20splat%20out&descSize=17&descColor=ECFEFF&descAlignY=56&animation=fadeIn" width="100%"/>
+</p>
 
-# docker_splat_v2
+<p align="center">
+  <a href="#-quick-start"><img src="https://img.shields.io/badge/Quick_Start-76B900?style=for-the-badge&logo=rocket&logoColor=white" alt="Quick Start"/></a>
+  <a href="#-features"><img src="https://img.shields.io/badge/Features-0EA5E9?style=for-the-badge&logo=sparkfun&logoColor=white" alt="Features"/></a>
+  <a href="#-the-pipeline"><img src="https://img.shields.io/badge/Pipeline-7C3AED?style=for-the-badge&logo=diagramsdotnet&logoColor=white" alt="Pipeline"/></a>
+  <a href="#-training-methods"><img src="https://img.shields.io/badge/Methods-EC4899?style=for-the-badge&logo=pytorch&logoColor=white" alt="Methods"/></a>
+  <a href="#-tech-stack"><img src="https://img.shields.io/badge/Tech_Stack-1C3C3C?style=for-the-badge&logo=docker&logoColor=white" alt="Tech Stack"/></a>
+</p>
 
-### Blackwell-native Docker pipeline for 3D Gaussian Splatting
+<p align="center">
+  <img src="https://img.shields.io/badge/CUDA-13.0-76B900?style=flat-square&logo=nvidia&logoColor=white"/>
+  <img src="https://img.shields.io/badge/PyTorch-2.10_(NGC_25.11)-EE4C2C?style=flat-square&logo=pytorch&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Nerfstudio-1.1.5_@50e0e3c-F59E0B?style=flat-square&logoColor=white"/>
+  <img src="https://img.shields.io/badge/gsplat-1.5.3-0EA5E9?style=flat-square&logoColor=white"/>
+  <img src="https://img.shields.io/badge/COLMAP-4.1.0.dev0_@ffb5404-7C3AED?style=flat-square&logoColor=white"/>
+  <img src="https://img.shields.io/badge/hloc-1.5-EC4899?style=flat-square&logoColor=white"/>
+  <img src="https://img.shields.io/badge/GPU-RTX_50_series_(sm__120)-76B900?style=flat-square&logo=nvidia&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Host-Pop!__OS_24.04-48B9C7?style=flat-square&logo=popos&logoColor=white"/>
+</p>
 
-**Turn videos into 3D Gaussian Splats on RTX 50-series GPUs.**
-A fully reproducible Docker stack with COLMAP, gsplat, and Nerfstudio — configured from scratch for `sm_120` (Blackwell) compute capability.
+<br/>
 
----
-
-![Linux](https://img.shields.io/badge/OS-Pop!__OS%2024.04-48B9C7?style=flat-square&logo=ubuntu&logoColor=white)
-![CUDA](https://img.shields.io/badge/CUDA-13.0-76B900?style=flat-square&logo=nvidia&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.10_NGC-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-28.2-2496ED?style=flat-square&logo=docker&logoColor=white)
-![GPU](https://img.shields.io/badge/GPU-RTX_5070_Ti_(sm__120)-76B900?style=flat-square&logo=nvidia&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Verified_working-success?style=flat-square)
-
-</div>
-
----
-
-## Why this exists
-
-The official Nerfstudio Docker image ships CUDA 11.8 and doesn't know what to do with a Blackwell GPU. The official COLMAP binary doesn't include Blackwell kernels. Gsplat's PyPI wheel JIT-compiles against whatever CUDA toolchain it finds — which breaks if you try to mix toolchains.
-
-This repo solves all three problems in a single reproducible Docker build:
-
-- **Blackwell `sm_120` kernels** compiled from source for both COLMAP and gsplat
-- **Pinned against NGC PyTorch 25.11** (CUDA 13.0, Python 3.12, sm_120 pre-compiled)
-- **Multi-stage Dockerfile** with `--target` support for incremental rebuilds
-- **Compatibility patch included** for the COLMAP `SiftExtraction` → `FeatureExtraction` flag rename that breaks Nerfstudio 1.1.5 out of the box
-- **COLMAP multi-submap auto-fix** via a PATH-shim that promotes the largest submap into `sparse/0` so `ns-process-data` doesn't silently export a 2-frame bootstrap stub
-- **Real-time training monitoring** via viser (3D preview) + TensorBoard (metrics/eval images) simultaneously
-
-End-to-end tested on an 80-second 720p orbit video: 98.12% pose recovery, ~84M gaussians at 7000 iterations, ~15 minutes on an RTX 5070 Ti.
+> A **fully reproducible Docker stack** that turns a video or a folder of photos into a **3D Gaussian Splat** on RTX 50-series GPUs. COLMAP and gsplat are compiled for `sm_120`, Nerfstudio is pinned to a known commit, every upstream patch is applied in the Dockerfile and asserted by a **76-check smoke test** — and a **PySide6 desktop app** drives the whole thing with a manifest-driven, lineage-tracked warehouse.
 
 ---
 
-## Stack
+<br/>
 
-| Component | Version | Source | Purpose |
-|---|---|---|---|
-| **Base image** | `nvcr.io/nvidia/pytorch:25.11-py3` | NGC | CUDA 13.0 + PyTorch 2.10 + sm_120 |
-| **COLMAP** | `4.1.0.dev0` (commit `ffb5404`) | Built from source, pinned commit | SfM + GPU SIFT |
-| **gsplat** | `1.5.3` | PyPI (JIT-compiled at runtime) | Gaussian rasterization. Latest release as of 2026-10; the library's 2DGS / 3DGUT / fisheye modes are *not* reachable through nerfstudio's `splatfacto*` flags at this nerfstudio commit |
-| **Nerfstudio** | `1.1.5` (git `50e0e3c`) | git main, pinned | Training CLI + viewer |
-| **splatfacto-w** | `0.1.5` (git `119a3bf`) | [KevinXu02/splatfacto-w](https://github.com/KevinXu02/splatfacto-w) | `splatfacto-w` / `splatfacto-w-light` methods (dataparser overlay + colour-cache patch, see below) |
-| **hloc** | `1.5` (git `c13273b`) + LightGlue `eb42fee`, `pycolmap 3.13.0`, `kornia 0.8.3` | [cvg/Hierarchical-Localization](https://github.com/cvg/Hierarchical-Localization) | Learned features for `ns-process-data --sfm-tool hloc` (SuperPoint / DISK + LightGlue / SuperGlue) |
-| **Viser** | `1.0.0` | Pinned by Nerfstudio (`viser==1.0.0`) | Web-based 3D viewer (port 7007) |
-| **TensorBoard** | `2.20.0` | Bundled with NGC PyTorch | Metrics + eval image logging (port 6006) |
-| **ffmpeg** | `6.1.1` | apt | Video frame extraction |
+## 🧠 What This Project Is
 
----
+The official Nerfstudio image ships CUDA 11.8 and cannot run on a Blackwell GPU; the official COLMAP binary has no Blackwell kernels; gsplat JIT-compiles against whatever toolchain it finds. This repository fixes all of that in one multi-stage build on top of **NGC PyTorch 25.11** (CUDA 13.0, Python 3.12), then layers on the pieces you actually need day to day: five training methods, learned-feature matching, a 360° video path, viser and TensorBoard side by side, PLY export and camera-path rendering, and a desktop GUI whose every artifact traces back to its source video through `manifest.json` files alone.
 
-## Quick start
+Think of it as **the splat factory for one workstation** — build once, process, train, export, repeat — with every build-time decision written down and tested.
 
-**Prerequisites:** Linux host with NVIDIA driver ≥ 580, Docker 28+, NVIDIA Container Toolkit, and a Blackwell GPU (RTX 5070 Ti, 5080, 5090, etc.). See [USER_GUIDE.md](USER_GUIDE.md#host-prerequisites) for full setup.
+<br/>
 
-### TL;DR — Makefile shortcuts
+## ✨ Features
 
-If you have `make` installed, one target covers disaster recovery end-to-end:
+<table>
+<tr>
+<td width="50%" valign="top">
 
-```bash
-git clone https://github.com/AlexJumaW99/docker_splat_v2.git
-cd docker_splat_v2
-make fresh        # down → build → up → ./smoke_test.sh (full verification)
+**$\textsf{\color{#76B900}Reproducible Blackwell image}$**
+
+&nbsp;&nbsp;🟢 COLMAP and gsplat compiled for **`sm_120`**; NGC PyTorch 25.11 base\
+&nbsp;&nbsp;🟢 Every dependency **pinned to a commit or version** (`COLMAP_COMMIT`, `NERFSTUDIO_COMMIT`, `SPLATFACTOW_COMMIT`, `HLOC_COMMIT`, `VOCAB_TREE_SHA256` …)\
+&nbsp;&nbsp;🟢 **Twelve upstream fixes** applied in the Dockerfile — flag renames, `torch.load` safety, viewer crash, submap promotion, splatfacto-w data loading, and more\
+&nbsp;&nbsp;🟢 `smoke_test.sh` asserts **76 checks** against the running container, from CUDA kernels to patch anchors\
+&nbsp;&nbsp;🟢 Warm rebuilds in **seconds** thanks to a 5-stage layout; `make fresh` for disaster recovery
+
+</td>
+<td width="50%" valign="top">
+
+**$\textsf{\color{#0EA5E9}Processing (Structure from Motion)}$**
+
+&nbsp;&nbsp;🔵 Video or image folders → frames → poses → `transforms.json`\
+&nbsp;&nbsp;🔵 Camera types **perspective · fisheye · equirectangular · pinhole · simple_pinhole** (360° video is cut into perspective views automatically)\
+&nbsp;&nbsp;🔵 Matching **sequential · vocab_tree · exhaustive** with a pre-placed faiss vocabulary tree\
+&nbsp;&nbsp;🔵 **Learned features** via hloc — SuperPoint / DISK + LightGlue / SuperGlue — for scenes where SIFT struggles\
+&nbsp;&nbsp;🔵 A PATH-shim promotes the **largest COLMAP submap** into `sparse/0` so a 2-frame bootstrap can never masquerade as the dataset\
+&nbsp;&nbsp;🔵 iPhone **HEIC/HEIF → JPEG** conversion with EXIF preserved
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**$\textsf{\color{#EC4899}Training}$ & $\textsf{\color{#EC4899}Export}$**
+
+&nbsp;&nbsp;🌸 **Five methods**: `splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`\
+&nbsp;&nbsp;🌸 **viser** 3D viewer (`:7007`) and **TensorBoard** (`:6006`) at the same time\
+&nbsp;&nbsp;🌸 `splatfacto-w` works on **ordinary COLMAP datasets**, not just phototourism — dataparser v2 + colour-cache patch, verified end to end\
+&nbsp;&nbsp;🌸 **PLY export** for every method, including a custom exporter that bakes splatfacto-w's appearance MLP into standard spherical harmonics\
+&nbsp;&nbsp;🌸 **Camera-path video** rendering from viser keyframes
+
+</td>
+<td valign="top">
+
+**$\textsf{\color{#7C3AED}Desktop GUI}$ & $\textsf{\color{#7C3AED}Warehouse}$**
+
+&nbsp;&nbsp;🟣 PySide6 app: **Dashboard · Process · Train · Exports · Viewers** — the exact `ns-*` commands, as forms with presets and tooltips\
+&nbsp;&nbsp;🟣 **ULID-keyed warehouse** (`data_v2/`): source → process → train → export / render, each with a `manifest.json` that names its parent\
+&nbsp;&nbsp;🟣 JSON-Schema-validated manifests, SHA-256 checksums, a **write-ahead `pending.json`** so a closed GUI never strands a finished run\
+&nbsp;&nbsp;🟣 Import already-processed folders (nerfstudio or COLMAP layout) or runs processed live in **vizer**\
+&nbsp;&nbsp;🟣 A narrow Docker allow-list: the app can `inspect`, `start` and `exec` — it can never build, remove or run containers
+
+</td>
+</tr>
+</table>
+
+<br/>
+
+## 🎬 The Pipeline
+
+One container, five CLIs, and a GUI that calls them for you. Every box below is a real command you can also run by hand.
+
+```mermaid
+flowchart LR
+    A["🎥 Video or\nphoto folder"] --> B["🎞️ ffmpeg\nframes + downscales"]
+    B --> C["📐 COLMAP SIFT\nor hloc features"]
+    C --> D["🧭 Poses\ntransforms.json"]
+    D --> E["🧠 ns-train\nsplatfacto family"]
+    E --> F["👁️ viser :7007\nTensorBoard :6006"]
+    E --> G["💾 ns-export\n.ply"]
+    E --> H["🎬 ns-render\ncamera-path .mp4"]
+    G --> I["✨ SuperSplat\n& web viewers"]
+
+    style A fill:#76B900,color:#fff,stroke:#76B900
+    style B fill:#4D7C0F,color:#fff,stroke:#4D7C0F
+    style C fill:#0EA5E9,color:#fff,stroke:#0EA5E9
+    style D fill:#0284C7,color:#fff,stroke:#0284C7
+    style E fill:#EC4899,color:#fff,stroke:#EC4899
+    style F fill:#7C3AED,color:#fff,stroke:#7C3AED
+    style G fill:#7C3AED,color:#fff,stroke:#7C3AED
+    style H fill:#7C3AED,color:#fff,stroke:#7C3AED
+    style I fill:#D97706,color:#fff,stroke:#D97706
 ```
 
-Everyday: `make up` (start), `make shell` (bash into `/workspace`), `make test` (run smoke suite), `make down` (stop + remove). Run `make help` for the list, or skip the Makefile entirely and use the raw commands in the numbered steps below — they're equivalent.
+### What goes in
+
+| Input | How | Notes |
+| :--- | :--- | :--- |
+| **Video** (`.mp4`, `.MOV` …) | `ns-process-data video` — Process tab default | `--num-frames-target` samples frames evenly; sequential matching is the right default for continuous footage |
+| **Photo folder** | `ns-process-data images` | JPEG, PNG, TIFF, CR2, HEIC/HEIF; exhaustive matching for < 100 photos |
+| **360° video** | `--camera-type equirectangular` | Each frame becomes 8 (or 14) perspective crops; verified 336/336 crops registered on a 42-frame sample |
+| **Already-processed folder** | GUI → *Import processed dataset* | `transforms.json` or `sparse/0` / `colmap/sparse/0` layouts, from `data/` or `data_v2/` |
+| **Other pose sources** (CLI only) | `ns-process-data polycam · metashape · realitycapture · record3d · odm · aria` | Skip matching entirely; not exposed in the GUI |
+
+### Camera & matching support, as measured
+
+| Layer | Accepts | Notes |
+| :--- | :--- | :--- |
+| `ns-process-data --camera-type` | perspective, fisheye, equirectangular, pinhole, simple_pinhole | Maps to COLMAP `OPENCV`, `OPENCV_FISHEYE`, planar crops → `OPENCV`, `PINHOLE`, `SIMPLE_PINHOLE` |
+| Importing a COLMAP model | + `SIMPLE_RADIAL`, `RADIAL`, `SIMPLE_RADIAL_FISHEYE`, `RADIAL_FISHEYE` | `FULL_OPENCV`, `FOV` and others raise `NotImplementedError` |
+| What splatfacto trains on | perspective, fisheye, FISHEYE624 | All undistorted to pinhole before training; the rasterizer is always called as pinhole |
+| `--matching-method` | `sequential`, `vocab_tree`, `exhaustive` | Under `--sfm-tool hloc`, `sequential` and `vocab_tree` both mean NetVLAD top-50 retrieval |
+| hloc features / matchers that work here | `sift`, `superpoint_*`, `sosnet`, `disk` · `superglue*`, `NN-*`, `superpoint+lightglue`, `disk+lightglue` | `r2d2`, `d2net-ss`, `adalam` do not import in this build |
+
+> [!NOTE]
+> The SuperPoint / SuperGlue weights hloc ships are licensed by Magic Leap for **non-commercial research use only**. `disk+lightglue` is the permissively licensed combination.
+
+<br/>
+
+## 🧪 Training Methods
+
+| Method | What it is | When to pick it |
+| :--- | :--- | :--- |
+| **`splatfacto`** | Nerfstudio's 3DGS recipe, default strategy | The starting point for most captures |
+| **`splatfacto-big`** | Same, with lower cull / densify thresholds (`cull_alpha 0.005`, `densify_grad 0.0005`) | Detail-rich scenes; more gaussians, more VRAM |
+| **`splatfacto-mcmc`** | MCMC densification (gsplat `MCMCStrategy`), capped at 1 M gaussians, relocation until step 25 k | Predictable gaussian budget; sparse-view scenes |
+| **`splatfacto-w-light`** | In-the-wild variant: per-image appearance embedding, no background model | Exposure or lighting drift across the capture; runs on any processed dataset |
+| **`splatfacto-w`** | Full in-the-wild model: appearance + learned background + transient masking | Crowded or changing scenes; needs the COLMAP sparse model with perspective cameras |
+
+### Numbers from this machine (RTX 5070 Ti · `buddha_v2`, 261 frames, 4K source · 2026-10-05)
+
+| Run | Gaussians | PSNR | Wall time |
+| :--- | ---: | ---: | ---: |
+| `splatfacto` 7 000 its @ 960 px | 329 059 | 30.99 | 87 s |
+| `splatfacto` 30 000 its @ 960 px | 349 329 | 33.93 | 370 s |
+| `splatfacto` 30 000 its @ 1920 px | 560 854 | 32.46 (viewed @ 1920) | 892 s |
+| `splatfacto-big` 7 000 its @ 960 px | 688 515 | — | 123 s |
+| `splatfacto-w-light` 7 000 its @ 960 px | 250 083 | 30.76 | 255 s |
+| `splatfacto-w` 7 000 its @ 960 px | 253 578 | 29.43 (right-half protocol) | 205 s |
+
+> [!TIP]
+> A splat is only as sharp as the resolution it was trained at: the 960 px model scores **28.2 dB** when viewed at 1920 px, the 1920 px model **32.5 dB**. Nerfstudio's auto rule trains 4K sources at 960 px — see [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2.2 for the training-resolution control and the full measurements.
+
+<br/>
+
+## ⚡ Quick Start
+
+### Prerequisites
+
+| Requirement | Required | Notes |
+| :--- | :---: | :--- |
+| **Linux host** (tested on Pop!_OS 24.04) | ✅ | |
+| **NVIDIA driver ≥ 580** + **NVIDIA Container Toolkit** | ✅ | `nvidia-smi` must work inside Docker |
+| **Docker 28+** with Compose | ✅ | `docker compose version` |
+| **Blackwell GPU** (RTX 5070 Ti, 5080, 5090 …) | ✅ | `TORCH_CUDA_ARCH_LIST=12.0` — see [Known limitations](#-known-limitations) for other cards |
+| **`make`** | optional | Wraps the Compose commands below |
 
 ### 1. Clone and build
 
 ```bash
 git clone https://github.com/AlexJumaW99/docker_splat_v2.git
 cd docker_splat_v2
-docker build --target nerfstudio -t splat-nerfstudio-v2 .
+make fresh          # down → build → up → ./smoke_test.sh
 ```
 
-Build takes **25–40 minutes** on first run (COLMAP compile is the bottleneck, ~10 min). Subsequent rebuilds leverage Docker's layer cache for near-instant iteration.
-
-### 2. Create and start the persistent container
+Or without `make`:
 
 ```bash
-mkdir -p ~/docker-stacks/docker_splat_v2/data \
-         ~/docker-stacks/docker_splat_v2/data_v2
-
-docker create --name splat-ns-v2 --gpus all --ipc=host \
-  --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
-  -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -v ~/docker-stacks/docker_splat_v2/data:/workspace \
-  -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \
-  -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2
-
-docker start splat-ns-v2
-docker exec -it splat-ns-v2 bash
+docker compose build
+docker compose up -d
+./smoke_test.sh
 ```
 
-**Two ports mapped:** `7007` for the viser 3D viewer, `6006` for TensorBoard metrics. Both are optional but recommended for full visibility during training.
+A cold build takes **25–40 minutes** (COLMAP compiles from source); with a warm layer cache a rebuild takes seconds. The compose file carries the full runtime contract — GPU access, `--ipc=host`, 16 GB `/dev/shm`, the two bind mounts (`data/` → `/workspace`, `data_v2/` → `/warehouse`), the two ports, and four cache volumes that survive rebuilds.
 
-**Two bind mounts:** `data/` is the legacy artifact tree (still used by raw CLI workflows); `data_v2/` is the new ULID-keyed, manifest-driven warehouse where the GUI writes new sources, processed datasets, and training runs. `make up` and `docker compose up -d` set both up automatically.
-
-### 3. Process a video → train → view
+### 2. Process → train → view (CLI)
 
 ```bash
-# Inside the container — drop your video at ~/docker-stacks/docker_splat_v2/data/ first
+docker compose exec nerfstudio bash           # a shell at /workspace
+
 ns-process-data video --data /workspace/yourvideo.mp4 \
   --output-dir /workspace/processed/yourvideo_splat \
   --num-frames-target 250 --matching-method sequential
 
 ns-train splatfacto --data /workspace/processed/yourvideo_splat \
-  --output-dir /workspace/outputs --max-num-iterations 7000 \
+  --output-dir /workspace/outputs --max-num-iterations 30000 \
   --vis viewer+tensorboard \
   --viewer.websocket-host 0.0.0.0 --viewer.quit-on-train-completion False
 ```
 
-Open `http://localhost:7007` for the 3D view. In a second shell (`docker exec -it splat-ns-v2 bash`), run `tensorboard --logdir /workspace/outputs --bind_all --port 6006` and open `http://localhost:6006` for live metrics.
+Open **http://localhost:7007** for the live 3D view. In a second shell run `tensorboard --logdir /workspace/outputs --bind_all --port 6006` and open **http://localhost:6006**.
 
-Available training methods: `splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`.
-
-For detailed workflow, troubleshooting, and export instructions, see **[USER_GUIDE.md](USER_GUIDE.md)**.
-
-### 4. Optional: desktop GUI
-
-A PySide6 desktop app lives in [`gui/`](gui/) and drives the same `splat-ns-v2` container without the CLI. It runs the exact `ns-process-data` / `ns-train` / `ns-export` / `ns-render` / `ns-viewer` invocations you'd run by hand, with per-project state, an "import processed dataset" flow for already-reconstructed folders like Tanks & Temples, an **Exports tab** for PLY export (auto-routed to the splatfacto-w-aware exporter when applicable) and camera-path video rendering, and a **Viewers tab** for launching ns-viewer against finished checkpoints and starting/stopping TensorBoard scoped to the active project. Process, Train, Export, and Render outputs all land in the manifest-driven `data_v2/` warehouse, ULID-keyed and lineage-linked via `parent.run_id` so any artifact traces back to its source video through file reads alone. The Process tab accepts both video files and image folders as input, with automatic HEIC/HEIF → JPEG conversion (quality 100, EXIF preserved) for iPhone photos — originals are stashed in a `heic_originals/` subfolder.
+### 3. Or use the desktop GUI
 
 ```bash
 cd gui && ./run.sh
 ```
 
-First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif. See [gui/README.md](gui/README.md) and the [Desktop GUI section](USER_GUIDE.md#desktop-gui-optional) of the user guide.
+First launch creates `.venv/` and installs PySide6 6.11, pydantic and pillow-heif. Everything the GUI writes lands in the `data_v2/` warehouse with lineage manifests. See [`gui/README.md`](gui/README.md).
 
----
+> [!IMPORTANT]
+> The full walkthrough — recording tips, every flag, the warehouse layout, exporting to SuperSplat, troubleshooting — is in **[USER_GUIDE.md](USER_GUIDE.md)**.
 
-## Architecture
+<br/>
 
-The Dockerfile uses a 5-stage build. Each stage is independently buildable with `docker build --target <stage>`, which dramatically speeds up iteration during development.
+## 🏗️ Build Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 1: base                                              │
-│  NGC PyTorch 25.11 + Blackwell env vars                     │
-│  ──────────────────────────────────────────────             │
-│  TORCH_CUDA_ARCH_LIST=12.0  FORCE_CUDA=1  CUDA_HOME=...     │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────┐
-│  Stage 2: system-deps                                       │
-│  apt install — COLMAP + ffmpeg build dependencies           │
-│  ──────────────────────────────────────────────             │
-│  Qt6, Ceres, Boost, Eigen, MKL, glog, gtest, SuiteSparse…   │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────┐
-│  Stage 3: colmap                                            │
-│  COLMAP from source, CMAKE_CUDA_ARCHITECTURES=120           │
-│  ──────────────────────────────────────────────             │
-│  SIFT on GPU via sm_120 kernels                             │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────┐
-│  Stage 4: gsplat (pinned to 1.5.3 PyPI wheel)               │
-│  Re-installed after nerfstudio's 1.4.0 downgrade in Stage 5 │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────┐
-│  Stage 5: nerfstudio                                        │
-│  pip install nerfstudio (git pin) + COLMAP/torch.load       │
-│  patches + splatfacto-w (KevinXu02, pinned commit)          │
-│  ──────────────────────────────────────────────             │
-│  ns-train, ns-process-data, ns-viewer, ns-export, ns-render │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    S1["<b>Stage 1 · base</b><br/>nvcr.io/nvidia/pytorch:25.11-py3<br/>TORCH_CUDA_ARCH_LIST=12.0"]
+    S2["<b>Stage 2 · system-deps</b><br/>Qt6 · Ceres · Boost · Eigen · MKL · ffmpeg"]
+    S3["<b>Stage 3 · colmap</b><br/>COLMAP @ ffb5404, CMAKE_CUDA_ARCHITECTURES=120<br/>GPU SIFT · ALIKED/LightGlue via onnxruntime"]
+    S4["<b>Stage 4 · gsplat</b><br/>gsplat 1.5.3 (PyPI wheel, JIT at runtime)"]
+    S5["<b>Stage 5 · nerfstudio</b><br/>nerfstudio @ 50e0e3c + patches<br/>splatfacto-w @ 119a3bf + overlay & cache patch<br/>colmap-shim · faiss vocab tree · hloc @ c13273b"]
+    S1 --> S2 --> S3 --> S4 --> S5
+
+    style S1 fill:#76B900,color:#fff,stroke:#76B900
+    style S2 fill:#4D7C0F,color:#fff,stroke:#4D7C0F
+    style S3 fill:#0EA5E9,color:#fff,stroke:#0EA5E9
+    style S4 fill:#EC4899,color:#fff,stroke:#EC4899
+    style S5 fill:#7C3AED,color:#fff,stroke:#7C3AED
 ```
 
----
+Each stage is buildable on its own with `docker build --target <stage>`. The upgrade ritual for any pinned component is: bump the `ARG`, rebuild, run `./smoke_test.sh`.
 
-## What's been fixed
-
-Twelve non-obvious issues you'd hit trying to build this yourself:
+<details>
+<summary><b>🔧 What's been fixed — twelve issues you would otherwise hit</b></summary>
+<br/>
 
 | Issue | Root cause | Fix |
 |---|---|---|
 | COLMAP CMake fails with `Could NOT find Qt6Svg` | Undocumented new Qt6 Svg dependency in COLMAP 4.1.0.dev0 | `qt6-svg-dev` added to `apt install` list |
 | Nerfstudio `ns-process-data video` fails with `unrecognised option '--SiftExtraction.use_gpu'` | COLMAP renamed SIFT-specific GPU flags to generic `FeatureExtraction.use_gpu` when ALIKED support was added | `sed` patch applied to nerfstudio's `colmap_utils.py` in Stage 5 |
-| `PYTORCH_CUDA_ALLOC_CONF` warning on every invocation | Env var renamed to `PYTORCH_ALLOC_CONF` in PyTorch 2.10 | Use the new name in the `docker run` / `docker create` command |
+| `PYTORCH_CUDA_ALLOC_CONF` warning on every invocation | Env var renamed to `PYTORCH_ALLOC_CONF` in PyTorch 2.10 | Compose sets the new name. Measured 2026-10-05: in the NGC 25.11 build the new name alone does **not** enable expandable segments; setting both does — tracked as [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2.6 |
 | `ns-train` fails to resume from checkpoints with `_pickle.UnpicklingError: Weights only load failed` | PyTorch 2.6 flipped `torch.load`'s `weights_only` default to `True`; nerfstudio's checkpoints include non-tensor state and fail the new safety check | `sed` patch in Stage 5 pins `weights_only=False` in nerfstudio's loader |
 | `ns-export gaussian-splat` crashes with `AssertionError` on splatfacto-w runs | Upstream exporter hard-asserts `isinstance(pipeline.model, SplatfactoModel)`, but `SplatfactoWModel` inherits from `Model` directly — and splatfacto-w computes SH coefficients per-frame from an appearance MLP rather than storing them as tensors | Image ships a custom `ns-export-splatfactow` CLI that bakes one appearance embedding (average of training cameras by default) into per-gaussian SH coefficients and writes an inria-format `.ply` with the same layout as `ns-export gaussian-splat`. The GUI Exports tab auto-routes to it for splatfacto-w/-light. |
 | `ns-process-data` silently exports a 2-frame `transforms.json` on longer videos | COLMAP 4.1's `incremental_pipeline` seeds a 2-image bootstrap as `sparse/0` before growing the main reconstruction into `sparse/1`. Nerfstudio's converter hardcodes `colmap_model_path = Path("colmap/sparse/0")`, so it reads the bootstrap stub and the real 200+-frame model sits unused on disk. | Image ships a PATH-shim (`/opt/colmap-shim/colmap`) that transparently wraps `colmap mapper`. After a successful mapper run it probes every numeric submap with `model_analyzer`, name-swaps the largest into `sparse/0`, and preserves the original `sparse/0` under its old name for inspection. Also injects `--Mapper.snapshot_path` so viser can watch incremental progress. Non-mapper subcommands pass through untouched. |
-| Two builds done a month apart could ship different COLMAP code under the same `4.1.0.dev0` version string | `git clone --depth 1` always pulled whatever was at `main` HEAD; nothing pinned the actual commit | `ARG COLMAP_COMMIT` in Stage 3 pins to a specific upstream SHA (currently `ffb5404`); partial clone (`--filter=blob:none`) checks out exactly that commit. Resolved SHA is recorded at `/etc/colmap-commit.sha` in the image, and `smoke_test.sh` asserts it matches the Dockerfile pin. Bumping the SHA + rerunning smoke tests is the upgrade ritual, matching the convention already in place for `NERFSTUDIO_COMMIT` / `SPLATFACTOW_COMMIT` / `VOCAB_TREE_COMMIT`. |
-| `splatfacto-w` training crashes with `FileNotFoundError: dense/sparse/cameras.bin` on non-phototourism datasets | Upstream `nerfw_dataparser.py` hardcodes phototourism-specific paths (`dense/sparse/`, `dense/images/`), asserts only `PINHOLE` cameras, iterates camera models instead of images (reads 1 row for a shared-intrinsics dataset instead of N), and requires a TSV train/test split file that only phototourism ships | `COPY` overlay replaces `nerfw_dataparser.py` in Stage 5: uses `config.colmap_path`, auto-detects `dense/images/` or `images/`, accepts `OPENCV` cameras, iterates images (not camera models), and falls back to a deterministic fraction-based eval split when no TSV file is present. The GUI's Train tab emits the `splatfactow_dataparser --colmap-path <rel>` tyro subcommand so the patched parser receives the project's COLMAP path. |
-| `splatfacto-w` training crashes with `IndexError` on gsplat 1.5.3 (`mask shape [200206] is not broadcastable to [100103, 2]`) | gsplat 1.5.3 changed `info["radii"]` from shape `[C, N]` (scalar per-gaussian visibility radius) to `[C, N, 2]` (per-axis radii for anisotropic gaussians). `splatfactow_model.py` sliced `info["radii"][0]` to get `[N]`, but now gets `[N, 2]`; downstream boolean masks built from the scalar `.flatten()` doubled in length | `sed` patch in Stage 5 changes `self.radii = info["radii"][0]` to `self.radii = info["radii"][0].amax(dim=-1)`, collapsing the per-axis `[N, 2]` back to a scalar `[N]` via the conservative (max) axis. |
+| Two builds done a month apart could ship different COLMAP code under the same `4.1.0.dev0` version string | `git clone --depth 1` always pulled whatever was at `main` HEAD; nothing pinned the actual commit | `ARG COLMAP_COMMIT` in Stage 3 pins to a specific upstream SHA (currently `ffb5404`); partial clone (`--filter=blob:none`) checks out exactly that commit. Resolved SHA is recorded at `/etc/colmap-commit.sha` in the image, and `smoke_test.sh` asserts it matches the Dockerfile pin. |
+| `splatfacto-w` training crashes with `FileNotFoundError: dense/sparse/cameras.bin` on non-phototourism datasets | Upstream `nerfw_dataparser.py` hardcodes phototourism-specific paths (`dense/sparse/`, `dense/images/`), asserts only `PINHOLE` cameras, iterates camera models instead of images, and requires a TSV train/test split file that only phototourism ships | `COPY` overlay replaces `nerfw_dataparser.py` in Stage 5: uses `config.colmap_path`, auto-detects `dense/images/` or `images/`, iterates images, and falls back to a deterministic fraction-based eval split when no TSV file is present. The GUI's Train tab emits the `splatfactow_dataparser --colmap-path <rel>` tyro subcommand. |
+| `splatfacto-w` training crashes with `IndexError` on gsplat 1.5.3 (`mask shape [200206] is not broadcastable to [100103, 2]`) | gsplat 1.5.3 changed `info["radii"]` from shape `[C, N]` to `[C, N, 2]` (per-axis radii). `splatfactow_model.py` sliced `info["radii"][0]` expecting `[N]` | `sed` patch in Stage 5 collapses the per-axis radii with `.amax(dim=-1)` |
 | `splatfacto-w-light` fails at load with `AssertionError: The size of image (3840, 2160) loaded does not match the camera parameters ((3838, 2161))`; `splatfacto-w` floods `Image shape … does not match camera shape`, then dies with `CUDA out of memory` on 4K data. SIMPLE_PINHOLE datasets fail with `Only {'PINHOLE', 'OPENCV'} camera models are supported` | The v4.4 NerfW overlay built `Cameras` without width/height, so nerfstudio derived them as `int(2·cx) × int(2·cy)` — wrong once COLMAP's bundle adjuster has refined the principal point (13 of 14 OPENCV datasets in the warehouse). It also dropped the OPENCV distortion coefficients, accepted only PINHOLE/OPENCV and always read full-resolution `images/`. splatfacto-w's datamanager skips mismatched frames recursively, moving one 4K frame to the GPU per recursion, so the real error surfaced as an OOM. The GUI also routed `splatfacto-w-light` through this parser although its upstream default is `nerfstudio-data`. | v4.7 overlay reads intrinsics through nerfstudio's own `parse_colmap_camera_params` (real size, distortion, perspective-family models), rejects fisheye explicitly, and picks `images_<N>` with nerfstudio-data's ≤ 1600 px rule. The Train tab routes only `splatfacto-w` through `splatfactow_dataparser` and refuses to start it on a project without a COLMAP sparse model; `splatfacto-w-light` uses the standard dataparsers again. |
 | `splatfacto-w` training dies at a random step with `AssertionError: torch.Size([112061, 16, 3])` from `gsplat/rendering.py` | Upstream `splatfactow_model.py` reuses `cached_colors` in eval whenever the eval camera index equals the last *training* camera index, without checking the gaussian count; densify/cull and in-training eval both run every 100 steps, so the cache is one densification stale whenever the indices coincide ([upstream issue #14](https://github.com/KevinXu02/splatfacto-w/issues/14), open since 2024-08) | `patch`-applied 3-line change in Stage 5: only eval renders populate `cached_colors` / `cached_bg_sh`, and a cached tensor must match the live gaussian count. Applied with `patch --forward --batch` so the build fails if upstream drifts. |
 | `ns-process-data … --sfm-tool hloc` says `you must install hloc toolbox!!` after a rebuild | hloc, LightGlue, kornia and pycolmap had been installed by hand into the running container's writable layer only; `docker compose up --build` recreated the container without them | Stage 5 bakes hloc (`HLOC_COMMIT`), LightGlue (`LIGHTGLUE_COMMIT`), `pycolmap==3.13.0` and `kornia==0.8.3` into the image; `smoke_test.sh` §18 asserts the imports. |
 
-All twelve are baked into the Dockerfile and the documented `docker create` command. Measured follow-ups (VRAM behaviour, training resolution, data-quality gates) are tracked in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md).
+</details>
 
----
+<br/>
 
-## Verification status
+## ✅ Verification Status
+
+All of the following were re-verified on 2026-10-05 against image `4bc97967` (v4.7).
 
 | Check | Result |
-|---|---|
-| NGC base image pull and tag detection | ✅ Verified |
-| apt dependency install (Stage 2) | ✅ Verified |
-| COLMAP source build with sm_120 | ✅ Verified — binary reports "with CUDA" |
-| COLMAP commit pin (Dockerfile vs image) | ✅ `smoke_test.sh` asserts `/etc/colmap-commit.sha` matches `ARG COLMAP_COMMIT` |
-| gsplat rasterization on `cuda:0` | ✅ Verified — `RASTERIZATION SUCCESS` smoke test |
-| Nerfstudio CLI available | ✅ Built-in methods including splatfacto, splatfacto-big, splatfacto-mcmc |
-| External method: splatfacto-w | ✅ Registers `splatfacto-w` + `splatfacto-w-light` via nerfstudio entry points |
-| `.ply` export for splatfacto-w / -light | ✅ Custom `ns-export-splatfactow` CLI baked into the image; GUI routes automatically |
-| `ns-process-data video` end-to-end | ✅ 98.12% pose recovery on test video |
-| COLMAP multi-submap promotion shim | ✅ Largest submap swapped into `sparse/0` automatically on splintered runs |
-| `ns-train splatfacto` full training | ✅ 7000 iterations, ~84M gaussians, ~15 min |
-| Viser viewer reachable from host | ✅ Port 7007 bridged, scene renders live |
-| TensorBoard reachable from host | ✅ Port 6006 bridged, scalars + events logged |
-| Viewer split-mode patch (gl_z_buf_depth) | ✅ `smoke_test.sh` verifies patched anchors present + depth compositing intact |
-| `--vis viewer+tensorboard` simultaneous | ✅ Verified — both work in parallel, minor eval stutter |
-| `splatfacto-w` training (non-phototourism) | ✅ 7,000-iteration runs on an off-centre OPENCV dataset (253,578 gaussians, PSNR 29.4) and a SIMPLE_PINHOLE dataset; PLY export, `ns-viewer` and a 480-frame 4K `ns-render` all pass (2026-10-05) |
-| `splatfacto-w-light` training | ✅ 7,000 iterations with `nerfstudio-data` (250,083 gaussians, PSNR 30.8) and 2,000 with `colmap`; export, viewer, render pass |
-| NerfW dataparser v2 overlay (`nerfw_dataparser.py`) | ✅ `COPY` overlay in Stage 5; `smoke_test.sh` §17 verifies the v2 marker, import and a camera size/distortion probe |
-| gsplat 1.5.3 radii shape fix + colour-cache guard (`splatfactow_model.py`) | ✅ `sed` + `patch` in Stage 5; `smoke_test.sh` §17 verifies all anchors. 12-image stress run completes where the unpatched model died at step 1,590 |
-| hloc toolbox baked in | ✅ `smoke_test.sh` §18 verifies imports from `/opt/hloc`; `superpoint_max + superpoint+lightglue` end-to-end on an 87-frame set |
+| :--- | :--- |
+| Image build + `smoke_test.sh` | ✅ **76 / 76** — GPU passthrough, sm_120 kernels, cuDNN, COLMAP flags + commit pin, gsplat JIT rasterization, every Stage-5 patch anchor, hloc imports |
+| `ns-process-data` sequential / vocab_tree / exhaustive | ✅ 87 / 87 frames registered on an 87-frame set (vocab_tree 34 s, sequential 24 s); on a 61-frame set vocab_tree matched the same 1 830 pairs as exhaustive with the faiss tree |
+| `ns-process-data --camera-type equirectangular` | ✅ 42 frames → 336 perspective crops, 336 / 336 registered |
+| `ns-process-data --sfm-tool hloc` (SuperPoint + LightGlue) | ✅ 87 / 87 frames registered from the image-baked toolbox |
+| `splatfacto` · `splatfacto-big` · `splatfacto-mcmc` | ✅ 3 500-iteration runs: 232 059 / 449 436 / 541 117 gaussians, PLY export + `ns-eval` clean |
+| `splatfacto-w-light` | ✅ 7 000 iterations with `nerfstudio-data` and 2 000 with `colmap`; export, `ns-viewer`, `ns-render` pass |
+| `splatfacto-w` | ✅ 7 000 iterations on an off-centre OPENCV dataset and on a SIMPLE_PINHOLE dataset; export, viewer, 480-frame 4K render pass; 12-image stress run completes where the unpatched model died at step 1 590 |
+| viser + TensorBoard simultaneously | ✅ Both bridged to the host; minor viewer stutter during eval steps |
+| COLMAP multi-submap promotion shim | ✅ Largest submap swapped into `sparse/0` on splintered runs |
 
----
+<br/>
 
-## Known limitations
+## ⚠️ Known Limitations
 
-- **Blackwell-only by design.** `TORCH_CUDA_ARCH_LIST=12.0` targets `sm_120` exclusively. To run on an Ada or Ampere card, change to `8.9` or `8.6` respectively in the Dockerfile (and rebuild).
-- **16 GB VRAM assumption.** Training at native 4K may OOM on a 5070 Ti (splatfacto-big on 266 4K frames peaked at 11.6 GiB by step 6,500 with the default GPU image cache). Measured levers and their numbers are in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2: `--pipeline.datamanager.cache-images cpu`, training resolution, and `--steps-per-eval-image`. Note that `PYTORCH_ALLOC_CONF=expandable_segments:True` alone does **not** enable expandable segments in the NGC 25.11 torch build; `PYTORCH_CUDA_ALLOC_CONF` must be set as well.
-- **Container runs as root.** Files written to `/workspace/outputs/` will be `root:root` on the host. Run `sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data` periodically.
-- **`ns-download-data` is broken upstream.** Nerfstudio's bundled dataset downloader fails due to Google Drive rate-limiting — this is not a bug in this repo, it's a [long-running upstream issue](https://github.com/nerfstudio-project/nerfstudio/issues/3134). Use your own video data.
-- **Viser may stutter briefly during eval steps** when used alongside TensorBoard. Documented upstream; typically a few seconds of laggy viewport every ~1000 iterations. Training metrics are unaffected.
+> [!WARNING]
+> **Blackwell only by design.** `TORCH_CUDA_ARCH_LIST=12.0` targets `sm_120` exclusively. For an Ada or Ampere card change it to `8.9` or `8.6` in the Dockerfile and rebuild.
 
----
+> [!WARNING]
+> **16 GB of VRAM is the assumption.** Training at native 4K can OOM on a 5070 Ti: `splatfacto-big` on 266 4K frames peaked at 11.6 GiB by step 6 500 with the default GPU image cache. The measured levers (`--pipeline.datamanager.cache-images cpu`, training resolution, `--steps-per-eval-image`) and their numbers are in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2. `PYTORCH_ALLOC_CONF=expandable_segments:True` alone does **not** enable expandable segments in the NGC 25.11 torch build.
 
-## Project history
+- **Container runs as root.** Files written under `data/outputs/` and inside `data_v2/trained/<ULID>/` are `root:root` on the host; `sudo chown -R $USER:$USER` them when needed.
+- **`ns-download-data` is broken upstream** (Google Drive rate limits, [nerfstudio#3134](https://github.com/nerfstudio-project/nerfstudio/issues/3134)). Use your own footage.
+- **Not verified here:** fisheye captures end to end (no fisheye footage on this machine), the original phototourism layout with the v2 dataparser, and the compatibility of `antialiased`-mode PLYs with external viewers.
 
-`v3-working` (commit `349e43e`) is the tagged milestone — the first Dockerfile that produced a working pipeline from scratch. Subsequent versioned commits (v3.1, v3.2) extend it without retagging.
+<br/>
 
-Commit history (`git log --oneline`, most recent first):
+## 📂 Project Structure
 
 ```
-v4.7: fix splatfacto-w / -w-light on standard datasets and bake hloc into the image (NerfW dataparser v2, colour-cache patch, Train-tab routing, smoke test §17-18, IMPROVEMENT_PLAN.md)
+docker_splat_v2/
+├── Dockerfile                    # 🐳 5-stage build; every pin and patch is an ARG or a commented RUN
+├── docker-compose.yml            # 🧩 The runtime contract: GPU, ipc, shm, mounts, ports, cache volumes
+├── Makefile                      # ⚡ build · up · shell · test · fresh · heal-net
+├── smoke_test.sh                 # ✅ 76 checks against the running container (18 sections)
+├── image_bin/
+│   ├── colmap-shim               # 🔀 Promotes the largest COLMAP submap into sparse/0; snapshots for viser
+│   ├── nerfw_dataparser.py       # 🧭 splatfacto-w dataparser v2 (real sizes, distortion, images_<N>)
+│   ├── splatfactow_model_cache.patch   # 🩹 3-line eval colour-cache guard, applied with `patch`
+│   └── ns-export-splatfactow     # 💾 PLY exporter that bakes splatfacto-w's appearance MLP into SH
+├── gui/                          # 🖥️ PySide6 desktop app (see gui/README.md)
+│   ├── run.sh                    #    creates .venv and launches
+│   └── app/                      #    views/, warehouse.py, manifest.py (+ frozen JSON Schema), jobs.py …
+├── scan_catalog.py               # 🗂️ Rebuilds catalog.db over the legacy data/ tree
+├── IMPROVEMENT_PLAN.md           # 🗺️ Measured backlog: Tier 1 (done) · Tier 2 · Tier 3
+├── USER_GUIDE.md                 # 📚 Full walkthrough, flags, troubleshooting
+├── data/                         # 🎞️ Legacy artifact tree (git-ignored)   → /workspace in the container
+└── data_v2/                      # 🏭 ULID warehouse with manifests (git-ignored) → /warehouse
+```
+
+<br/>
+
+## 🗺️ Roadmap
+
+The measured backlog lives in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md): **Tier 1** (splatfacto-w data loading, colour-cache crash, hloc in the image — landed in v4.7), **Tier 2** (training-resolution control, in-training eval cadence, CPU image cache, pose-recovery gate, persisted job logs, allocator env), **Tier 3** (defaults and hygiene).
+
+<br/>
+
+## 🧩 Tech Stack
+
+<table>
+<tr>
+<td align="center" width="20%"><br/><img src="https://img.shields.io/badge/NGC_PyTorch-25.11-76B900?style=for-the-badge&logo=nvidia&logoColor=white"/><br/><sub><b>Base image</b></sub><br/><br/></td>
+<td align="center" width="20%"><br/><img src="https://img.shields.io/badge/COLMAP-4.1.0.dev0-7C3AED?style=for-the-badge&logoColor=white"/><br/><sub><b>Structure from Motion</b></sub><br/><br/></td>
+<td align="center" width="20%"><br/><img src="https://img.shields.io/badge/hloc-1.5-EC4899?style=for-the-badge&logoColor=white"/><br/><sub><b>Learned features</b></sub><br/><br/></td>
+<td align="center" width="20%"><br/><img src="https://img.shields.io/badge/gsplat-1.5.3-0EA5E9?style=for-the-badge&logoColor=white"/><br/><sub><b>Rasterizer</b></sub><br/><br/></td>
+<td align="center" width="20%"><br/><img src="https://img.shields.io/badge/Nerfstudio-1.1.5-F59E0B?style=for-the-badge&logoColor=white"/><br/><sub><b>Training CLI</b></sub><br/><br/></td>
+</tr>
+<tr>
+<td align="center"><br/><img src="https://img.shields.io/badge/splatfacto--w-0.1.5-D946EF?style=for-the-badge&logoColor=white"/><br/><sub><b>In-the-wild methods</b></sub><br/><br/></td>
+<td align="center"><br/><img src="https://img.shields.io/badge/viser-1.0.0-0891B2?style=for-the-badge&logoColor=white"/><br/><sub><b>3D viewer</b></sub><br/><br/></td>
+<td align="center"><br/><img src="https://img.shields.io/badge/TensorBoard-2.20-FF6F00?style=for-the-badge&logo=tensorflow&logoColor=white"/><br/><sub><b>Metrics</b></sub><br/><br/></td>
+<td align="center"><br/><img src="https://img.shields.io/badge/PySide6-6.11-41CD52?style=for-the-badge&logo=qt&logoColor=white"/><br/><sub><b>Desktop GUI</b></sub><br/><br/></td>
+<td align="center"><br/><img src="https://img.shields.io/badge/Docker_Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white"/><br/><sub><b>Runtime</b></sub><br/><br/></td>
+</tr>
+</table>
+
+<br/>
+
+<details>
+<summary><b>📜 Project history</b></summary>
+<br/>
+
+`v3-working` (commit `349e43e`) is the tagged milestone — the first Dockerfile that produced a working pipeline from scratch. Image versions since then (`v4.x`) are annotated in the Dockerfile comments.
+
+```
+v4.7: fix splatfacto-w / -w-light on standard datasets, bake hloc into the image
 New Project import: adopt warehouse runs processed in vizer
 Manifest schema: accept pinhole / simple_pinhole camera types
 Process tab: add 'Run with vizer' live-viewing handoff
 Harden warehouse: schema validation, manifest index, full project deletion
-Fix splatfacto-w training on non-phototourism datasets (NerfW dataparser patch + gsplat 1.5.3 radii fix + GUI Train tab splatfactow_dataparser subcommand)
-Migrate GUI Exports tab to the manifest-driven warehouse: splat PLYs land under data_v2/exports/splat/<EXPORT_ULID>/ and rendered videos under data_v2/renders/<RENDER_ULID>/, each with a manifest.json whose parent.run_id closes the lineage chain back through train → process → source. Run discovery rewired from legacy data/outputs/ to data_v2/trained/*/manifest.json filtered by the project's processed ULID; scan_catalog.py bumped to schema v2 with warehouse_sources / warehouse_processed / warehouse_train / warehouse_exports / warehouse_renders tables joined by manifest ULID rather than filename parsing. mesh/ and pointcloud/ sub-folders reserved by the layout but not wired (ns-export poisson / tsdf / marching-cubes / pointcloud all require the volumetric-NeRF model interface SplatfactoModel doesn't implement).
-Migrate GUI Process + Train tabs to a manifest-driven ULID warehouse under data_v2/: SourceManifest → ProcessManifest → TrainManifest chain with declared parent.run_id at every hop, frozen v1.0 JSON Schema artifact, pending.json write-ahead-log sidecar so a closed GUI never strands a successful run, "🎉 Training Finished" stdout banner detection so manifests finalize when training ends (not when the viewer process exits), and a `python -m app.warehouse backfill-train` CLI that reconstructs manifests for orphan runs from config.yml + the pending sidecar
-Upgrade gsplat 1.4.0 -> 1.5.3 to unlock 2DGS, fused-SSIM, 3DGUT, Fisheye-GS
+Fix splatfacto-w training on non-phototourism datasets
+Migrate GUI Exports tab to manifest-driven ULID warehouse
+Migrate GUI Process + Train tabs to manifest-driven ULID warehouse
+Upgrade gsplat 1.4.0 -> 1.5.3
 Add scan_catalog.py: rebuild catalog.db index over data/ tree
 Add vizer live point-cloud viewer button to Process tab + project management enhancements
-Add HEIC/HEIF auto-conversion to JPEG in the Process tab GUI (pillow-heif, quality 100, EXIF preserved)
-Add Viewers tab with ns-viewer launch, TensorBoard start/stop, and live port status (GUI)
+Add HEIC/HEIF auto-conversion to JPEG in the Process tab GUI
+Add Viewers tab with ns-viewer launch, TensorBoard start/stop, and live port status
 Document network-detachment recovery + add make heal-net
 Add image-folder source mode to the Process tab GUI
 Pin COLMAP commit + smoke-test SHA against Dockerfile pin
@@ -261,47 +385,39 @@ Add Makefile wrapping compose + smoke-test for disaster-recovery shortcuts
 Fix viewer split-mode crash by filtering gl_z_buf_depth from dropdowns
 Relocate repo from ~/Desktop to ~/docker-stacks; pin PySide6==6.11.0
 Capture runtime contract in docker-compose.yml + trim build context
-Correct viser version in stack table (0.2.7 → 1.0.0)
 Auto-promote largest COLMAP submap into sparse/0 via PATH-shim
 Warn on Process tab when COLMAP splinters into multiple submaps
 Pre-place faiss-format vocab tree for vocab_tree matcher
 Add help-badge tooltips across GUI and retheme to light palette
 Add advanced controls to Process tab and drop broken depth-debug flag
-Label splatfacto-mcmc runs distinctly in Exports tab
 Add splatfacto-w .ply exporter and route GUI Exports tab to it
-Bake splatfacto-w into image and expose in Train dropdown (GUI)
-Add Exports tab with .ply export and camera-path video render (GUI)
+Bake splatfacto-w into image and expose in Train dropdown
+Add Exports tab with .ply export and camera-path video render
 Fork naming to v2 and pin nerfstudio to git main (enables splatfacto-mcmc)
-Add "import processed dataset" flow to skip straight to training (GUI)
-Add Train tab and viser-port safety helpers (GUI)
+Add "import processed dataset" flow to skip straight to training
+Add Train tab and viser-port safety helpers
 Add smoke_test.sh for container verification
 v3.2 — patch nerfstudio torch.load for PyTorch 2.6+ weights_only default
-Add GUI application source
 v3.1 — add TensorBoard monitoring (EXPOSE 6006) + docs
 v3   — patch nerfstudio for COLMAP SiftExtraction→FeatureExtraction flag rename
-v2.1 — add trailing newline + expand Stage 4 explanatory comment
 v2   — multi-stage refactor + add qt6-svg-dev to fix COLMAP build
 v1   — single-stage build, fails at COLMAP/Qt6Svg (baseline)
 ```
 
----
+</details>
 
-## Acknowledgments
+<br/>
 
-Built on top of excellent open-source work:
+## 🙏 Acknowledgements
 
-- [**Nerfstudio**](https://github.com/nerfstudio-project/nerfstudio) — the training framework and CLI
-- [**gsplat**](https://github.com/nerfstudio-project/gsplat) — the CUDA Gaussian rasterizer
-- [**splatfacto-w**](https://github.com/KevinXu02/splatfacto-w) — in-the-wild splatfacto variants (KevinXu02)
-- [**COLMAP**](https://github.com/colmap/colmap) — Structure-from-Motion for camera pose recovery
-- [**NVIDIA NGC**](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) — PyTorch base image with Blackwell support
-- [**Viser**](https://github.com/nerfstudio-project/viser) — the web-based 3D viewer
-- [**TensorBoard**](https://www.tensorflow.org/tensorboard) — training metric visualization
+Built on [**Nerfstudio**](https://github.com/nerfstudio-project/nerfstudio) and [**gsplat**](https://github.com/nerfstudio-project/gsplat) (the training framework and the CUDA rasterizer), [**COLMAP**](https://github.com/colmap/colmap) (Structure from Motion), [**splatfacto-w**](https://github.com/KevinXu02/splatfacto-w) by KevinXu02 (in-the-wild variants), [**hloc**](https://github.com/cvg/Hierarchical-Localization) and [**LightGlue**](https://github.com/cvg/LightGlue) from ETH Zurich's CVG, [**viser**](https://github.com/nerfstudio-project/viser), [**TensorBoard**](https://www.tensorflow.org/tensorboard), and NVIDIA's [**NGC PyTorch**](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) base image. The faiss-format vocabulary tree comes from [ZachMckennedyFWig/ColmapFaissVocabTrees](https://github.com/ZachMckennedyFWig/ColmapFaissVocabTrees).
 
----
+<br/>
 
-<div align="center">
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:76B900,50:0EA5E9,100:7C3AED&height=120&section=footer&animation=fadeIn" width="100%"/>
+</p>
 
-**Questions or issues?** Open an issue in this repo.
-
-</div>
+<p align="center">
+  <sub>Crafted by Alex Juma — capture, reconstruct, splat 🎥✨</sub>
+</p>

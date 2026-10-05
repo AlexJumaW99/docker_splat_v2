@@ -50,6 +50,7 @@ DOCKER_CREATE_CMD = """docker create \\
   --shm-size=16g \\
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \\
   -v ~/docker-stacks/docker_splat_v2/data:/workspace \\
+  -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \\
   -p 7007:7007 \\
   -p 6006:6006 \\
   -it \\
