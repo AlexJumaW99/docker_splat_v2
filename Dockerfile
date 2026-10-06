@@ -52,6 +52,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # upgrade ritual; this matches the convention already used by
 # NERFSTUDIO_COMMIT, SPLATFACTOW_COMMIT, and VOCAB_TREE_COMMIT in Stage 5.
 #
+# v4.9 (2026-10-06): bumped from 4.1.0.dev0 @ffb5404e (main, 2026-04-24) to
+# the 4.2.1 release tag @bd1fcf65 (2026-09-29). Validated side by side in a
+# throwaway container before adoption: every flag nerfstudio's colmap_utils
+# and the shim emit still exists (FeatureExtraction/FeatureMatching.use_gpu,
+# Mapper.ba_global_function_tolerance, Mapper.snapshot_*, BundleAdjustment.
+# refine_principal_point, VocabTreeMatching.vocab_tree_path); the faiss vocab
+# tree loads; sequential / vocab_tree / exhaustive register 87/87 of the same
+# 87-frame set in 16 / 28 / 21 s (4.1: 23 / 33 / 35 s) with statistically
+# identical models (points within 2 %, reprojection error 0.380 vs 0.385 px);
+# the 42-frame equirectangular sample registers 376/376 crops in 282 s (4.1:
+# 336 of 375 in 321 s). The 2-3-image bootstrap submap in sparse/0 still
+# happens on 4.2.1, so the shim below stays. Rollback: `splat-nerfstudio-v2:pre-v4.9`.
+#
 # `git clone --filter=blob:none` is a partial clone — defers blob downloads
 # until checkout, so disk + network usage stays close to a shallow clone
 # while still letting us check out an arbitrary SHA (which `--depth 1`
@@ -61,13 +74,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The resolved commit is recorded at /etc/colmap-commit.sha so it can be
 # probed at runtime (`cat /etc/colmap-commit.sha`) and asserted by
 # smoke_test.sh. COLMAP's `-h` does include a 7-char abbreviated commit
-# (e.g. "Commit ffb5404e on 2026-04-24"), but parsing that and matching
+# (e.g. "Commit bd1fcf65 on 2026-09-29"), but parsing that and matching
 # against a 40-char SHA prefix is fiddly — keeping the full SHA in a
 # dedicated file makes the comparison trivial and unambiguous.
 # ============================================================
 FROM system-deps AS colmap
 
-ARG COLMAP_COMMIT=ffb5404e7bbfb9c718726f16718d7264582fe718
+ARG COLMAP_COMMIT=bd1fcf654d2dd8fefa1466999c190a246f83f4b9
 
 RUN git -c advice.detachedHead=false clone --filter=blob:none \
         https://github.com/colmap/colmap.git /opt/colmap_src \
@@ -290,7 +303,7 @@ RUN chmod +x /usr/local/bin/ns-export-splatfactow
 
 # v4.3: colmap shim — wraps `colmap mapper` to (a) inject snapshot flags for
 # live viser progress and (b) swap the largest submap into sparse/0 when
-# COLMAP's incremental_pipeline (4.1.0.dev0) splinters the reconstruction.
+# COLMAP's incremental_pipeline (4.1.0.dev0, still 4.2.1) splinters the reconstruction.
 # Nerfstudio hardcodes colmap_model_path=Path("colmap/sparse/0"); COLMAP 4.1
 # seeds a 2-image bootstrap as sparse/0 before growing the main model into
 # sparse/1, so ns-process-data silently exports a 2-frame transforms.json

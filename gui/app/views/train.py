@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
+from app import nvidia_service as nv
 from app import train_options as topt
 from app import warehouse as wh
 from app.config import CONTAINER_NAME, VISER_PORT, WAREHOUSE_DIR
@@ -67,11 +68,17 @@ _HELP = {
     ),
     "iters": (
         "Max iterations",
-        "Total ns-train optimization steps.<br><br>"
-        "<b>1k\u20133k</b> \u00b7 quick smoke test \u2014 verify the data before committing.<br>"
-        "<b>7k</b> \u00b7 default \u2014 decent quality on most captures.<br>"
-        "<b>15k\u201330k</b> \u00b7 production quality; diminishing returns past "
-        "\u224830k for splatfacto."
+        "Total ns-train optimization steps. Every preset's internal schedule "
+        "(densification until step 15\u202f000, or 25\u202f000 for mcmc; learning-"
+        "rate decay over 30\u202f000) is an absolute step count, so short runs end "
+        "mid-schedule.<br><br>"
+        "<b>Preview \u00b7 7\u202f000</b> \u00b7 a first look (measured: PSNR 31.0 in 87\u202fs "
+        "at 960\u202fpx).<br>"
+        "<b>Standard \u00b7 30\u202f000</b> \u00b7 nerfstudio's default and this tab's "
+        "default; the same scene reached PSNR 33.9 in 370\u202fs.<br>"
+        "<b>Long \u00b7 55\u202f000</b> \u00b7 splatfacto-w's upstream default (its robust "
+        "masking starts at 6\u202f000 and densification runs to 20\u202f000).<br>"
+        "Beyond 30\u202f000 the built-in splatfacto variants show diminishing returns."
     ),
     "save_step": (
         "Steps per save",
@@ -193,6 +200,12 @@ _CACHE_LABELS = {"auto": "Auto (recommended)", "gpu": "GPU", "cpu": "CPU (host R
 _RASTER_LABELS = {"default": "Method default", "classic": "classic", "antialiased": "antialiased"}
 # Steps-per-save values above this get an inline warning (see help text).
 _SAVE_STEP_WARN = 5000
+# Iteration quick picks: (label, steps). Measured basis in _HELP["iters"].
+_ITER_PRESETS = [("Preview · 7k", 7000), ("Standard · 30k", 30000), ("Long · 55k", 55000)]
+# Upstream TrainerConfig.max_num_iterations per method (nerfstudio
+# method_configs.py / splatfactow_config.py).
+_UPSTREAM_ITERS = {"splatfacto": 30000, "splatfacto-big": 30000, "splatfacto-mcmc": 30000,
+                   "splatfacto-w": 55000, "splatfacto-w-light": 30000}
 
 
 # nerfstudio prints a rich Panel with "🎉 Training Finished 🎉" in the title
@@ -379,6 +392,7 @@ class _Form(QWidget):
         self._pending_run_id: str | None = None
         self._pending_parent_process_id: str | None = None
         self._pending_form_params: dict | None = None
+        self._pending_dataparser: str | None = None  # effective dataparser subcommand
         self._pending_command: str | None = None
         self._pending_start_time: datetime | None = None
         self._pending_display_name: str | None = None
@@ -404,6 +418,11 @@ class _Form(QWidget):
         self._viser_poll = QTimer(self)
         self._viser_poll.setInterval(1000)
         self._viser_poll.timeout.connect(self._check_viser)
+        # After "Training Finished": poll nvidia-smi so the card can show what
+        # the idle viewer process is still holding.
+        self._gpu_held_poll = QTimer(self)
+        self._gpu_held_poll.setInterval(5000)
+        self._gpu_held_poll.timeout.connect(self._refresh_gpu_held)
 
         self._build()
         self._load_project()
@@ -526,6 +545,7 @@ class _Form(QWidget):
         grid.addWidget(labeled("Method", *_HELP["method"]), 0, 0)
         self.method_combo = QComboBox()
         self.method_combo.addItems(METHODS)
+        self.method_combo.currentTextChanged.connect(self._on_method_changed)
         grid.addWidget(self.method_combo, 0, 1)
 
         # Training resolution — populated per dataset in _refresh_resolution().
@@ -559,21 +579,41 @@ class _Form(QWidget):
 
         # Max iterations
         grid.addWidget(labeled("Max iterations", *_HELP["iters"]), 2, 0)
-        it_row = QHBoxLayout(); it_row.setSpacing(10)
+        it_col = QVBoxLayout(); it_col.setSpacing(6); it_col.setContentsMargins(0, 0, 0, 0)
+        it_row = QHBoxLayout(); it_row.setSpacing(10); it_row.setContentsMargins(0, 0, 0, 0)
         self.iters_slider = QSlider(Qt.Horizontal)
-        self.iters_slider.setRange(1000, 30000)
+        self.iters_slider.setRange(1000, 60000)
         self.iters_slider.setSingleStep(500)
         self.iters_slider.setPageStep(1000)
         self.iters_value = QSpinBox()
-        self.iters_value.setRange(1000, 30000)
+        self.iters_value.setRange(1000, 60000)
         self.iters_value.setSingleStep(500)
         self.iters_value.setMinimumWidth(90)
         self.iters_slider.valueChanged.connect(self.iters_value.setValue)
         self.iters_value.valueChanged.connect(self.iters_slider.setValue)
+        self.iters_value.valueChanged.connect(self._refresh_iters_caption)
         it_row.addWidget(self.iters_slider, 1)
         it_row.addWidget(self.iters_value)
         it_wrap = QWidget(); it_wrap.setLayout(it_row)
-        grid.addWidget(it_wrap, 2, 1)
+        # Quick picks + a caption naming the method's upstream default.
+        chips = QHBoxLayout(); chips.setSpacing(8); chips.setContentsMargins(0, 0, 0, 0)
+        self.iter_chip_btns: list[QPushButton] = []
+        for label, steps in _ITER_PRESETS:
+            b = QPushButton(label)
+            b.setProperty("role", "ghost")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(f"Set Max iterations to {steps:,}")
+            b.clicked.connect(lambda _c=False, s=steps: self.iters_value.setValue(s))
+            chips.addWidget(b)
+            self.iter_chip_btns.append(b)
+        self.iters_caption = QLabel("")
+        self.iters_caption.setProperty("role", "caption")
+        chips.addWidget(self.iters_caption, 1)
+        chips_wrap = QWidget(); chips_wrap.setLayout(chips)
+        it_col.addWidget(it_wrap)
+        it_col.addWidget(chips_wrap)
+        it_col_wrap = QWidget(); it_col_wrap.setLayout(it_col)
+        grid.addWidget(it_col_wrap, 2, 1)
 
         # Steps per save (+ inline warning above _SAVE_STEP_WARN)
         grid.addWidget(labeled("Steps per save", *_HELP["save_step"]), 3, 0)
@@ -731,10 +771,11 @@ class _Form(QWidget):
         # Viser-ready banner — shows once port 7007 starts listening.
         self.viser_card = QFrame()
         self.viser_card.setProperty("role", "subcard")
-        vs = QHBoxLayout(self.viser_card)
-        vs.setContentsMargins(14, 10, 14, 10)
-        ok = QLabel("✓ Viser server is live.")
-        ok.setStyleSheet("color: #22C55E; font-weight: 600;")
+        vcol = QVBoxLayout(self.viser_card)
+        vcol.setContentsMargins(14, 10, 14, 10); vcol.setSpacing(6)
+        vs = QHBoxLayout(); vs.setContentsMargins(0, 0, 0, 0)
+        self.viser_ok_lbl = QLabel("✓ Viser server is live.")
+        self.viser_ok_lbl.setStyleSheet("color: #22C55E; font-weight: 600;")
         self.open_viser_btn = QPushButton(f"Open http://localhost:{VISER_PORT}")
         self.open_viser_btn.setProperty("role", "primary")
         self.open_viser_btn.setCursor(Qt.PointingHandCursor)
@@ -743,10 +784,32 @@ class _Form(QWidget):
         self.viewers_btn.setProperty("role", "secondary")
         self.viewers_btn.setCursor(Qt.PointingHandCursor)
         self.viewers_btn.clicked.connect(self.request_viewers.emit)
-        vs.addWidget(ok)
+        vs.addWidget(self.viser_ok_lbl)
         vs.addStretch(1)
         vs.addWidget(self.open_viser_btn)
         vs.addWidget(self.viewers_btn)
+        vs_wrap = QWidget(); vs_wrap.setLayout(vs)
+        # Shown after the "Training Finished" banner while the process stays
+        # alive for the viewer: how much GPU memory it is still holding, and a
+        # one-click release. A finished run once held 10.7 GB for 15 hours.
+        held = QHBoxLayout(); held.setContentsMargins(0, 0, 0, 0); held.setSpacing(10)
+        self.gpu_held_lbl = QLabel("")
+        self.gpu_held_lbl.setProperty("role", "caption")
+        self.gpu_held_lbl.setWordWrap(True)
+        self.release_gpu_btn = QPushButton("Release GPU (stop viewer)")
+        self.release_gpu_btn.setProperty("role", "secondary")
+        self.release_gpu_btn.setCursor(Qt.PointingHandCursor)
+        self.release_gpu_btn.setToolTip(
+            "Stops the finished ns-train process that is only serving the viewer. "
+            "The checkpoint and manifest are already on disk; reopen the run from the Viewers tab."
+        )
+        self.release_gpu_btn.clicked.connect(self._on_cancel)
+        held.addWidget(self.gpu_held_lbl, 1)
+        held.addWidget(self.release_gpu_btn, 0)
+        self.gpu_held_wrap = QWidget(); self.gpu_held_wrap.setLayout(held)
+        self.gpu_held_wrap.hide()
+        vcol.addWidget(vs_wrap)
+        vcol.addWidget(self.gpu_held_wrap)
         self.viser_card.hide()
 
         v.addLayout(row)
@@ -778,7 +841,7 @@ class _Form(QWidget):
         method = params.get("method", "splatfacto")
         if method in METHODS:
             self.method_combo.setCurrentIndex(METHODS.index(method))
-        iters = int(params.get("max_num_iterations", 7000))
+        iters = int(params.get("max_num_iterations", 30000))
         self.iters_slider.setValue(iters); self.iters_value.setValue(iters)
         self.save_step_spin.setValue(int(params.get("steps_per_save", 2000)))
         vis = params.get("vis", "viewer+tensorboard")
@@ -788,6 +851,7 @@ class _Form(QWidget):
             bool(params.get("quit_on_train_completion", False))
         )
         self.extra_flags_edit.setText(params.get("extra_flags", ""))
+        self._refresh_iters_caption()
 
         res_idx = self.resolution_combo.findData(params.get("resolution", "auto"))
         self.resolution_combo.setCurrentIndex(res_idx if res_idx >= 0 else 0)
@@ -802,6 +866,22 @@ class _Form(QWidget):
         raster_idx = self.raster_combo.findData(params.get("rasterize_mode", "default"))
         self.raster_combo.setCurrentIndex(raster_idx if raster_idx >= 0 else 0)
         self._refresh_resolution_caption()
+
+    def _on_method_changed(self, _text: str) -> None:
+        self._refresh_iters_caption()
+
+    def _refresh_iters_caption(self, *_args) -> None:
+        method = self.method_combo.currentText()
+        upstream = _UPSTREAM_ITERS.get(method, 30000)
+        cur = self.iters_value.value()
+        if cur == upstream:
+            self.iters_caption.setText(f"= {method}'s upstream default")
+        elif cur < upstream:
+            self.iters_caption.setText(
+                f"{method}'s upstream default is {upstream:,} — shorter runs stop mid-schedule"
+            )
+        else:
+            self.iters_caption.setText(f"{method}'s upstream default is {upstream:,}")
 
     # ---- dataset card / resolution helpers ----
     def _refresh_dataset_card(self) -> None:
@@ -1133,12 +1213,36 @@ class _Form(QWidget):
                 if resp != QMessageBox.Yes:
                     return
 
+            # Free-VRAM pre-flight. The usual culprit is a finished run whose
+            # viewer is still open (10.7 GB held for 15 h once); the port check
+            # below only catches it when the viewer is requested again.
+            stats = nv.query_gpu()
+            if stats is not None:
+                free_gib = (stats.mem_total_mb - stats.mem_used_mb) / 1024
+                if free_gib < 3.0:
+                    resp = QMessageBox.question(
+                        self, "Little GPU memory free",
+                        f"Only {free_gib:.1f} GiB of {stats.mem_total_mb / 1024:.1f} GiB VRAM is free "
+                        f"({stats.mem_used_mb / 1024:.1f} GiB in use). A viewer from a finished run, "
+                        "ns-viewer, or another process is probably holding it — see the Viewers tab.\n\n"
+                        "Start training anyway?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                    )
+                    if resp != QMessageBox.Yes:
+                        return
+
             resolution = self._current_resolution()
             resolved = self._resolved_params(params)
             # Everything the manifest needs: the raw form keys plus the
             # effective values. Stored on the pending sidecar too, so a
             # backfill reconstructs the same TrainParams.
             form_params = {**params, **resolved}
+            # The dataparser subcommand ns-train actually receives — recorded
+            # as such in the manifest (splatfacto-w uses its own parser).
+            effective_dataparser = (
+                "splatfactow_dataparser" if params["method"] == "splatfacto-w"
+                else self._project.dataparser
+            )
 
             # If the viewer was requested, make sure nothing INSIDE the container
             # is already bound to viser's port. The host-side port is always held
@@ -1223,6 +1327,7 @@ class _Form(QWidget):
             self._pending_run_id = train_run_id
             self._pending_parent_process_id = parent_manifest.run_id
             self._pending_form_params = form_params
+            self._pending_dataparser = effective_dataparser
             self._pending_command = display
             self._pending_start_time = datetime.now(timezone.utc)
             self._pending_display_name = self._project.name or self._project.id
@@ -1242,7 +1347,7 @@ class _Form(QWidget):
                     command=display,
                     display_name=self._pending_display_name,
                     form_params=form_params,
-                    dataparser=self._project.dataparser,
+                    dataparser=effective_dataparser,
                     experiment_name=self._project.id,
                 )
             except Exception as e:
@@ -1277,6 +1382,22 @@ class _Form(QWidget):
     def _open_viser_in_browser(self) -> None:
         webbrowser.open(f"http://localhost:{VISER_PORT}")
 
+    def _refresh_gpu_held(self) -> None:
+        stats = nv.query_gpu()
+        if stats is None:
+            self.gpu_held_lbl.setText("The finished run keeps the GPU allocated while its viewer is open.")
+            return
+        used, total = stats.mem_used_mb / 1024, stats.mem_total_mb / 1024
+        self.gpu_held_lbl.setText(
+            f"GPU memory in use: {used:.1f} of {total:.1f} GiB while this viewer stays open — "
+            f"the next training run only gets what is left."
+        )
+
+    def _stop_gpu_held(self) -> None:
+        self._gpu_held_poll.stop()
+        self.gpu_held_wrap.hide()
+        self.viser_ok_lbl.setText("✓ Viser server is live.")
+
     # ---- job signals (filtered by kind) ----
     def _wire_jobs(self) -> None:
         self._jobs.started.connect(self._on_job_started)
@@ -1305,6 +1426,11 @@ class _Form(QWidget):
             # state so the user knows the lineage was recorded — clicking
             # Cancel from here is now just dismissing the viewer.
             set_pill(self.status_pill, "✓ Trained · viewer alive", "success")
+            self.viser_ok_lbl.setText("✓ Training finished — viewer still live.")
+            self.gpu_held_wrap.show()
+            self.viser_card.show()
+            self._refresh_gpu_held()
+            self._gpu_held_poll.start()
 
     def _on_job_started(self, spec: JobSpec) -> None:
         if spec.kind == "downscale" and self._downscale_mine:
@@ -1360,7 +1486,7 @@ class _Form(QWidget):
             train_params = wh.train_params_from_form(
                 self._pending_form_params,
                 experiment_name=self._project.id,
-                dataparser=self._project.dataparser,
+                dataparser=self._pending_dataparser or self._project.dataparser,
                 timestamp_dir=timestamp_dir,
             )
             wh.write_train_manifest(
@@ -1413,6 +1539,7 @@ class _Form(QWidget):
             return
         self._running_mine = False
         self._viser_poll.stop()
+        self._stop_gpu_held()
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         if self._training_finalized:
@@ -1449,6 +1576,7 @@ class _Form(QWidget):
             return
         self._running_mine = False
         self._viser_poll.stop()
+        self._stop_gpu_held()
         self.viser_card.hide()
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
@@ -1473,6 +1601,7 @@ class _Form(QWidget):
             return
         self._running_mine = False
         self._viser_poll.stop()
+        self._stop_gpu_held()
         self.viser_card.hide()
         self._clear_pending_state()
         self.run_btn.setEnabled(True)
@@ -1487,6 +1616,7 @@ class _Form(QWidget):
         self._pending_run_id = None
         self._pending_parent_process_id = None
         self._pending_form_params = None
+        self._pending_dataparser = None
         self._pending_command = None
         self._pending_start_time = None
         self._pending_display_name = None

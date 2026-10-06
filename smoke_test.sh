@@ -8,6 +8,7 @@
 # Usage:
 #   ./smoke_test.sh                                   # all tests
 #   ./smoke_test.sh --skip-jit                        # skip the slow gsplat JIT compile
+#   ./smoke_test.sh --skip-train                      # skip §21 (5 short training runs, ~2 min)
 #   CONTAINER=foo IMAGE=foo:latest ./smoke_test.sh    # override defaults
 #
 # Exits non-zero if any test fails. Never stops on failure — runs every
@@ -19,9 +20,11 @@ CONTAINER="${CONTAINER:-splat-ns-v2}"
 IMAGE="${IMAGE:-splat-nerfstudio-v2:latest}"
 HOST_DATA_DIR="${HOST_DATA_DIR:-/home/meroe/docker-stacks/docker_splat_v2/data}"
 SKIP_JIT=0
+SKIP_TRAIN=0
 for arg in "$@"; do
     case "$arg" in
         --skip-jit) SKIP_JIT=1 ;;
+        --skip-train) SKIP_TRAIN=1 ;;
         -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
     esac
 done
@@ -640,6 +643,139 @@ out=$(dexec bash -c 'CUDA_VISIBLE_DEVICES= python -c "import nerfstudio.scripts.
 [ "$out" = "False" ] && pass "cudnn.benchmark is False after importing ns-train (default)" || fail "cudnn.benchmark default" "$out"
 out=$(dexec bash -c 'NS_CUDNN_BENCHMARK=1 CUDA_VISIBLE_DEVICES= python -c "import nerfstudio.scripts.train, torch; print(torch.backends.cudnn.benchmark)"' 2>&1 | tail -1)
 [ "$out" = "True" ] && pass "NS_CUDNN_BENCHMARK=1 restores upstream behaviour" || fail "cudnn override" "$out"
+
+# ============================================================================
+# 21. Training smoke: all five methods on a synthetic dataset (v4.8)
+#
+# Registration and import checks (§10) passed 62/62 on an image where two
+# methods could not start, and the eval-VRAM misattribution of 2026-10-05 was
+# only caught by running the generated command. So: actually train. A
+# synthetic 8-camera COLMAP model + rendered images is generated inside the
+# container with nerfstudio's own writers (no user data, ~1 MB), every method
+# trains 300 iterations headless with an eval image every 100 steps, a PLY is
+# exported through both exporters, and the splatfacto-w colour-cache check
+# from the v4.7 patch runs deterministically on the resulting checkpoint.
+# Skip with --skip-train. Each run takes ~8 s on a 5070 Ti.
+# ============================================================================
+section "21. Training smoke (5 methods × 300 iterations, synthetic data)"
+
+if [ "$SKIP_TRAIN" = "1" ]; then
+    warn "training smoke skipped (--skip-train)"
+else
+    SYN="/tmp/smoke_train_$$"
+    dexec mkdir -p "$SYN" > /dev/null 2>&1
+
+    out=$(dexec_in env CUDA_VISIBLE_DEVICES= python - "$SYN/data" <<'PY' 2>&1 | grep -E '^(SYNTH_OK|Traceback|.*Error)' | tail -1
+import sys, json, math
+from pathlib import Path
+import numpy as np
+from PIL import Image
+from nerfstudio.data.utils.colmap_parsing_utils import (
+    Camera, Image as CImage, Point3D, rotmat2qvec,
+    write_cameras_binary, write_images_binary, write_points3D_binary,
+)
+from nerfstudio.process_data.colmap_utils import colmap_to_json
+root = Path(sys.argv[1]); W, H, F = 160, 120, 140.0
+sparse = root / "colmap" / "sparse" / "0"; sparse.mkdir(parents=True, exist_ok=True)
+(root / "images").mkdir(exist_ok=True)
+rng = np.random.default_rng(0)
+pts = rng.uniform(-0.8, 0.8, size=(400, 3)); cols = rng.integers(40, 255, size=(400, 3))
+cams = {1: Camera(id=1, model="PINHOLE", width=W, height=H, params=np.array([F, F, W / 2, H / 2]))}
+imgs = {}
+for i in range(8):
+    a = 2 * math.pi * i / 8
+    C = np.array([4.0 * math.cos(a), 4.0 * math.sin(a), 1.5])
+    f = -C / np.linalg.norm(C)
+    r = np.cross(f, np.array([0, 0, 1.0])); r /= np.linalg.norm(r)
+    d = np.cross(f, r)
+    R = np.stack([r, d, f]); t = -R @ C
+    img = np.full((H, W, 3), 90, dtype=np.uint8)
+    pc = (R @ pts.T).T + t
+    for (x, y, z), c in zip(pc, cols):
+        if z <= 0.1: continue
+        u, v = int(F * x / z + W / 2), int(F * y / z + H / 2)
+        if 1 <= u < W - 1 and 1 <= v < H - 1:
+            img[v - 1:v + 2, u - 1:u + 2] = c
+    name = f"frame_{i + 1:05d}.png"
+    Image.fromarray(img).save(root / "images" / name)
+    imgs[i + 1] = CImage(id=i + 1, qvec=rotmat2qvec(R), tvec=t, camera_id=1, name=name,
+                         xys=np.zeros((0, 2)), point3D_ids=np.array([], dtype=np.int64))
+p3d = {j + 1: Point3D(id=j + 1, xyz=pts[j], rgb=cols[j], error=0.5,
+                      image_ids=np.array([], dtype=np.int64), point2D_idxs=np.array([], dtype=np.int64)) for j in range(400)}
+write_cameras_binary(cams, sparse / "cameras.bin")
+write_images_binary(imgs, sparse / "images.bin")
+write_points3D_binary(p3d, sparse / "points3D.bin")
+n = colmap_to_json(recon_dir=sparse, output_dir=root)
+print(f"SYNTH_OK frames={n}")
+PY
+)
+    if echo "$out" | grep -q '^SYNTH_OK frames=8'; then
+        pass "synthetic dataset generated ($out)"
+    else
+        fail "synthetic dataset generation" "$out"
+    fi
+
+    COMMON="--data $SYN/data --max-num-iterations 300 --steps-per-save 100000 --steps-per-eval-image 100 --steps-per-eval-all-images 100000 --vis tensorboard --experiment-name smoke"
+    for m in splatfacto splatfacto-big splatfacto-mcmc splatfacto-w-light splatfacto-w; do
+        extra=""
+        [ "$m" = "splatfacto-w" ] && extra="splatfactow_dataparser --colmap-path colmap/sparse/0"
+        t0=$(date +%s)
+        # shellcheck disable=SC2086
+        log=$(dexec bash -c "cd /tmp && timeout 600 ns-train $m $COMMON --output-dir $SYN/out_$m $extra 2>&1; echo EXIT=\$?")
+        rc=$(echo "$log" | grep -o 'EXIT=[0-9]*' | tail -1 | cut -d= -f2)
+        banner=$(echo "$log" | grep -c 'Training Finished')
+        ckpt=$(dexec bash -c "find $SYN/out_$m -name '*.ckpt' | wc -l" | tr -d '[:space:]')
+        if [ "$rc" = "0" ] && [ "$banner" -ge 1 ] && [ "${ckpt:-0}" -ge 1 ]; then
+            pass "ns-train $m: 300 iterations, banner, checkpoint ($(( $(date +%s) - t0 )) s)"
+        else
+            fail "ns-train $m" "exit=$rc banner=$banner ckpt=$ckpt — $(echo "$log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -E 'Error|assert' | tail -2 | cut -c1-200 | tr '\n' ' ')"
+        fi
+    done
+
+    cfg_std=$(dexec bash -c "ls $SYN/out_splatfacto/smoke/splatfacto/*/config.yml 2>/dev/null | head -1" | tr -d '[:space:]')
+    cfg_w=$(dexec bash -c "ls $SYN/out_splatfacto-w/smoke/splatfacto-w/*/config.yml 2>/dev/null | head -1" | tr -d '[:space:]')
+
+    if [ -n "$cfg_std" ]; then
+        out=$(dexec bash -c "cd /tmp && timeout 300 ns-export gaussian-splat --load-config $cfg_std --output-dir $SYN/exp_std > /dev/null 2>&1; stat -c %s $SYN/exp_std/splat.ply 2>/dev/null" | tr -d '[:space:]')
+        [ "${out:-0}" -gt 1000 ] && pass "ns-export gaussian-splat wrote splat.ply ($out bytes)" || fail "ns-export gaussian-splat" "no PLY ($out)"
+    else
+        fail "ns-export gaussian-splat" "no splatfacto config.yml to export from"
+    fi
+
+    if [ -n "$cfg_w" ]; then
+        out=$(dexec bash -c "cd /tmp && timeout 300 ns-export-splatfactow --load-config $cfg_w --output-dir $SYN/exp_w > /dev/null 2>&1; stat -c %s $SYN/exp_w/splat.ply 2>/dev/null" | tr -d '[:space:]')
+        [ "${out:-0}" -gt 1000 ] && pass "ns-export-splatfactow wrote splat.ply ($out bytes)" || fail "ns-export-splatfactow" "no PLY ($out)"
+
+        # Deterministic colour-cache check (v4.7 patch): train render on camera k,
+        # cull, eval render on the SAME camera must not assert.
+        out=$(dexec_in python - "$cfg_w" <<'PY' 2>&1 | grep -E '^RESULT' | tail -1
+import sys, torch
+from pathlib import Path
+from nerfstudio.utils.eval_utils import eval_setup
+_, pipeline, _, _ = eval_setup(Path(sys.argv[1]), test_mode="val")
+model, dm = pipeline.model, pipeline.datamanager
+def cam(i):
+    c = dm.train_dataset.cameras[i:i+1].to(model.device); c.metadata = {"cam_idx": i}; return c
+ok = True
+for same in (False, True, True):
+    model.train(); c, _ = dm.next_train(0); k = c.metadata["cam_idx"]; model.get_outputs(c)
+    with torch.no_grad():
+        m = torch.zeros(model.num_points, dtype=torch.bool, device=model.device); m[:5] = True; model.cull_gaussians(m)
+    model.eval(); e = k if same else (k + 1) % len(dm.train_dataset)
+    try:
+        with torch.no_grad(): model.get_outputs_for_camera(cam(e))
+    except AssertionError as ex:
+        ok = False
+print("RESULT", "PASS" if ok else "FAIL", model.num_points)
+PY
+)
+        echo "$out" | grep -q '^RESULT PASS' && pass "splatfacto-w colour cache survives cull between train and eval render ($out)" || fail "splatfacto-w colour-cache check" "$out"
+    else
+        fail "ns-export-splatfactow / cache check" "no splatfacto-w config.yml"
+    fi
+
+    dexec rm -rf "$SYN" > /dev/null 2>&1
+fi
 
 # ============================================================================
 # Summary

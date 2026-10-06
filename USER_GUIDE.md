@@ -90,15 +90,20 @@ Should show your RTX 50-series GPU. If this fails, fix it before proceeding — 
 ```bash
 git clone https://github.com/AlexJumaW99/docker_splat_v2.git
 cd docker_splat_v2
-docker build --target nerfstudio -t splat-nerfstudio-v2 .
+docker compose build nerfstudio      # preferred: reads docker-compose.yml's build block
+# or: docker build --target nerfstudio -t splat-nerfstudio-v2 .
 ```
+
+> If plain `docker build` stops with `BuildKit is enabled but the buildx component is
+> missing or broken`, use `docker compose build` — it drives BuildKit through Compose and
+> works without the buildx plugin (this is how v4.9 was built here).
 
 **Expected duration:** 25–40 minutes on first run. Breakdown:
 
 | Stage | Time | Cacheable |
 |---|---|---|
 | Stage 1–2 (apt deps) | 3–5 min | Yes (until apt list changes) |
-| Stage 3 (COLMAP compile) | 10–15 min | Yes (until `COLMAP_COMMIT` is bumped) |
+| Stage 3 (COLMAP compile) | ~4 min measured for 4.2.1 (ninja, 448 objects, 2026-10-06); 10–15 min on slower CPUs | Yes (until `COLMAP_COMMIT` is bumped) |
 | Stage 4 (gsplat compile) | 2–4 min | Yes |
 | Stage 5 (nerfstudio pip install) | 5–10 min | Partially (pip caches wheels) |
 
@@ -229,8 +234,8 @@ First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif (~
 | Tab       | State | Behavior                                                                                                                                      |
 |-----------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------|
 | Dashboard | live  | Polls Docker + `splat-ns-v2` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
-| Process   | live  | Form-driven `ns-process-data` (video or images). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF photos (iPhone) to maximum-quality JPEG with EXIF preserved before processing; originals are stashed in a `heic_originals/` subfolder. |
-| Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), **Training resolution** dropdown built from the dataset's `images_N` copies (with an *Add downscale levels* action when they are missing), iteration slider, checkpoint cadence (flags values above 5000), viser + TensorBoard mode. Advanced: **Image cache** (Auto / GPU / CPU with a live size estimate), **Eval cadence** (default 1000 steps), **Rasterize mode**, raw CLI flags. The DATASET card shows how many frames received a pose and the tab asks before training below 50 %. Routes `splatfacto-w` through `splatfactow_dataparser` and refuses it without a COLMAP model; writes `job.log` next to the run's manifest. Detects when viser comes up and deep-links to `http://localhost:7007`. |
+| Process   | live  | Form-driven `ns-process-data` (video or images). **Feature engine** picker (COLMAP SIFT or three hloc combinations, recorded as typed manifest fields). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF photos (iPhone) to maximum-quality JPEG with EXIF preserved before processing; originals are stashed in a `heic_originals/` subfolder. |
+| Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), **Training resolution** dropdown built from the dataset's `images_N` copies (with an *Add downscale levels* action when they are missing), iteration slider (default 30 000, range 1 000–60 000, *Preview 7k · Standard 30k · Long 55k* quick picks with the method's upstream default named), checkpoint cadence (flags values above 5000), viser + TensorBoard mode. Advanced: **Image cache** (Auto / GPU / CPU with a live size estimate), **Eval cadence** (default 1000 steps), **Rasterize mode**, raw CLI flags. The DATASET card shows how many frames received a pose and the tab asks before training below 50 %. After training finishes with the viewer open, the card shows the GPU memory still held and offers **Release GPU**; Run also warns when under 3 GiB of VRAM is free. Routes `splatfacto-w` through `splatfactow_dataparser` and refuses it without a COLMAP model; writes `job.log` next to the run's manifest. Detects when viser comes up and deep-links to `http://localhost:7007`. |
 | Exports   | live  | Form-driven PLY export and `ns-render camera-path` (video from viser keyframe JSON). Each artifact lands in its own ULID directory — `data_v2/exports/splat/<EXPORT_ULID>/<name>.ply` and `data_v2/renders/<RENDER_ULID>/<name>.mp4` — alongside a `manifest.json` whose `parent.run_id` is the train ULID; collisions are impossible by construction. Auto-routes to `ns-export-splatfactow` for `splatfacto-w` / `splatfacto-w-light` runs (upstream `ns-export gaussian-splat` doesn't handle them) and to `ns-export gaussian-splat` for everything else. |
 | Viewers   | live  | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
 | Runs      | stub  | Placeholder for a training-run browser over `data/outputs/`.                                                                                  |
@@ -425,7 +430,7 @@ On an RTX 5070 Ti with a 30-second 1080p video at 250 frames:
 └── transforms.json      # Nerfstudio camera poses (the key file)
 ```
 
-> On longer videos, COLMAP 4.1's `incremental_pipeline` sometimes seeds a 2-image bootstrap as `sparse/0` and grows the real model into `sparse/1`. The image ships a `colmap` PATH-shim (`/opt/colmap-shim/colmap`) that detects this after the mapper exits, probes each numeric submap with `colmap model_analyzer`, and name-swaps the largest into `sparse/0` (the original `sparse/0` is preserved under its old index). The result: `ns-process-data` always reads the largest reconstruction, never the bootstrap stub. You'll see `colmap-shim: promoting sparse/N (M registered images) -> sparse/0` on stderr when promotion happens. The shim is transparent and only touches `colmap mapper` — every other subcommand passes straight through.
+> On longer videos, COLMAP's `incremental_pipeline` (4.1.0.dev0 and, verified 2026-10-06, 4.2.1 too) sometimes seeds a 2–3-image bootstrap as `sparse/0` and grows the real model into `sparse/1`. The image ships a `colmap` PATH-shim (`/opt/colmap-shim/colmap`) that detects this after the mapper exits, probes each numeric submap with `colmap model_analyzer`, and name-swaps the largest into `sparse/0` (the original `sparse/0` is preserved under its old index). The result: `ns-process-data` always reads the largest reconstruction, never the bootstrap stub. You'll see `colmap-shim: promoting sparse/N (M registered images) -> sparse/0` on stderr when promotion happens. The shim is transparent and only touches `colmap mapper` — every other subcommand passes straight through.
 
 ### Success criteria
 
@@ -483,7 +488,7 @@ For still photos, **use `exhaustive` unless you have more than ~100 images.** Wi
 
 ### Learned features with hloc (`--sfm-tool hloc`)
 
-Image v4.7 bakes the [hloc](https://github.com/cvg/Hierarchical-Localization) toolbox into the container, so COLMAP's SIFT can be swapped for learned features when SIFT struggles (long focal lengths, low texture, strong exposure changes). In the GUI, put the flags in the Process tab's **Raw CLI flags** box; on the CLI, append them to `ns-process-data`:
+Image v4.7 bakes the [hloc](https://github.com/cvg/Hierarchical-Localization) toolbox into the container, so COLMAP's SIFT can be swapped for learned features when SIFT struggles (long focal lengths, low texture, strong exposure changes). In the GUI, pick one in the Process tab's **Feature engine** dropdown next to *Matching method* (COLMAP · SIFT, hloc · SuperPoint + LightGlue, hloc · DISK + LightGlue, hloc · SuperPoint + SuperGlue) — it emits the three flags below and records `sfm_tool` / `feature_type` / `matcher_type` in the ProcessManifest. On the CLI, append them to `ns-process-data`:
 
 ```bash
 ns-process-data images --data /workspace/photos --output-dir /workspace/processed/photos_splat \
@@ -545,9 +550,9 @@ See the [Real-time monitoring section](#real-time-monitoring-with-tensorboard) f
 | Iterations | Time (RTX 5070 Ti, measured 2026-10-05 on 235 frames at 960 px) | Use case |
 |---|---|---|
 | 2000 | < 1 min | Quick "does it work" check |
-| 7000 | ~1.5 min (87 s) — PSNR 31.0 on the test scene | Preview quality; the GUI's default |
-| 30000 (Nerfstudio default) | ~6 min (370 s) at 960 px, ~15 min (892 s) at 1920 px — PSNR 33.9 / 32.5 | Final quality; every schedule in the presets (densification stop, learning-rate decay) assumes 30 000 |
-| 50000+ | > 25 min | Diminishing returns for splatfacto; `splatfacto-w`'s upstream default is 55 000 |
+| 7000 | ~1.5 min (87 s) — PSNR 31.0 on the test scene | Preview quality (the Train tab's *Preview · 7k* quick pick) |
+| 30000 (Nerfstudio default, and the Train tab's default since 2026-10-06) | ~6 min (370 s) at 960 px, ~15 min (892 s) at 1920 px — PSNR 33.9 / 32.5 | Final quality; every schedule in the presets (densification stop, learning-rate decay) assumes 30 000 |
+| 50000+ | > 25 min | Diminishing returns for splatfacto; `splatfacto-w`'s upstream default is 55 000 (the *Long · 55k* quick pick; the slider now goes to 60 000) |
 
 Times scale with frame count, training resolution and gaussian count: training the same scene at 1920 px took 2.4× as long as at 960 px.
 
@@ -919,7 +924,7 @@ Rendering time scales with frame count, output resolution and scene gaussian cou
 
 ### "Could NOT find Qt6Svg" during build
 
-Cause: COLMAP 4.1.0.dev0 requires `qt6-svg-dev`, which older documentation doesn't mention.
+Cause: COLMAP 4.1.0.dev0 and later require `qt6-svg-dev`, which older documentation doesn't mention.
 
 Fix: already in the v2+ Dockerfile. If you see this, you're building from an outdated source.
 
@@ -987,7 +992,7 @@ Multiple architectures can be built simultaneously by separating with semicolons
 
 ### `transforms.json` only contains 2 frames despite a long input video
 
-Cause: COLMAP 4.1's `incremental_pipeline` splintered the reconstruction — it seeded a 2-image bootstrap as `sparse/0` and grew the real model into `sparse/1`, `sparse/2`, etc. Nerfstudio's converter hardcodes `colmap_model_path = Path("colmap/sparse/0")`, so it exports the bootstrap stub and leaves the real reconstruction unused on disk.
+Cause: COLMAP's `incremental_pipeline` (4.1.0.dev0 and 4.2.1 alike) splintered the reconstruction — it seeded a 2-image bootstrap as `sparse/0` and grew the real model into `sparse/1`, `sparse/2`, etc. Nerfstudio's converter hardcodes `colmap_model_path = Path("colmap/sparse/0")`, so it exports the bootstrap stub and leaves the real reconstruction unused on disk.
 
 Fix: already handled by the `colmap-shim` baked into the image (`/opt/colmap-shim/colmap`, prepended to `PATH`). After the mapper exits, the shim probes every numeric submap with `colmap model_analyzer`, name-swaps the largest into `sparse/0`, and preserves the original `sparse/0` under its old index. You'll see `colmap-shim: promoting sparse/N (M registered images) -> sparse/0` on stderr when it kicks in.
 

@@ -125,6 +125,22 @@ class ProcessParams(BaseModel):
     eval_data: str | None = None  # relpath to optional eval set
     extra_flags: list[str] = Field(default_factory=list)
 
+    # ---- added 2026-10-06 (Tier 3). Which structure-from-motion engine ran.
+    # None on manifests written before this date or when ns-process-data's
+    # default (COLMAP SIFT) was used without saying so. Values mirror
+    # nerfstudio's `--sfm-tool/--feature-type/--matcher-type` choices; under
+    # hloc, `matching_method` sequential/vocab_tree both mean NetVLAD top-50
+    # retrieval (nerfstudio hloc_utils.py).
+    sfm_tool: Literal["colmap", "hloc"] | None = None
+    feature_type: Literal[
+        "sift", "superpoint", "superpoint_aachen", "superpoint_max",
+        "superpoint_inloc", "r2d2", "d2net-ss", "sosnet", "disk",
+    ] | None = None
+    matcher_type: Literal[
+        "NN", "superglue", "superglue-fast", "NN-superpoint", "NN-ratio",
+        "NN-mutual", "adalam", "disk+lightglue", "superpoint+lightglue",
+    ] | None = None
+
 
 TrainMethod = Literal[
     "splatfacto",
@@ -152,7 +168,10 @@ class TrainParams(BaseModel):
     vis: Literal["viewer", "tensorboard", "viewer+tensorboard"]
     viewer_websocket_host: str = "0.0.0.0"
     viewer_quit_on_train_completion: bool = False
-    dataparser: Literal["nerfstudio-data", "colmap"]
+    # The dataparser subcommand ns-train actually received. Since 2026-10-06
+    # splatfacto-w runs record "splatfactow_dataparser" (their real parser);
+    # earlier manifests carry the project's dataparser instead.
+    dataparser: Literal["nerfstudio-data", "colmap", "splatfactow_dataparser"]
     extra_flags: list[str] = Field(default_factory=list)
 
     # ---- added 2026-10-05 (Tier 2). All optional with defaults, so every

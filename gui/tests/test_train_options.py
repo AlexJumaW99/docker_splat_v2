@@ -113,11 +113,21 @@ class CacheTests(unittest.TestCase):
 
 
 class PoseRecoveryTests(unittest.TestCase):
-    def test_prefers_manifest_metrics(self):
+    def test_disk_wins_over_a_stale_manifest(self):
+        # vizer once recorded 209 extracted frames while 267 were on disk; the
+        # readout must follow the directory, which is what training loads.
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             _make_dataset(root, (640, 480), (), frames=4, transforms_frames=4,
                           manifest_metrics={"extracted_frame_count": 75.0, "registered_frame_count": 2.0})
+            pr = to.pose_recovery(root)
+            self.assertEqual((pr.registered, pr.extracted, pr.source), (4, 4, "files"))
+            self.assertEqual(pr.level, "success")
+
+    def test_manifest_used_when_files_are_gone(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "manifest.json").write_text(json.dumps({"stage": "process", "metrics": {"extracted_frame_count": 75.0, "registered_frame_count": 2.0}}))
             pr = to.pose_recovery(root)
             self.assertEqual((pr.registered, pr.extracted, pr.source), (2, 75, "manifest"))
             self.assertAlmostEqual(pr.ratio, 2 / 75)

@@ -479,6 +479,58 @@ def collect_process_metrics(output_dir: Path) -> dict[str, float]:
     return metrics
 
 
+def scrape_process_outputs(output_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """The `outputs` and `checksums` sections of a ProcessManifest, read from
+    what ns-process-data left on disk. Shared by write_process_manifest and
+    refresh_process_manifest so both agree on what counts as an output."""
+    outputs: dict[str, str] = {}
+    transforms = output_dir / "transforms.json"
+    if transforms.is_file():
+        outputs["transforms_json"] = to_warehouse_relpath(transforms)
+    sparse0 = output_dir / "colmap" / "sparse" / "0"
+    if sparse0.is_dir():
+        outputs["colmap_sparse"] = to_warehouse_relpath(sparse0)
+    images = output_dir / "images"
+    if images.is_dir():
+        outputs["images_dir"] = to_warehouse_relpath(images)
+    depth = output_dir / "depth"
+    if depth.is_dir():
+        outputs["depth_dir"] = to_warehouse_relpath(depth)
+
+    checksums: dict[str, str] = {}
+    if transforms.is_file():
+        checksums[outputs["transforms_json"]] = sha256_file(transforms)
+    return outputs, checksums
+
+
+def refresh_process_manifest(process_dir: Path) -> ProcessManifest:
+    """Re-scrape `outputs`, `metrics` and `checksums` of an existing
+    ProcessManifest from the directory as it is now, keeping every declared
+    field (run_id, parent, params, command, created_at, provenance).
+
+    Why this exists: a manifest is written once, when the writer believes
+    the run is complete. vizer wrote `01KVKNPCGV` after 67 s with
+    `extracted_frame_count = 209` and `outputs = {images_dir}` while the frames
+    were still being copied; the dataset was completed afterwards (267 frames,
+    COLMAP model, transforms.json) and the record never caught up. The
+    previous file is kept as `manifest.json.bak-<UTC timestamp>`.
+    """
+    process_dir = Path(process_dir)
+    path = process_dir / "manifest.json"
+    manifest = load_manifest(path)
+    if not isinstance(manifest, ProcessManifest):
+        raise ValueError(f"{path} is a {manifest.stage!r} manifest, not a process manifest")
+    metrics = collect_process_metrics(process_dir)
+    if "process_duration_seconds" in manifest.metrics:
+        metrics["process_duration_seconds"] = manifest.metrics["process_duration_seconds"]
+    outputs, checksums = scrape_process_outputs(process_dir)
+    refreshed = manifest.model_copy(update={"outputs": outputs, "metrics": metrics, "checksums": checksums})
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    shutil.copy2(path, process_dir / f"manifest.json.bak-{stamp}")
+    dump_manifest(refreshed, path)
+    return refreshed
+
+
 def write_process_manifest(
     *,
     output_dir: Path,
@@ -505,23 +557,7 @@ def write_process_manifest(
     if duration_seconds is not None:
         metrics["process_duration_seconds"] = float(duration_seconds)
 
-    outputs: dict[str, str] = {}
-    transforms = output_dir / "transforms.json"
-    if transforms.is_file():
-        outputs["transforms_json"] = to_warehouse_relpath(transforms)
-    sparse0 = output_dir / "colmap" / "sparse" / "0"
-    if sparse0.is_dir():
-        outputs["colmap_sparse"] = to_warehouse_relpath(sparse0)
-    images = output_dir / "images"
-    if images.is_dir():
-        outputs["images_dir"] = to_warehouse_relpath(images)
-    depth = output_dir / "depth"
-    if depth.is_dir():
-        outputs["depth_dir"] = to_warehouse_relpath(depth)
-
-    checksums: dict[str, str] = {}
-    if transforms.is_file():
-        checksums[outputs["transforms_json"]] = sha256_file(transforms)
+    outputs, checksums = scrape_process_outputs(output_dir)
 
     manifest = ProcessManifest(
         run_id=run_id,
@@ -566,6 +602,29 @@ def process_params_from_form(form_params: dict, mode: str) -> ProcessParams:
     import shlex
     extra_list = shlex.split(extra) if extra.strip() else []
 
+    # SfM engine: the Process tab's "Feature engine" control sets these keys;
+    # raw --sfm-tool/--feature-type/--matcher-type flags typed into the
+    # raw-flags box come last on the command line and therefore win, so they
+    # override here too. "any" is nerfstudio's placeholder, not a choice.
+    sfm_tool = form_params.get("sfm_tool") or None
+    feature_type = form_params.get("feature_type") or None
+    matcher_type = form_params.get("matcher_type") or None
+    for flag, key in (("--sfm-tool", "sfm_tool"), ("--feature-type", "feature_type"), ("--matcher-type", "matcher_type")):
+        for i, tok in enumerate(extra_list):
+            val = None
+            if tok == flag and i + 1 < len(extra_list):
+                val = extra_list[i + 1]
+            elif tok.startswith(flag + "="):
+                val = tok.split("=", 1)[1]
+            if val and val != "any":
+                if key == "sfm_tool": sfm_tool = val
+                elif key == "feature_type": feature_type = val
+                else: matcher_type = val
+    if sfm_tool is None and (feature_type or matcher_type):
+        # nerfstudio's find_tool_feature_matcher_combination resolves "any" to
+        # hloc whenever a non-SIFT feature or non-NN matcher is requested.
+        sfm_tool = "colmap" if feature_type in (None, "sift") and matcher_type in (None, "NN") else "hloc"
+
     return ProcessParams(
         mode=mode,  # type: ignore[arg-type]  # "video" | "images" validated in model
         matching_method=form_params["matching_method"],
@@ -590,6 +649,9 @@ def process_params_from_form(form_params: dict, mode: str) -> ProcessParams:
         eval_random_seed=form_params.get("eval_random_seed"),
         eval_data=form_params.get("eval_data"),
         extra_flags=extra_list,
+        sfm_tool=sfm_tool,  # type: ignore[arg-type]
+        feature_type=feature_type,  # type: ignore[arg-type]
+        matcher_type=matcher_type,  # type: ignore[arg-type]
     )
 
 
@@ -944,7 +1006,7 @@ _TOP_SCALAR_RE = re.compile(r"^(?P<key>[a-z_][a-z0-9_]*):\s*(?P<val>.*?)\s*$")
 # `dataparser: !!python/object:nerfstudio.data.dataparsers.<X>_dataparser.<Y>DataParserConfig`
 _DATAPARSER_TAG_RE = re.compile(
     r"^\s*dataparser:\s*!!python/object:"
-    r"nerfstudio\.data\.dataparsers\.(?P<module>[a-z_]+)_dataparser\."
+    r"(?:nerfstudio\.data\.dataparsers|splatfactow)\.(?P<module>[a-z_]+)_dataparser\."
     r"(?P<cls>\w+)DataParserConfig\s*$"
 )
 # Nested `viewer:` block — quit_on_train_completion lives 2 spaces in.
@@ -998,6 +1060,10 @@ def _parse_train_config_yml(config_path: Path) -> dict:
                 out["dataparser_kind"] = "nerfstudio-data"
             elif module == "colmap":
                 out["dataparser_kind"] = "colmap"
+            elif module == "nerfw":
+                # splatfactow.nerfw_dataparser.NerfW -> the subcommand ns-train
+                # was given (recorded as such in TrainParams since 2026-10-06).
+                out["dataparser_kind"] = "splatfactow_dataparser"
             else:
                 out["dataparser_kind"] = module  # best-effort, unknown variant
             continue
@@ -1421,6 +1487,30 @@ def _cli_backfill_train(argv: list[str]) -> int:
     return rc
 
 
+def _cli_refresh_process(argv: list[str]) -> int:
+    """`python -m app.warehouse refresh-process <dir>...`"""
+    if not argv:
+        print("usage: python -m app.warehouse refresh-process <process_dir> [<process_dir> ...]")
+        return 2
+    rc = 0
+    for raw in argv:
+        d = Path(raw).expanduser().resolve()
+        try:
+            before = load_manifest(d / "manifest.json")
+            after = refresh_process_manifest(d)
+            print(f"refreshed {d}")
+            for k in sorted(set(before.metrics) | set(after.metrics)):
+                if before.metrics.get(k) != after.metrics.get(k):
+                    print(f"  metrics.{k}: {before.metrics.get(k)} -> {after.metrics.get(k)}")
+            for k in sorted(set(before.outputs) | set(after.outputs)):
+                if before.outputs.get(k) != after.outputs.get(k):
+                    print(f"  outputs.{k}: {before.outputs.get(k)} -> {after.outputs.get(k)}")
+        except Exception as e:  # noqa: BLE001 — report and continue
+            print(f"FAILED {d}: {e}")
+            rc = 1
+    return rc
+
+
 def _cli_verify(argv: list[str]) -> int:
     """Verify checksums for one or more manifest.json files."""
     if not argv:
@@ -1479,6 +1569,7 @@ if __name__ == "__main__":
     import sys
     cmds = {
         "backfill-train": _cli_backfill_train,
+        "refresh-process": _cli_refresh_process,
         "verify": _cli_verify,
         "stale-pending": _cli_stale_pending,
         "orphans": _cli_orphans,
@@ -1491,6 +1582,9 @@ if __name__ == "__main__":
         "  backfill-train <train_dir> [<train_dir> ...]\n"
         "      Reconstruct manifest.json for an orphan run from its config.yml\n"
         "      and (optionally) pending.json. provenance=\"backfilled\".\n"
+        "  refresh-process <process_dir> [...]\n"
+        "      Re-scrape outputs/metrics/checksums of a ProcessManifest from the\n"
+        "      directory as it is now (keeps a .bak). Fixes records written too early.\n"
         "  verify <manifest.json> [...]\n"
         "      Verify SHA-256 checksums recorded in one or more manifests.\n"
         "  stale-pending\n"

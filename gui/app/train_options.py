@@ -317,30 +317,31 @@ def count_transforms_frames(processed_dir: Path | str) -> int | None:
 
 
 def pose_recovery(processed_dir: Path | str) -> PoseRecovery:
-    """How many extracted frames received a camera pose. Prefers the figures
-    recorded in manifest.json; falls back to counting transforms.json frames
-    and files in images/ (covers manifests written by other tools, e.g. vizer,
-    and legacy datasets)."""
+    """How many extracted frames received a camera pose.
+
+    Reads the directory first — `transforms.json` frames (one per registered
+    image) and files in `images/` — because that is what training will load;
+    the manifest's metrics are used only for whatever is not on disk. A
+    vizer-written manifest once recorded 209 extracted frames while 267 sat
+    in `images/` (written before the run had finished), which is exactly the
+    case this ordering avoids.
+    """
     root = Path(processed_dir)
-    registered: int | None = None
-    extracted: int | None = None
-    m = root / "manifest.json"
-    if m.is_file():
-        try:
-            metrics = json.loads(m.read_text()).get("metrics") or {}
-            if metrics.get("registered_frame_count") is not None:
-                registered = int(metrics["registered_frame_count"])
-            if metrics.get("extracted_frame_count") is not None:
-                extracted = int(metrics["extracted_frame_count"])
-        except (OSError, ValueError, TypeError):
-            pass
-    source = "manifest" if registered is not None else "none"
-    if registered is None:
-        registered = count_transforms_frames(root)
-        if registered is not None:
-            source = "files"
-    if extracted is None and (root / "images").is_dir():
-        extracted = _count_images(root / "images")
+    registered = count_transforms_frames(root)
+    extracted = _count_images(root / "images") if (root / "images").is_dir() else None
+    source = "files" if registered is not None else "none"
+    if registered is None or extracted is None:
+        m = root / "manifest.json"
+        if m.is_file():
+            try:
+                metrics = json.loads(m.read_text()).get("metrics") or {}
+                if registered is None and metrics.get("registered_frame_count") is not None:
+                    registered = int(metrics["registered_frame_count"])
+                    source = "manifest"
+                if extracted is None and metrics.get("extracted_frame_count") is not None:
+                    extracted = int(metrics["extracted_frame_count"])
+            except (OSError, ValueError, TypeError):
+                pass
     return PoseRecovery(registered=registered, extracted=extracted, source=source)
 
 

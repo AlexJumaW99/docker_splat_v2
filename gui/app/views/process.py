@@ -94,6 +94,23 @@ _HELP = {
         "More frames → longer feature-matching + bundle-adjust, but more "
         "supervision during training."
     ),
+    "engine": (
+        "Feature engine",
+        "Which structure-from-motion engine finds and matches image features."
+        "<br><br><b>COLMAP · SIFT</b> \u00b7 the default; GPU SIFT compiled for "
+        "this card. Right for most video captures.<br>"
+        "<b>hloc · SuperPoint + LightGlue</b> \u00b7 learned features and matcher; "
+        "helps on long focal lengths, low texture, strong exposure changes "
+        "(registered 87/87 frames on the test set). SuperPoint's weights are "
+        "licensed by Magic Leap for <i>non-commercial research</i> only.<br>"
+        "<b>hloc · DISK + LightGlue</b> \u00b7 the Apache-2.0 pair (DISK by EPFL, "
+        "LightGlue by ETH); use it when the licence matters.<br>"
+        "<b>hloc · SuperPoint + SuperGlue</b> \u00b7 the older learned matcher.<br><br>"
+        "Under hloc, <b>exhaustive</b> keeps its meaning but <b>sequential</b> and "
+        "<b>vocab_tree</b> both become NetVLAD retrieval of the 50 most similar "
+        "frames, and the crop / circle-mask options are not available. hloc runs "
+        "its own pycolmap; the principal point stays at the image centre."
+    ),
     "matching": (
         "Matching method",
         "How COLMAP decides which frame pairs to feature-match.<br><br>"
@@ -249,6 +266,19 @@ def _host_to_container(host_path: str | Path) -> str:
 # in this list historically but tyro rejects it ("invalid choice"); leaving it
 # selectable would silently break a saved preset.
 MATCH_METHODS = ["sequential", "vocab_tree", "exhaustive"]
+
+# Feature engines the Process tab offers: (key, label, sfm_tool, feature_type,
+# matcher_type). The hloc rows are the combinations verified to import in this
+# image (smoke_test.sh §18); r2d2 / d2net-ss / adalam do not, so they are not
+# offered. Keys are what presets store; the three flag values are what the
+# command line and the ProcessManifest carry.
+FEATURE_ENGINES = [
+    ("colmap",        "COLMAP · SIFT (default)",                         None,   None,             None),
+    ("hloc_sp_lg",    "hloc · SuperPoint + LightGlue",                   "hloc", "superpoint_max", "superpoint+lightglue"),
+    ("hloc_disk_lg",  "hloc · DISK + LightGlue  (permissive licence)",   "hloc", "disk",           "disk+lightglue"),
+    ("hloc_sp_sg",    "hloc · SuperPoint + SuperGlue",                   "hloc", "superpoint_max", "superglue"),
+]
+_ENGINE_BY_KEY = {e[0]: e for e in FEATURE_ENGINES}
 
 # Camera models supported by ns-process-data --camera-type. Order matches the
 # CLI help so users see the same dropdown order they'd find in the docs.
@@ -595,14 +625,29 @@ class _Form(QWidget):
         self.method_combo.addItems(MATCH_METHODS)
         grid.addWidget(self.method_combo, 1, 1)
 
+        # Feature engine (COLMAP SIFT or an hloc learned-feature combination)
+        grid.addWidget(labeled("Feature engine", *_HELP["engine"]), 2, 0)
+        eng_col = QVBoxLayout(); eng_col.setSpacing(4); eng_col.setContentsMargins(0, 0, 0, 0)
+        self.engine_combo = QComboBox()
+        for key, label, *_ in FEATURE_ENGINES:
+            self.engine_combo.addItem(label, userData=key)
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        self.engine_caption = QLabel("")
+        self.engine_caption.setProperty("role", "caption")
+        self.engine_caption.setWordWrap(True)
+        eng_col.addWidget(self.engine_combo)
+        eng_col.addWidget(self.engine_caption)
+        eng_wrap = QWidget(); eng_wrap.setLayout(eng_col)
+        grid.addWidget(eng_wrap, 2, 1)
+
         # Downscale levels
-        grid.addWidget(labeled("Downscale levels", *_HELP["downscales"]), 2, 0)
+        grid.addWidget(labeled("Downscale levels", *_HELP["downscales"]), 3, 0)
         self.downscales_spin = QSpinBox()
         self.downscales_spin.setRange(0, 5)
         self.downscales_spin.setMaximumWidth(80)
         ds_row = QHBoxLayout(); ds_row.addWidget(self.downscales_spin); ds_row.addStretch(1)
         ds_wrap = QWidget(); ds_wrap.setLayout(ds_row)
-        grid.addWidget(ds_wrap, 2, 1)
+        grid.addWidget(ds_wrap, 3, 1)
 
         # Verbose
         verbose_row = QHBoxLayout(); verbose_row.setSpacing(6); verbose_row.setContentsMargins(0, 0, 0, 0)
@@ -611,7 +656,7 @@ class _Form(QWidget):
         verbose_row.addWidget(_hb("verbose"))
         verbose_row.addStretch(1)
         vw = QWidget(); vw.setLayout(verbose_row)
-        grid.addWidget(vw, 3, 1)
+        grid.addWidget(vw, 4, 1)
 
         v.addLayout(grid)
 
@@ -838,6 +883,19 @@ class _Form(QWidget):
         return sc
 
     # ---- conditional visibility ----
+
+    def _on_engine_changed(self, _idx: int) -> None:
+        key = self.engine_combo.currentData() or "colmap"
+        tool = _ENGINE_BY_KEY[key][2]
+        if tool == "hloc":
+            note = ("hloc: exhaustive = all pairs; sequential and vocab_tree = NetVLAD top-50 "
+                    "retrieval · crop / circle-mask unavailable · first run downloads the "
+                    "LightGlue (and NetVLAD) weights")
+            if key in ("hloc_sp_lg", "hloc_sp_sg"):
+                note += " · SuperPoint weights: non-commercial research licence"
+            self.engine_caption.setText(note)
+        else:
+            self.engine_caption.setText("")
 
     def _on_camera_type_changed(self, value: str) -> None:
         is_equirect = (value == "equirectangular")
@@ -1113,6 +1171,15 @@ class _Form(QWidget):
         method = params.get("matching_method", default_method)
         idx = MATCH_METHODS.index(method) if method in MATCH_METHODS else 0
         self.method_combo.setCurrentIndex(idx)
+        engine = params.get("feature_engine")
+        if engine is None and params.get("sfm_tool") == "hloc":
+            # Older record with typed fields but no UI key: map back if possible.
+            for key, _l, tool, ft, mt in FEATURE_ENGINES:
+                if tool == "hloc" and ft == params.get("feature_type") and mt == params.get("matcher_type"):
+                    engine = key
+        e_idx = self.engine_combo.findData(engine or "colmap")
+        self.engine_combo.setCurrentIndex(e_idx if e_idx >= 0 else 0)
+        self._on_engine_changed(self.engine_combo.currentIndex())
         self.downscales_spin.setValue(int(params.get("num_downscales", 3)))
         self.verbose_cb.setChecked(bool(params.get("verbose", True)))
         self.extra_flags_edit.setText(params.get("extra_flags", ""))
@@ -1259,6 +1326,12 @@ class _Form(QWidget):
             # basic
             "num_frames_target": self.frames_value.value(),
             "matching_method": self.method_combo.currentText(),
+            # Feature engine: UI key plus the three flag values the command
+            # line and ProcessManifest use (see FEATURE_ENGINES).
+            "feature_engine": self.engine_combo.currentData() or "colmap",
+            "sfm_tool": _ENGINE_BY_KEY[self.engine_combo.currentData() or "colmap"][2],
+            "feature_type": _ENGINE_BY_KEY[self.engine_combo.currentData() or "colmap"][3],
+            "matcher_type": _ENGINE_BY_KEY[self.engine_combo.currentData() or "colmap"][4],
             "num_downscales": self.downscales_spin.value(),
             "verbose": self.verbose_cb.isChecked(),
             "extra_flags": self.extra_flags_edit.text().strip(),
@@ -1308,6 +1381,15 @@ class _Form(QWidget):
         ])
         if params.get("verbose"):
             argv.append("--verbose")
+
+        # Feature engine (hloc). Emitted before the raw flags so a typed
+        # --matcher-type etc. still overrides.
+        if params.get("sfm_tool") == "hloc":
+            argv.extend([
+                "--sfm-tool", "hloc",
+                "--feature-type", params["feature_type"],
+                "--matcher-type", params["matcher_type"],
+            ])
 
         # Camera & cropping
         if params.get("camera_type", "perspective") != "perspective":
@@ -1425,6 +1507,22 @@ class _Form(QWidget):
                     return
 
             params = self._collect_params()
+
+            # hloc cannot take a camera mask: nerfstudio raises
+            # "Cannot use a mask with hloc" after copying every frame. Catch it
+            # here, before anything is minted on disk.
+            if params.get("sfm_tool") == "hloc":
+                crops = (params.get("crop_top", 0), params.get("crop_bottom", 0),
+                         params.get("crop_left", 0), params.get("crop_right", 0))
+                if any(float(c) > 0 for c in crops) or float(params.get("percent_radius_crop", 1.0)) < 1.0:
+                    QMessageBox.warning(
+                        self, "Cropping is not available with hloc",
+                        "ns-process-data rejects crop factors and the circle mask when "
+                        "--sfm-tool hloc is used (\"Cannot use a mask with hloc\").\n\n"
+                        "Set Crop to 0 and Circle-mask radius to 1.00, or switch the "
+                        "Feature engine back to COLMAP · SIFT.",
+                    )
+                    return
             self._store.update_last_process_params(self._project.id, params)
 
             # Register the source under data_v2/sources/<ULID>/. Idempotent

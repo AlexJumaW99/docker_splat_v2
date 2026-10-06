@@ -598,6 +598,68 @@
           },
           "title": "Extra Flags",
           "type": "array"
+        },
+        "sfm_tool": {
+          "anyOf": [
+            {
+              "enum": [
+                "colmap",
+                "hloc"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sfm Tool"
+        },
+        "feature_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "sift",
+                "superpoint",
+                "superpoint_aachen",
+                "superpoint_max",
+                "superpoint_inloc",
+                "r2d2",
+                "d2net-ss",
+                "sosnet",
+                "disk"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Feature Type"
+        },
+        "matcher_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "NN",
+                "superglue",
+                "superglue-fast",
+                "NN-superpoint",
+                "NN-ratio",
+                "NN-mutual",
+                "adalam",
+                "disk+lightglue",
+                "superpoint+lightglue"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Matcher Type"
         }
       },
       "required": [
@@ -1251,7 +1313,8 @@
         "dataparser": {
           "enum": [
             "nerfstudio-data",
-            "colmap"
+            "colmap",
+            "splatfactow_dataparser"
           ],
           "title": "Dataparser",
           "type": "string"

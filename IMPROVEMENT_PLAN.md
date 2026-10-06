@@ -2,8 +2,8 @@
 
 Prioritized backlog for `docker_splat_v2`, written 2026-10-05 after a full audit of the
 five training methods, the matching paths and the camera-type handling. Every number
-below was measured on this machine (RTX 5070 Ti 16 GB, image `a4f876fc`, nerfstudio
-`50e0e3c`, gsplat 1.5.3, COLMAP `ffb5404e`) unless marked *not verified*. Benchmark
+below was measured on this machine (RTX 5070 Ti 16 GB, images `a4f876fc` → `4682ac79` (v4.9), nerfstudio
+`50e0e3c`, gsplat 1.5.3, COLMAP `ffb5404e` → 4.2.1 `bd1fcf65` from v4.9 on) unless marked *not verified*. Benchmark
 details are in the appendix; keep this file current as items land.
 
 Status legend: `[ ]` open · `[~]` in progress · `[x]` done (date noted; see `git log` for the commit).
@@ -200,33 +200,85 @@ Build took 27 s (all heavy layers cached). In the recreated container: splatfact
 
 ---
 
-## Tier 3 — defaults and hygiene
+## Tier 3 — defaults and hygiene (landed 2026-10-06, image v4.9)
 
-- `[ ]` Default `Max iterations` 30000 (upstream presets' schedules assume it); keep 7k as
-  a "preview" preset. Measured: 7k → 30k = PSNR 30.99 → 33.93 (87 s → 370 s) at 960 px.
-- `[ ]` `smoke_test.sh`: 300-iteration `ns-train` smoke per method + the deterministic
-  cache check; the current suite passed 62/62 while two methods could not start.
+- `[x]` Default `Max iterations` 30000 (upstream presets' schedules assume it); range 1 000–60 000;
+  quick picks *Preview 7k · Standard 30k · Long 55k*; caption names the method's upstream default
+  (55 000 for splatfacto-w). Measured: 7k → 30k = PSNR 30.99 → 33.93 (87 s → 370 s) at 960 px.
+- `[x]` `smoke_test.sh` §21: synthetic 8-camera dataset generated in the container, all five
+  methods train 300 iterations (~8 s each), both exporters write a PLY, deterministic
+  splatfacto-w cache check; `--skip-train` to skip. Suite is now 92 checks.
 - `[x]` Dockerfile/README: gsplat 1.5.3 does *not* expose 2DGS/3DGUT/fisheye through
   nerfstudio's splatfacto (0 references in `splatfacto.py`); corrected wording.
-- `[ ]` `quit-on-train-completion` default or a VRAM-held warning: a finished viewer held
-  10.7 GB for 15 h.
-- `[ ]` Manifest: record the effective dataparser for splatfacto-w runs
-  (`splatfactow_dataparser`), and typed SfM fields (`sfm_tool`, `feature_type`,
-  `matcher_type`) instead of free-text `extra_flags`; note that under hloc
-  `sequential`/`vocab_tree` both mean NetVLAD top-50 retrieval.
-- `[ ]` Investigate one vizer-processed manifest recording 209 extracted frames while
-  267 exist on disk.
-- `[ ]` Optional COLMAP upgrade to a tagged release (4.2.1 as of 2026-09-29): release
-  notes list mapper speedups and bug fixes but nothing about the submap issue the shim
-  handles; *not tested here*, and the flag-rename patch, shim and vocab tree would need
-  re-validation.
+- `[x]` After the completion banner the viser card shows the GPU memory still held (polled
+  every 5 s) with a **Release GPU** button; Run warns when under 3 GiB of VRAM is free.
+  `quit-on-train-completion` stays unchecked by default (the user inspects results).
+- `[x]` `TrainParams.dataparser` records `splatfactow_dataparser` for splatfacto-w runs (backfill
+  recognises `splatfactow.nerfw_dataparser` in config.yml too); `ProcessParams` gained optional
+  `sfm_tool` / `feature_type` / `matcher_type`, filled by the Process tab's new **Feature engine**
+  control or parsed from hand-typed raw flags; the control's caption states the NetVLAD semantics.
+- `[x]` Investigated: vizer's `_on_process_end()` wrote `01KVKNPCGV` after 66.9 s with only
+  `images_dir` as output and 209 frames counted — before the dataset was finished. Repaired with
+  the new `python -m app.warehouse refresh-process` (keeps a `.bak`); `pose_recovery()` now reads
+  the directory first. Fix for the vizer repo (not done here): require `transforms.json` before
+  writing a ProcessManifest.
+- `[x]` COLMAP upgraded to the 4.2.1 release tag (`bd1fcf65`, 2026-09-29) as image v4.9 after a
+  side-by-side trial (results under **3.6** below). Rollback tag `splat-nerfstudio-v2:pre-v4.9`.
+
+## Tier 3 — implementation plan (written 2026-10-06 before coding)
+
+**Findings from the research pass**
+- `splatfacto-w`'s upstream `max_num_iterations` is 55 000 (`splatfactow_config.py`); the Train tab's slider stops at 30 000 and defaults to 7 000. The schedules inside every preset (densification stop at 15 000 / 25 000, learning-rate decay over 30 000) are absolute step counts.
+- The vizer-written manifest `01KVKNPCGV` (`the_pavilion`) was written by vizer's `_on_process_end()` after **66.9 s** with `outputs = {images_dir}` only and `extracted_frame_count = 209`: at that moment `images/` held 209 files and neither `transforms.json` nor `colmap/` existed. The dataset on disk is now complete (267 frames, COLMAP model, transforms.json), so the process that vizer monitored exited 0 early and the work was finished afterwards without the manifest being refreshed. Fix in this repo: read on-disk counts first for the pose readout, and add a `refresh-process` warehouse command that re-scrapes outputs/metrics/checksums. Fix for the vizer repo (noted, not done here): validate that `transforms.json` exists before writing a ProcessManifest.
+- nerfstudio's `colmap_parsing_utils` ships `write_cameras_binary` / `write_images_binary` / `write_points3D_binary`, and `colmap_utils.colmap_to_json` turns such a model into `transforms.json` + `sparse_pc.ply` — enough to build a self-contained synthetic dataset for a training smoke test without touching user data.
+- `nvidia_service.query_gpu()` already returns used/total memory for the Dashboard; the Train tab can reuse it.
+- COLMAP 4.2.1 is tag `bd1fcf65` (2026-09-29). The upgrade ritual is `ARG COLMAP_COMMIT` + rebuild + smoke test; the items that must be re-validated are the SIFT flag names nerfstudio emits, the mapper/BA flags, the faiss vocabulary tree, the submap-promotion shim (`model_analyzer` output format) and the equirectangular path.
+
+**3.1 Iterations** — default 30 000; range 1 000 – 60 000; quick-pick chips *Preview 7 000 · Standard 30 000 · Long 55 000*; a method-aware caption naming the upstream default (30 000; 55 000 for `splatfacto-w`); help text with the measured 7k → 30k gain.
+
+**3.2 Training smoke** — `smoke_test.sh` §21 (`--skip-train` to skip): synthesize an 8-camera COLMAP model + images + `transforms.json` under the container's `/tmp`, train all five methods for 300 iterations headless with eval every 100 steps, assert the completion banner and a checkpoint, export one built-in PLY and one splatfacto-w PLY, run the deterministic colour-cache check on the splatfacto-w checkpoint, clean up.
+
+**3.3 Viewer holding VRAM** — keep `quit-on-train-completion` unchecked by default (the user inspects results), but after the completion banner the Train tab's viser card shows the GPU memory currently held (polled) with a **Release GPU** button, and Run pre-flights free VRAM (warn below 3 GiB, naming the amount).
+
+**3.4 Manifests** — `TrainParams.dataparser` gains `splatfactow_dataparser` and records the effective one; `ProcessParams` gains optional `sfm_tool` / `feature_type` / `matcher_type`; the Process tab gets a **Feature engine** control next to *Matching method* (COLMAP SIFT · hloc SuperPoint + LightGlue · hloc DISK + LightGlue · hloc SuperPoint + SuperGlue) that emits the three flags, with a caption explaining that under hloc `sequential`/`vocab_tree` mean NetVLAD top-50 retrieval and that crops/masks are unavailable; raw `--sfm-tool/--feature-type/--matcher-type` flags typed by hand are parsed into the same fields.
+
+**3.5 Warehouse repair** — `python -m app.warehouse refresh-process <dir>` (keeps a `.bak`), run on `01KVKNPCGV`.
+
+**3.6 COLMAP 4.2.1 trial** — build a *test* image tag with `--build-arg COLMAP_COMMIT=bd1fcf65…` (does not replace `latest`), run the validations above in a temporary container, then adopt or document.
+
+**3.6 outcome (2026-10-06) — adopted as v4.9.** Trial image built with a compose override
+(`docker build` fails on this host: "BuildKit is enabled but the buildx component is missing";
+`docker compose build` works). Build 6 min 12 s, of which the COLMAP compile was 234 s (448
+ninja objects). Validation in a throwaway container (`data_v2` mounted read-only), then the same
+three matcher runs on the v4.8 image for a same-day baseline:
+
+| Check | 4.1.0.dev0 `ffb5404e` (v4.8) | 4.2.1 `bd1fcf65` (v4.9) |
+|---|---|---|
+| `colmap -h` / `/etc/colmap-commit.sha` | — | `COLMAP 4.2.1 (Commit bd1fcf65 on 2026-09-29 with CUDA, std hash maps)` |
+| 11 flags nerfstudio + shim emit (`FeatureExtraction/FeatureMatching.use_gpu`, `ImageReader.*`, `Mapper.ba_global_function_tolerance`, `Mapper.snapshot_path/_frames_freq`, `BundleAdjustment.refine_principal_point`, `VocabTreeMatching.vocab_tree_path`) | present | all present; `SiftExtraction.use_gpu` still gone, so the Stage-5 sed stays |
+| 87-frame buddha subset, sequential | 87/87, 23 s, 15 732 pts, 0.385 px | 87/87, 16 s, 15 643 pts, 0.380 px |
+| same, vocab_tree (faiss tree) | 87/87, 33 s, 17 957 pts, 0.450 px | 87/87, 28 s, 17 637 pts, 0.446 px |
+| same, exhaustive | 87/87, 35 s, 17 950 pts, 0.447 px | 87/87, 21 s, 17 653 pts, 0.447 px |
+| 42-frame equirect sample (`Nunobiki1_360.mp4`, 376 crops) | 336 of 375 registered, 321 s (2026-10-05) | 376/376 registered, 282 s, 84 715 pts, 0.843 px |
+| shim: bootstrap stub in `sparse/0` | happens (2 of 3 runs) | still happens (vocab_tree + equirect runs: 3-image stub, real model promoted from `sparse/1`) — shim stays |
+| `model_analyzer` "Registered images:" parse (shim + `docker_service.py`) | OK | OK |
+| `ns-train splatfacto` 300 its on the new reconstruction | — | OK |
+
+Reconstructions are statistically equivalent (point counts within 2 %, reprojection error equal or
+lower), every path is faster, and the equirect sample registers every crop. Adopted: `ARG
+COLMAP_COMMIT` bumped, `latest` rebuilt from cache (every layer reused from the trial build),
+container recreated, `smoke_test.sh` re-run (result recorded in the commit message). The earlier
+"336/336" wording in the docs was imprecise — the 2026-10-05 log reads "Starting with 375 video
+frames / Colmap matched 336 images" — and has been corrected everywhere.
+
+---
 
 ## Do not change
 
 nerfstudio pin (`50e0e3c` equals upstream main), gsplat 1.5.3 (latest release; 1.6.0
 unreleased), splatfacto-w pin (equals HEAD, repo idle since 2024-11), the vocab tree
-(87/87 frames registered), the COLMAP shim, the equirectangular path (336/336 crops
-registered). splatfacto / -big / -mcmc train, export and evaluate cleanly.
+(87/87 frames registered), the COLMAP shim (still needed on 4.2.1), the equirectangular path
+(376/376 crops registered on 4.2.1; 336 of 375 on 4.1.0.dev0). splatfacto / -big / -mcmc train, export and evaluate cleanly.
 
 ---
 
@@ -248,7 +300,7 @@ registered). splatfacto / -big / -mcmc train, export and evaluate cleanly.
 | splatfacto-w, parser v2 + cache guard | 12-image subset | 7,000 its OK |
 | vocab_tree / sequential | 87-frame buddha subset | 87/87 registered, 45 s / 24 s |
 | exhaustive / sequential / vocab_tree | 61-frame long-focal subset | 2–3/61 registered for all three (dataset, not matcher) |
-| equirectangular video, sequential | 42 frames → 336 crops | 336/336 registered, 321 s |
+| equirectangular video, sequential | 42-frame sample → 376 crops | 336 of 375 registered, 321 s (4.1.0.dev0); 376/376 in 282 s on 4.2.1 |
 | splatfacto-big native 4K, GPU cache | fort_garry, 6,500 its | 1.96 M gaussians, peak 11.64 GiB, 581 s |
 | same, expandable segments on | | peak reserved 11.92 vs 12.34 GiB, 667 s |
 | same, `cache-images cpu` | | peak 5.63 GiB, 781 s |
