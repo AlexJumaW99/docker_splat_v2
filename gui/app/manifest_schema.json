@@ -1410,6 +1410,19 @@
           ],
           "default": null,
           "title": "Rasterize Mode"
+        },
+        "max_gs_num": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Gs Num"
         }
       },
       "required": [

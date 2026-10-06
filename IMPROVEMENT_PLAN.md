@@ -273,6 +273,31 @@ frames / Colmap matched 336 images" — and has been corrected everywhere.
 
 ---
 
+## Max gaussians for `splatfacto-mcmc` (landed 2026-10-06, GUI only — no image change)
+
+- `[x]` Train tab **Max gaussians** dropdown (1 M default · 2 M · 3 M · 4 M), shown only for
+  `splatfacto-mcmc`. Emits `--pipeline.model.max-gs-num N` (nothing at the default), recorded as
+  `TrainParams.max_gs_num`; a value typed into the raw CLI flags wins. The caption under the
+  control states the measured cost, and the free-VRAM pre-flight uses the measured peak for the
+  chosen budget instead of the generic 3 GiB.
+- Why a control at all: nerfstudio's `SplatfactoModelConfig.max_gs_num = 1_000_000` goes straight
+  into gsplat's `MCMCStrategy(cap_max=)`, which grows the model 5 % every 100 steps (steps
+  500–25 000) until it holds exactly that many gaussians. A 30k run therefore always ends at the
+  budget (all four benchmark checkpoints hold exactly their budget); by that rule fort_garry's
+  93,854 SfM points reach 1 M at step 5,400 and 4 M at step 8,200, and replaying it reproduces the
+  541,117 gaussians logged for the 3,500-iteration buddha_v2 run. The 3DGS-MCMC authors' per-scene
+  configs use 1.1 M–5.9 M.
+- Measured (appendix): 1 M → 2 M → 4 M = PSNR 35.00 → 35.39 → 35.71 at roughly +1.7 GiB VRAM,
+  +6 min and +205 MB of PLY per extra million; two identical 1 M runs differed by 0.04 dB.
+  gsplat's published Mip-NeRF 360 figures for 1 M / 2 M / 3 M are 29.18 / 29.53 / 29.65.
+- *Not verified:* anything above 960 px, and any object-centric scene (those runs were dropped to
+  keep the benchmark short); the 3 M figures in the GUI are interpolated between 2 M and 4 M.
+- The other four methods have no count cap: `splatfacto` / `-big` use gsplat's `DefaultStrategy`
+  (they accept `max-gs-num` and ignore it), `splatfacto-w` / `-w-light` run their own
+  split/duplicate/cull loop (and reject the flag).
+
+---
+
 ## Do not change
 
 nerfstudio pin (`50e0e3c` equals upstream main), gsplat 1.5.3 (latest release; 1.6.0
@@ -310,3 +335,6 @@ unreleased), splatfacto-w pin (equals HEAD, repo idle since 2024-11), the vocab 
 | LPIPS first call, cudnn.benchmark on / off | 1920×1080 pair | +12.40 GiB / +0.50 GiB (960×540: +3.15 / +0.12) |
 | ns-train with cuDNN autotuning off (v4.8) | buddha_v2 @1920 1200 its · @960 3500 its | peak 2.42 GiB · 0.90 GiB, same wall time; override restores 11.16 GiB |
 | GUI Tier-2 commands | 6 runs (see Tier 2 validation) | all exit 0 |
+| splatfacto-mcmc `max-gs-num` 1 M / 2 M / 4 M, 30k (2026-10-06) | fort_garry @960 | PSNR 35.02 (repeat 34.98) / 35.39 / 35.71 · peak 2,612 / 4,330 / 7,732 MiB · 600 / 977 / 1,696 s · eval 129 / 87 / 54 fps |
+| same runs, `ns-export` PLY | | 238 / 457 / 847 MB = 961,606 / 1,843,747 / 3,414,229 gaussians (opacity < 1/255 dropped: 3.8 / 7.8 / 14.6 %) |
+| splatfacto-big 30k, no cap (reference) | fort_garry @960 | 1,044,608 gaussians, 589 s |

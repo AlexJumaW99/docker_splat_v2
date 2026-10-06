@@ -22,11 +22,18 @@ Measured background (2026-10-05, RTX 5070 Ti; details in IMPROVEMENT_PLAN.md):
   eval cadence default here (1000 instead of nerfstudio's 100) is about the
   other cost of frequent evals: ~180 MB of TensorBoard images per 1000 steps
   at 4K and one extra full-resolution render every 100 steps.
+* splatfacto-mcmc does not derive its gaussian count from the scene: gsplat's
+  MCMCStrategy grows the model 5 % every 100 steps (steps 500-25 000) until it
+  holds exactly `max_gs_num` (nerfstudio default 1 M), so the count is a
+  budget the user has to pick. Measured 2026-10-06 at 960 px / 30 000 steps:
+  1 M -> 2 M -> 4 M gave PSNR 35.00 -> 35.39 -> 35.71 for 2.55 -> 4.23 ->
+  7.55 GiB peak VRAM and 10 -> 16 -> 28 min (two 1 M runs differed by 0.04 dB).
 """
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -278,6 +285,112 @@ def choose_cache_images(mode: str, frame_count: int, width: int, height: int) ->
     return "cpu" if estimate_cache_gib(frame_count, width, height) > CACHE_CPU_THRESHOLD_GIB else None
 
 
+# ----------------------------------------------------------------- mcmc budget
+
+MCMC_METHOD = "splatfacto-mcmc"
+# nerfstudio SplatfactoModelConfig.max_gs_num, handed to gsplat as
+# MCMCStrategy(cap_max=...).
+MAX_GS_NUM_FLAG = "--pipeline.model.max-gs-num"
+MAX_GS_NUM_DEFAULT = 1_000_000
+MAX_GS_NUM_CHOICES = (1_000_000, 2_000_000, 3_000_000, 4_000_000)
+# Longest image side (px) the figures in _MCMC_MEASURED were taken at.
+MCMC_MEASURED_WIDTH = 960
+
+
+@dataclass(frozen=True)
+class McmcBudgetCost:
+    """What one splatfacto-mcmc run at a given budget cost. `measured` is
+    False for a value interpolated between two measured budgets, in which
+    case `psnr` is None."""
+    psnr: float | None
+    peak_vram_gib: float
+    train_minutes: float
+    ply_mb: float
+    measured: bool = True
+
+
+# Measured 2026-10-06: fort_garry_drone_updated (266 frames, 4K source) at
+# 960 px, 30 000 steps, RTX 5070 Ti, nerfstudio 50e0e3c / gsplat 1.5.3.
+# PSNR is ns-eval on the held-out frames; peak VRAM is the ns-train process
+# as nvidia-smi reports it (1 Hz); PLY size is after ns-export drops the
+# gaussians below 1/255 opacity (4 % at 1 M, 8 % at 2 M, 15 % at 4 M). The
+# 1 M row is the mean of two runs (35.02 / 34.98 dB) with the higher peak.
+_MCMC_MEASURED = {
+    1_000_000: McmcBudgetCost(35.00, 2.551, 10.0, 238.0),   # 2612 MiB
+    2_000_000: McmcBudgetCost(35.39, 4.229, 16.3, 457.0),   # 4330 MiB
+    4_000_000: McmcBudgetCost(35.71, 7.551, 28.3, 847.0),   # 7732 MiB
+}
+
+
+def mcmc_budget_cost(max_gs_num: int) -> McmcBudgetCost | None:
+    """Cost of a splatfacto-mcmc run with this budget: the measured row, or a
+    linear interpolation between the two neighbouring measured budgets (VRAM
+    grew +1.68 then +1.66 GiB per extra million, time +6.3 then +6.0 min).
+    None outside the measured range — nothing is extrapolated."""
+    if max_gs_num in _MCMC_MEASURED:
+        return _MCMC_MEASURED[max_gs_num]
+    budgets = sorted(_MCMC_MEASURED)
+    for lo, hi in zip(budgets, budgets[1:]):
+        if lo < max_gs_num < hi:
+            t = (max_gs_num - lo) / (hi - lo)
+            a, b = _MCMC_MEASURED[lo], _MCMC_MEASURED[hi]
+            return McmcBudgetCost(
+                psnr=None,
+                peak_vram_gib=a.peak_vram_gib + t * (b.peak_vram_gib - a.peak_vram_gib),
+                train_minutes=a.train_minutes + t * (b.train_minutes - a.train_minutes),
+                ply_mb=a.ply_mb + t * (b.ply_mb - a.ply_mb),
+                measured=False,
+            )
+    return None
+
+
+def max_gs_num_label(max_gs_num: int) -> str:
+    """Dropdown label for a budget, e.g. "2 M"."""
+    text = f"{max_gs_num / 1_000_000:g} M"
+    return f"{text} · nerfstudio default" if max_gs_num == MAX_GS_NUM_DEFAULT else text
+
+
+def choose_max_gs_num(method: str, choice: int | None, extra_flags: Sequence[str] = ()) -> int | None:
+    """Resolve the Max gaussians control to the value to emit, or None meaning
+    "do not emit the flag".
+
+    Only splatfacto-mcmc reads max_gs_num: splatfacto and splatfacto-big accept
+    the flag and ignore it, splatfacto-w / -w-light reject it. The default
+    needs no flag, and a max-gs-num the user typed into the raw CLI flags wins
+    over the dropdown.
+    """
+    if method != MCMC_METHOD or choice in (None, ""):
+        return None
+    if int(choice) == MAX_GS_NUM_DEFAULT:
+        return None
+    if any(f.split("=", 1)[0].replace("_", "-") == MAX_GS_NUM_FLAG for f in extra_flags):
+        return None
+    return int(choice)
+
+
+def max_gs_num_caption(max_gs_num: int, train_width: int | None) -> str:
+    """One-line cost readout under the Max gaussians dropdown. `train_width`
+    is the longest side of the chosen training resolution; above the measured
+    960 px the figures are shown with a warning rather than scaled."""
+    cost = mcmc_budget_cost(max_gs_num)
+    if cost is None:
+        return "not measured on this machine"
+    figures = f"{cost.peak_vram_gib:.1f} GiB peak VRAM · {cost.train_minutes:.0f} min · {cost.ply_mb:.0f} MB PLY"
+    if not cost.measured:
+        text = f"≈ {figures} (interpolated between measured budgets at {MCMC_MEASURED_WIDTH} px)"
+    elif max_gs_num == MAX_GS_NUM_DEFAULT:
+        text = f"measured at {MCMC_MEASURED_WIDTH} px, 30k steps: {figures}"
+    else:
+        gain = cost.psnr - _MCMC_MEASURED[MAX_GS_NUM_DEFAULT].psnr
+        text = (
+            f"measured at {MCMC_MEASURED_WIDTH} px, 30k steps: {gain:+.2f} dB PSNR vs "
+            f"{MAX_GS_NUM_DEFAULT / 1_000_000:g} M · {figures}"
+        )
+    if train_width and train_width > MCMC_MEASURED_WIDTH:
+        text += f" · ⚠ not measured above {MCMC_MEASURED_WIDTH} px — VRAM at {train_width} px is unknown"
+    return text
+
+
 # ---------------------------------------------------------------- pose recovery
 
 
@@ -362,6 +475,7 @@ def build_train_argv(
     steps_per_eval_all_images: int | None,
     cache_images: str | None,
     rasterize_mode: str | None,
+    max_gs_num: int | None,
     resolution: ResolutionOption | None,
     extra_flags: list[str],
     project_dataparser: str,
@@ -397,6 +511,8 @@ def build_train_argv(
         argv += ["--pipeline.datamanager.cache-images", cache_images]
     if rasterize_mode is not None:
         argv += ["--pipeline.model.rasterize-mode", rasterize_mode]
+    if max_gs_num is not None:
+        argv += [MAX_GS_NUM_FLAG, str(max_gs_num)]
     if resolution is not None:
         argv += resolution.pipeline_flags()
     argv += list(extra_flags)

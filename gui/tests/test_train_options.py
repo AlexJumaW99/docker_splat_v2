@@ -161,7 +161,7 @@ class ArgvTests(unittest.TestCase):
                   experiment_name="proj", max_num_iterations=7000, steps_per_save=2000,
                   vis="viewer+tensorboard", quit_on_train_completion=False,
                   steps_per_eval_image=1000, steps_per_eval_all_images=1000,
-                  cache_images=None, rasterize_mode=None, resolution=None, extra_flags=[],
+                  cache_images=None, rasterize_mode=None, max_gs_num=None, resolution=None, extra_flags=[],
                   project_dataparser="nerfstudio-data", colmap_path="colmap/sparse/0")
         kw.update(over)
         return to.build_train_argv(**kw)
@@ -204,6 +204,72 @@ class ArgvTests(unittest.TestCase):
     def test_headless_vis_has_no_viewer_flags(self):
         argv = self._base(vis="tensorboard")
         self.assertNotIn("--viewer.websocket-host", argv)
+
+    def test_max_gs_num_absent_by_default(self):
+        self.assertNotIn(to.MAX_GS_NUM_FLAG, self._base(method="splatfacto-mcmc"))
+
+    def test_max_gs_num_goes_before_subcommand(self):
+        half = to.ResolutionOption("down:2", "x", 2, 1920, 1080, True)
+        argv = self._base(method="splatfacto-mcmc", max_gs_num=2_000_000, resolution=half)
+        i = argv.index("--pipeline.model.max-gs-num")
+        self.assertEqual(argv[i + 1], "2000000")
+        self.assertLess(i, argv.index("nerfstudio-data"))
+
+
+class McmcBudgetTests(unittest.TestCase):
+    def test_only_mcmc_above_default_emits(self):
+        self.assertEqual(to.choose_max_gs_num("splatfacto-mcmc", 2_000_000), 2_000_000)
+        self.assertIsNone(to.choose_max_gs_num("splatfacto-mcmc", to.MAX_GS_NUM_DEFAULT))
+        self.assertIsNone(to.choose_max_gs_num("splatfacto-mcmc", None))
+        # splatfacto / -big ignore the flag; splatfacto-w / -w-light reject it
+        for method in ("splatfacto", "splatfacto-big", "splatfacto-w", "splatfacto-w-light"):
+            self.assertIsNone(to.choose_max_gs_num(method, 4_000_000))
+
+    def test_raw_cli_flag_wins_over_dropdown(self):
+        for raw in (["--pipeline.model.max-gs-num", "3000000"],
+                    ["--pipeline.model.max-gs-num=3000000"],
+                    ["--pipeline.model.max_gs_num", "3000000"]):
+            self.assertIsNone(to.choose_max_gs_num("splatfacto-mcmc", 2_000_000, raw))
+        other = ["--pipeline.model.cull-alpha-thresh", "0.005"]
+        self.assertEqual(to.choose_max_gs_num("splatfacto-mcmc", 2_000_000, other), 2_000_000)
+
+    def test_choices_start_at_the_default(self):
+        self.assertEqual(to.MAX_GS_NUM_CHOICES[0], to.MAX_GS_NUM_DEFAULT)
+        self.assertEqual(to.max_gs_num_label(1_000_000), "1 M · nerfstudio default")
+        self.assertEqual(to.max_gs_num_label(2_000_000), "2 M")
+
+    def test_cost_measured_interpolated_and_out_of_range(self):
+        two = to.mcmc_budget_cost(2_000_000)
+        self.assertTrue(two.measured)
+        self.assertAlmostEqual(two.peak_vram_gib, 4.229)
+        three = to.mcmc_budget_cost(3_000_000)
+        self.assertFalse(three.measured)
+        self.assertIsNone(three.psnr)
+        self.assertAlmostEqual(three.peak_vram_gib, (4.229 + 7.551) / 2)
+        self.assertAlmostEqual(three.train_minutes, (16.3 + 28.3) / 2)
+        self.assertIsNone(to.mcmc_budget_cost(6_000_000))
+        self.assertIsNone(to.mcmc_budget_cost(500_000))
+
+    def test_every_choice_has_a_caption(self):
+        for n in to.MAX_GS_NUM_CHOICES:
+            self.assertIsNotNone(to.mcmc_budget_cost(n))
+
+    def test_caption_wording(self):
+        self.assertEqual(
+            to.max_gs_num_caption(1_000_000, 960),
+            "measured at 960 px, 30k steps: 2.6 GiB peak VRAM · 10 min · 238 MB PLY",
+        )
+        self.assertIn("+0.39 dB PSNR vs 1 M", to.max_gs_num_caption(2_000_000, 960))
+        self.assertIn("+0.71 dB PSNR vs 1 M", to.max_gs_num_caption(4_000_000, None))
+        three = to.max_gs_num_caption(3_000_000, 960)
+        self.assertTrue(three.startswith("≈ 5.9 GiB peak VRAM"))
+        self.assertIn("interpolated", three)
+        self.assertNotIn("dB", three)
+
+    def test_caption_warns_above_measured_resolution(self):
+        self.assertNotIn("⚠", to.max_gs_num_caption(2_000_000, 960))
+        self.assertNotIn("⚠", to.max_gs_num_caption(2_000_000, 480))
+        self.assertIn("VRAM at 1920 px is unknown", to.max_gs_num_caption(2_000_000, 1920))
 
 
 if __name__ == "__main__":

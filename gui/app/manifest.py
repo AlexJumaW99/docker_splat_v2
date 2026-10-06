@@ -198,6 +198,12 @@ class TrainParams(BaseModel):
     """`--pipeline.model.rasterize-mode`. None = the method's default
     (classic for splatfacto*, antialiased for splatfacto-w*)."""
 
+    # ---- added 2026-10-06. Optional for the same reason as the block above.
+    max_gs_num: int | None = Field(default=None, ge=1)
+    """`--pipeline.model.max-gs-num`: splatfacto-mcmc's gaussian budget. None
+    = the flag was not emitted (any other method, or nerfstudio's default of
+    1 000 000 applied)."""
+
 
 class ExportParams(BaseModel):
     """Arguments handed to `ns-export gaussian-splat` or the custom

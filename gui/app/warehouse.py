@@ -798,6 +798,7 @@ def train_params_from_form(
         steps_per_eval_image=_opt_int("steps_per_eval_image"),
         steps_per_eval_all_images=_opt_int("steps_per_eval_all_images"),
         rasterize_mode=form_params.get("rasterize_mode_effective") or None,
+        max_gs_num=_opt_int("max_gs_num_effective"),
     )
 
 

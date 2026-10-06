@@ -57,14 +57,37 @@ _HELP = {
         "quality scales with iterations.<br>"
         "<b>splatfacto-big</b> \u00b7 higher gaussian budget; better detail, more "
         "VRAM.<br>"
-        "<b>splatfacto-mcmc</b> \u00b7 MCMC-based densification; often "
-        "higher-quality but slower.<br>"
+        "<b>splatfacto-mcmc</b> \u00b7 MCMC-based densification with a fixed "
+        "gaussian budget (<i>Max gaussians</i>); often higher-quality but "
+        "slower.<br>"
         "<b>splatfacto-w-light</b> \u00b7 in-the-wild variant with a per-image "
         "appearance model; runs on any processed dataset.<br>"
         "<b>splatfacto-w</b> \u00b7 full in-the-wild model (appearance + "
         "background + transient masking). Needs the COLMAP sparse model "
         "with perspective cameras; fisheye datasets are refused. Trains at "
         "\u22641600 px using the dataset's downscaled copies."
+    ),
+    "max_gs_num": (
+        "Max gaussians",
+        "How many gaussians <b>splatfacto-mcmc</b> ends up with "
+        "(<code>--pipeline.model.max-gs-num</code>). The other methods let "
+        "the scene decide the count; MCMC grows the model 5\u202f% every 100 "
+        "steps (steps 500\u201325\u202f000) until it holds exactly this many, so it "
+        "is a budget you choose. nerfstudio's default is 1\u202fM; the method's "
+        "authors set it per scene, from 1.1\u202fM to 5.9\u202fM.<br><br>"
+        "Measured on a 266-frame drone scene at 960\u202fpx, 30\u202f000 steps "
+        "(RTX 5070 Ti):<br>"
+        "<b>1\u202fM</b> \u00b7 PSNR 35.0 \u00b7 2.6\u202fGiB peak VRAM \u00b7 10\u202fmin \u00b7 "
+        "238\u202fMB PLY \u00b7 129\u202ffps<br>"
+        "<b>2\u202fM</b> \u00b7 PSNR 35.4 \u00b7 4.2\u202fGiB \u00b7 16\u202fmin \u00b7 457\u202fMB \u00b7 87\u202ffps<br>"
+        "<b>4\u202fM</b> \u00b7 PSNR 35.7 \u00b7 7.6\u202fGiB \u00b7 28\u202fmin \u00b7 847\u202fMB \u00b7 54\u202ffps<br>"
+        "Two identical 1\u202fM runs differed by 0.04\u202fdB, so the gain is real, "
+        "but each doubling buys less. 3\u202fM was not run (its figures are "
+        "interpolated) and nothing above 960\u202fpx was measured.<br><br>"
+        "A short run can stop before the budget is reached: 7\u202f000 steps "
+        "grow the model to at most ~23\u00d7 its SfM point count. The exported "
+        "PLY holds slightly fewer gaussians than the budget because ns-export "
+        "drops those below 1/255 opacity (4\u202f% at 1\u202fM, 15\u202f% at 4\u202fM)."
     ),
     "iters": (
         "Max iterations",
@@ -548,8 +571,25 @@ class _Form(QWidget):
         self.method_combo.currentTextChanged.connect(self._on_method_changed)
         grid.addWidget(self.method_combo, 0, 1)
 
+        # Max gaussians — splatfacto-mcmc only; the row is shown / hidden and
+        # its cost readout refreshed in _refresh_max_gs().
+        self.max_gs_label = labeled("Max gaussians", *_HELP["max_gs_num"])
+        grid.addWidget(self.max_gs_label, 1, 0)
+        gs_col = QVBoxLayout(); gs_col.setSpacing(4); gs_col.setContentsMargins(0, 0, 0, 0)
+        self.max_gs_combo = QComboBox()
+        for n in topt.MAX_GS_NUM_CHOICES:
+            self.max_gs_combo.addItem(topt.max_gs_num_label(n), userData=n)
+        self.max_gs_combo.currentIndexChanged.connect(self._refresh_max_gs)
+        self.max_gs_caption = QLabel("")
+        self.max_gs_caption.setProperty("role", "caption")
+        self.max_gs_caption.setWordWrap(True)
+        gs_col.addWidget(self.max_gs_combo)
+        gs_col.addWidget(self.max_gs_caption)
+        self.max_gs_wrap = QWidget(); self.max_gs_wrap.setLayout(gs_col)
+        grid.addWidget(self.max_gs_wrap, 1, 1)
+
         # Training resolution — populated per dataset in _refresh_resolution().
-        grid.addWidget(labeled("Training resolution", *_HELP["resolution"]), 1, 0)
+        grid.addWidget(labeled("Training resolution", *_HELP["resolution"]), 2, 0)
         res_col = QVBoxLayout(); res_col.setSpacing(4); res_col.setContentsMargins(0, 0, 0, 0)
         res_row = QHBoxLayout(); res_row.setSpacing(10); res_row.setContentsMargins(0, 0, 0, 0)
         self.resolution_combo = QComboBox()
@@ -575,10 +615,10 @@ class _Form(QWidget):
         res_col.addWidget(res_wrap)
         res_col.addWidget(self.resolution_caption)
         res_col_wrap = QWidget(); res_col_wrap.setLayout(res_col)
-        grid.addWidget(res_col_wrap, 1, 1)
+        grid.addWidget(res_col_wrap, 2, 1)
 
         # Max iterations
-        grid.addWidget(labeled("Max iterations", *_HELP["iters"]), 2, 0)
+        grid.addWidget(labeled("Max iterations", *_HELP["iters"]), 3, 0)
         it_col = QVBoxLayout(); it_col.setSpacing(6); it_col.setContentsMargins(0, 0, 0, 0)
         it_row = QHBoxLayout(); it_row.setSpacing(10); it_row.setContentsMargins(0, 0, 0, 0)
         self.iters_slider = QSlider(Qt.Horizontal)
@@ -613,10 +653,10 @@ class _Form(QWidget):
         it_col.addWidget(it_wrap)
         it_col.addWidget(chips_wrap)
         it_col_wrap = QWidget(); it_col_wrap.setLayout(it_col)
-        grid.addWidget(it_col_wrap, 2, 1)
+        grid.addWidget(it_col_wrap, 3, 1)
 
         # Steps per save (+ inline warning above _SAVE_STEP_WARN)
-        grid.addWidget(labeled("Steps per save", *_HELP["save_step"]), 3, 0)
+        grid.addWidget(labeled("Steps per save", *_HELP["save_step"]), 4, 0)
         self.save_step_spin = QSpinBox()
         self.save_step_spin.setRange(100, 10000)
         self.save_step_spin.setSingleStep(100)
@@ -627,20 +667,20 @@ class _Form(QWidget):
         ss_row = QHBoxLayout(); ss_row.setSpacing(10)
         ss_row.addWidget(self.save_step_spin); ss_row.addWidget(self.save_step_warn, 1)
         ss_wrap = QWidget(); ss_wrap.setLayout(ss_row)
-        grid.addWidget(ss_wrap, 3, 1)
+        grid.addWidget(ss_wrap, 4, 1)
 
         # Visualization
-        grid.addWidget(labeled("Visualization", *_HELP["vis"]), 4, 0)
+        grid.addWidget(labeled("Visualization", *_HELP["vis"]), 5, 0)
         self.vis_combo = QComboBox()
         self.vis_combo.addItems(VIS_MODES)
-        grid.addWidget(self.vis_combo, 4, 1)
+        grid.addWidget(self.vis_combo, 5, 1)
 
         # Quit on completion
         qc_row = QHBoxLayout(); qc_row.setSpacing(6); qc_row.setContentsMargins(0, 0, 0, 0)
         self.quit_on_completion_cb = QCheckBox("Quit viewer when training finishes")
         qc_row.addWidget(self.quit_on_completion_cb); qc_row.addWidget(_hb("quit_on_completion")); qc_row.addStretch(1)
         qc_wrap = QWidget(); qc_wrap.setLayout(qc_row)
-        grid.addWidget(qc_wrap, 5, 1)
+        grid.addWidget(qc_wrap, 6, 1)
 
         v.addLayout(grid)
 
@@ -865,10 +905,29 @@ class _Form(QWidget):
         )
         raster_idx = self.raster_combo.findData(params.get("rasterize_mode", "default"))
         self.raster_combo.setCurrentIndex(raster_idx if raster_idx >= 0 else 0)
+        gs_idx = self.max_gs_combo.findData(params.get("max_gs_num", topt.MAX_GS_NUM_DEFAULT))
+        self.max_gs_combo.setCurrentIndex(gs_idx if gs_idx >= 0 else 0)
         self._refresh_resolution_caption()
+        self._refresh_max_gs()
 
     def _on_method_changed(self, _text: str) -> None:
         self._refresh_iters_caption()
+        self._refresh_max_gs()
+
+    def _refresh_max_gs(self, *_args) -> None:
+        """Max gaussians only applies to splatfacto-mcmc: show its row for
+        that method and keep the cost readout in step with the chosen budget
+        and training resolution."""
+        is_mcmc = self.method_combo.currentText() == topt.MCMC_METHOD
+        self.max_gs_label.setVisible(is_mcmc)
+        self.max_gs_wrap.setVisible(is_mcmc)
+        if not is_mcmc:
+            return
+        opt = self._current_resolution()
+        budget = self.max_gs_combo.currentData() or topt.MAX_GS_NUM_DEFAULT
+        self.max_gs_caption.setText(
+            topt.max_gs_num_caption(int(budget), max(opt.width, opt.height) if opt else None)
+        )
 
     def _refresh_iters_caption(self, *_args) -> None:
         method = self.method_combo.currentText()
@@ -923,6 +982,7 @@ class _Form(QWidget):
             bool(topt.missing_levels(Path(self._project.processed_dir)))
         )
         self._refresh_resolution_caption()
+        self._refresh_max_gs()
 
     def _current_resolution(self) -> topt.ResolutionOption | None:
         return topt.find_option(self._resolution_options, self.resolution_combo.currentData())
@@ -950,6 +1010,7 @@ class _Form(QWidget):
 
     def _on_resolution_changed(self, _idx: int) -> None:
         self._refresh_resolution_caption()
+        self._refresh_max_gs()
 
     def _on_save_step_changed(self, value: int) -> None:
         if value > _SAVE_STEP_WARN:
@@ -972,6 +1033,10 @@ class _Form(QWidget):
             if opt is not None else None
         )
         raster = params["rasterize_mode"]
+        try:
+            extras = shlex.split(params.get("extra_flags") or "")
+        except ValueError:  # _on_run rejects unbalanced quotes before this matters
+            extras = []
         return {
             "resolution_label": opt.label if opt else "",
             "train_width": opt.width if opt else None,
@@ -984,6 +1049,9 @@ class _Form(QWidget):
             ),
             "cache_images_effective": cache_eff,
             "rasterize_mode_effective": None if raster == "default" else raster,
+            "max_gs_num_effective": topt.choose_max_gs_num(
+                params["method"], params.get("max_gs_num"), extras
+            ),
         }
 
     def _on_add_levels(self) -> None:
@@ -1083,6 +1151,9 @@ class _Form(QWidget):
             "steps_per_eval_image": self.eval_image_spin.value(),
             "steps_per_eval_all_images": self.eval_all_spin.value(),
             "rasterize_mode": self.raster_combo.currentData() or "default",
+            # splatfacto-mcmc budget; kept on the form for every method so a
+            # preset survives a method switch (see _resolved_params).
+            "max_gs_num": int(self.max_gs_combo.currentData() or topt.MAX_GS_NUM_DEFAULT),
         }
 
     def _on_run(self) -> None:
@@ -1219,11 +1290,22 @@ class _Form(QWidget):
             stats = nv.query_gpu()
             if stats is not None:
                 free_gib = (stats.mem_total_mb - stats.mem_used_mb) / 1024
-                if free_gib < 3.0:
+                # A splatfacto-mcmc budget above the default needs more than
+                # the generic 3 GiB floor: use the peak measured for it.
+                budget = topt.choose_max_gs_num(params["method"], params.get("max_gs_num"), extras)
+                cost = topt.mcmc_budget_cost(budget) if budget else None
+                need_gib = max(3.0, cost.peak_vram_gib if cost else 0.0)
+                budget_note = (
+                    f"splatfacto-mcmc with {topt.max_gs_num_label(budget)} gaussians needs about "
+                    f"{cost.peak_vram_gib:.1f} GiB at {topt.MCMC_MEASURED_WIDTH} px "
+                    f"({'measured' if cost.measured else 'interpolated'}). "
+                    if cost and cost.peak_vram_gib > 3.0 else ""
+                )
+                if free_gib < need_gib:
                     resp = QMessageBox.question(
                         self, "Little GPU memory free",
                         f"Only {free_gib:.1f} GiB of {stats.mem_total_mb / 1024:.1f} GiB VRAM is free "
-                        f"({stats.mem_used_mb / 1024:.1f} GiB in use). A viewer from a finished run, "
+                        f"({stats.mem_used_mb / 1024:.1f} GiB in use). {budget_note}A viewer from a finished run, "
                         "ns-viewer, or another process is probably holding it — see the Viewers tab.\n\n"
                         "Start training anyway?",
                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -1303,6 +1385,7 @@ class _Form(QWidget):
                 steps_per_eval_all_images=int(params["steps_per_eval_all_images"]),
                 cache_images=resolved["cache_images_effective"],
                 rasterize_mode=resolved["rasterize_mode_effective"],
+                max_gs_num=resolved["max_gs_num_effective"],
                 resolution=resolution,
                 extra_flags=extras,
                 project_dataparser=self._project.dataparser,

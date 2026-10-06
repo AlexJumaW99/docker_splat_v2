@@ -152,7 +152,7 @@ flowchart LR
 | :--- | :--- | :--- |
 | **`splatfacto`** | Nerfstudio's 3DGS recipe, default strategy | The starting point for most captures |
 | **`splatfacto-big`** | Same, with lower cull / densify thresholds (`cull_alpha 0.005`, `densify_grad 0.0005`) | Detail-rich scenes; more gaussians, more VRAM |
-| **`splatfacto-mcmc`** | MCMC densification (gsplat `MCMCStrategy`), capped at 1 M gaussians, relocation until step 25 k | Predictable gaussian budget; sparse-view scenes |
+| **`splatfacto-mcmc`** | MCMC densification (gsplat `MCMCStrategy`) with a fixed gaussian budget — 1 M by default, 2–4 M via the Train tab's **Max gaussians** control (`--pipeline.model.max-gs-num`) — relocation until step 25 k | Predictable gaussian budget; sparse-view scenes |
 | **`splatfacto-w-light`** | In-the-wild variant: per-image appearance embedding, no background model | Exposure or lighting drift across the capture; runs on any processed dataset |
 | **`splatfacto-w`** | Full in-the-wild model: appearance + learned background + transient masking | Crowded or changing scenes; needs the COLMAP sparse model with perspective cameras |
 
