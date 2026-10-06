@@ -11,6 +11,7 @@ POSIX separators, matching the path convention documented in `manifest.py`.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -440,9 +441,14 @@ def register_source_image_folder(
 
 def collect_process_metrics(output_dir: Path) -> dict[str, float]:
     """Post-hoc metrics scraped from the on-disk output of ns-process-data.
-    Cheap, no stdout parsing required: just file-system inspection. More
-    detailed metrics (pose recovery %) would need streaming-log capture
-    and can be added later — this is the bare minimum that beats nothing.
+    Cheap, no stdout parsing required: just file-system inspection.
+
+    `registered_frame_count` is the number of frames that received a camera
+    pose: ns-process-data writes exactly one `frames[]` entry per registered
+    image into transforms.json, so counting them is the pose-recovery figure
+    without any log parsing. Three warehouse datasets had 2/16, 2/75 and
+    23/253 posed frames with exit code 0 — this is what lets the Train tab
+    warn before anyone trains on them.
     """
 
     metrics: dict[str, float] = {}
@@ -453,6 +459,13 @@ def collect_process_metrics(output_dir: Path) -> dict[str, float]:
         metrics["extracted_frame_count"] = float(
             sum(1 for p in images.iterdir() if p.is_file())
         )
+    transforms = output_dir / "transforms.json"
+    if transforms.is_file():
+        try:
+            frames = json.loads(transforms.read_text()).get("frames", [])
+            metrics["registered_frame_count"] = float(len(frames))
+        except (OSError, ValueError):
+            pass
     sparse_root = output_dir / "colmap" / "sparse"
     if sparse_root.is_dir():
         submaps = [p for p in sparse_root.iterdir() if p.is_dir() and p.name.isdigit()]
@@ -691,6 +704,19 @@ def train_params_from_form(
     extra = form_params.get("extra_flags") or ""
     extra_list = shlex.split(extra) if extra.strip() else []
 
+    # Tier-2 knobs. The Train tab resolves its dropdowns against the dataset
+    # at run time and stores the *effective* values under these keys (see
+    # _Form._resolved_params in views/train.py), so a sidecar written by the
+    # GUI and a backfill from an older sidecar (keys absent -> None) both map
+    # cleanly onto the optional TrainParams fields.
+    def _opt_int(key: str) -> int | None:
+        v = form_params.get(key)
+        return None if v in (None, "") else int(v)
+
+    def _opt_float(key: str) -> float | None:
+        v = form_params.get(key)
+        return None if v in (None, "") else float(v)
+
     return TrainParams(
         method=form_params["method"],  # type: ignore[arg-type]
         experiment_name=experiment_name,
@@ -704,6 +730,12 @@ def train_params_from_form(
         ),
         dataparser=dataparser,  # type: ignore[arg-type]
         extra_flags=extra_list,
+        downscale_factor=_opt_int("downscale_factor"),
+        camera_res_scale_factor=_opt_float("camera_res_scale_factor"),
+        cache_images=form_params.get("cache_images_effective") or None,
+        steps_per_eval_image=_opt_int("steps_per_eval_image"),
+        steps_per_eval_all_images=_opt_int("steps_per_eval_all_images"),
+        rasterize_mode=form_params.get("rasterize_mode_effective") or None,
     )
 
 

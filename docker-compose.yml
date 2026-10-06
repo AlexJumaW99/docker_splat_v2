@@ -65,11 +65,16 @@ services:
       stack: 67108864                 # --ulimit stack=67108864 (64 MiB; NCCL/CUDA need big stacks)
 
     environment:
-      # Renamed from PYTORCH_CUDA_ALLOC_CONF in PyTorch 2.10. Without
-      # this, every nerfstudio invocation prints a deprecation warning
-      # and falls back to the default allocator, which fragments badly
-      # on long splatfacto runs.
+      # PyTorch 2.10 renamed PYTORCH_CUDA_ALLOC_CONF to PYTORCH_ALLOC_CONF and
+      # warns when the old name is used. Measured 2026-10-05 in the NGC 25.11
+      # build (torch 2.10.0a0): with ONLY the new name set, the allocator's
+      # segments are NOT expandable (torch.cuda.memory._snapshot() ->
+      # is_expandable=False); with only the old name they are, plus the
+      # deprecation warning; with BOTH set they are, and no warning. So both
+      # are set. Effect on a native-4K splatfacto-big run: peak reserved
+      # memory 12.34 -> 11.92 GiB (single runs; see IMPROVEMENT_PLAN.md 2.6).
       PYTORCH_ALLOC_CONF: "expandable_segments:True"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
     ports:
       - "7007:7007"                   # viser 3D viewer (web UI served by ns-train)

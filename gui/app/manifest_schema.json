@@ -1262,6 +1262,91 @@
           },
           "title": "Extra Flags",
           "type": "array"
+        },
+        "downscale_factor": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Downscale Factor"
+        },
+        "camera_res_scale_factor": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "maximum": 1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Camera Res Scale Factor"
+        },
+        "cache_images": {
+          "anyOf": [
+            {
+              "enum": [
+                "gpu",
+                "cpu"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache Images"
+        },
+        "steps_per_eval_image": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Steps Per Eval Image"
+        },
+        "steps_per_eval_all_images": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Steps Per Eval All Images"
+        },
+        "rasterize_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "classic",
+                "antialiased"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rasterize Mode"
         }
       },
       "required": [

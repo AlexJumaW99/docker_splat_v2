@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
+from app import train_options as topt
 from app import warehouse as wh
 from app.config import CONTAINER_NAME, VISER_PORT, WAREHOUSE_DIR
 from app.jobs import JobManager, JobSpec
@@ -34,11 +35,13 @@ _HELP = {
     "dataset": (
         "Processed dataset",
         "The host-side folder containing the ns-process-data output for this "
-        "project. Inside the container it's bind-mounted read-only at "
-        "<code>/workspace/processed/&lt;project&gt;_splat/</code> and passed "
-        "to ns-train via <code>--data</code>. The marker file "
+        "project, passed to ns-train via <code>--data</code>. The marker file "
         "(<code>transforms.json</code> for nerfstudio-data, "
-        "<code>cameras.bin</code> for colmap) is what gates training."
+        "<code>cameras.bin</code> for colmap) is what gates training.<br><br>"
+        "<b>Poses</b> \u00b7 how many extracted frames received a camera pose. "
+        "ns-process-data exits 0 even when COLMAP registered 2 of 75 frames, "
+        "so this is the number to check before training: green \u2265 90\u202f%, "
+        "amber 50\u201390\u202f%, red below 50\u202f% (Run asks for confirmation)."
     ),
     "preset": (
         "Training presets",
@@ -75,7 +78,61 @@ _HELP = {
         "Interval between checkpoint dumps. Each checkpoint is a full "
         ".ckpt under the run's <code>nerfstudio_models/</code> folder \u2014 "
         "smaller values = more disk but finer-grained recovery if training "
-        "crashes. Default 2000 is a reasonable trade-off."
+        "crashes. Default 2000 is a reasonable trade-off.<br><br>"
+        "A 4K splatfacto-big run with <b>10000</b> here ran out of memory at "
+        "step ~8500 and left no checkpoint at all; values above 5000 are "
+        "flagged for that reason."
+    ),
+    "resolution": (
+        "Training resolution",
+        "Which copy of the frames ns-train optimises against. "
+        "<b>A splat is only sharp at the resolution it was trained at</b>: on "
+        "the same 4K scene, a model trained at 960\u202fpx scored PSNR 33.9 viewed "
+        "at 960\u202fpx but 28.2 viewed at 1920\u202fpx; the 1920\u202fpx model scored "
+        "32.5 at 1920 (2.4\u00d7 the training time).<br><br>"
+        "<b>Auto</b> \u00b7 nerfstudio's own rule: the smallest "
+        "<code>images_N</code> copy whose longest side is \u2264 1600\u202fpx \u2014 "
+        "for 4K footage that is 960\u202fpx.<br>"
+        "<b>images_N entries</b> \u00b7 emitted as "
+        "<code>--downscale-factor N</code> on the dataparser.<br>"
+        "<b>rescaled at load</b> \u00b7 the dataset has no such folder; frames "
+        "are resized while loading (<code>camera-res-scale-factor</code>). "
+        "Use <i>Add downscale levels</i> to create the folders once instead."
+    ),
+    "cache_images": (
+        "Image cache",
+        "Where nerfstudio keeps the training frames: on the GPU (fastest) or "
+        "in host RAM (saves VRAM, about a third slower per step at 4K).<br><br>"
+        "<b>Auto</b> \u00b7 GPU unless the frames exceed "
+        f"{topt.CACHE_CPU_THRESHOLD_GIB:g}\u202fGiB at the chosen resolution, "
+        "then CPU. Measured: 266 frames at 4K are 6.2\u202fGiB on the GPU and "
+        "pushed splatfacto-big to 11.6\u202fGiB by step 6500; with the CPU cache "
+        "the same run peaked at 5.6\u202fGiB (581\u202fs \u2192 781\u202fs for 6500 steps)."
+    ),
+    "eval_steps": (
+        "Eval cadence",
+        "How often nerfstudio renders a held-out image (and, less often, all "
+        "of them) for TensorBoard. nerfstudio's default is <b>100</b>: a full-"
+        "resolution render plus PSNR/SSIM/LPIPS every 100 steps, and ~180\u202fMB "
+        "of TensorBoard images per 1000 steps at 4K. <b>1000</b> keeps the "
+        "metrics and the live viewer at a tenth of that cost.<br><br>"
+        "The first eval image used to be the VRAM high-water mark of a run "
+        "(+12.4\u202fGiB at 1920\u202fpx): cuDNN autotuning the LPIPS convolutions. "
+        "Image v4.8 switches that autotuning off (same speed, 11.2 \u2192 2.4\u202fGiB "
+        "peak), so cadence no longer decides the peak."
+    ),
+    "rasterize_mode": (
+        "Rasterize mode",
+        "<b>Method default</b> \u00b7 classic for splatfacto / -big / -mcmc, "
+        "antialiased for splatfacto-w / -w-light.<br>"
+        "<b>classic</b> \u00b7 the original 3DGS rasterizer; PLYs render the same "
+        "in every web viewer.<br>"
+        "<b>antialiased</b> \u00b7 Mip-Splatting-style opacity compensation. "
+        "Measured on the same scene: PSNR 34.9 vs 33.9 at native resolution "
+        "and 30.2 vs 28.2 when viewed at twice the training resolution. "
+        "nerfstudio warns that a PLY exported from an antialiased model does "
+        "not match classic-mode viewers \u2014 keep classic if the PLY is the "
+        "deliverable."
     ),
     "vis": (
         "Visualization",
@@ -130,6 +187,12 @@ METHODS = [
     "splatfacto-w", "splatfacto-w-light",
 ]
 VIS_MODES = ["viewer+tensorboard", "viewer", "tensorboard"]
+CACHE_MODES = ["auto", "gpu", "cpu"]
+RASTER_MODES = ["default", "classic", "antialiased"]
+_CACHE_LABELS = {"auto": "Auto (recommended)", "gpu": "GPU", "cpu": "CPU (host RAM)"}
+_RASTER_LABELS = {"default": "Method default", "classic": "classic", "antialiased": "antialiased"}
+# Steps-per-save values above this get an inline warning (see help text).
+_SAVE_STEP_WARN = 5000
 
 
 # nerfstudio prints a rich Panel with "🎉 Training Finished 🎉" in the title
@@ -331,6 +394,12 @@ class _Form(QWidget):
         # Reset to False at the top of _on_run for each new attempt.
         self._training_finalized = False
 
+        # Training-resolution dropdown entries for the current dataset
+        # (rebuilt by _refresh_resolution) and whether the running job is
+        # our own "Add downscale levels" helper rather than a training run.
+        self._resolution_options: list[topt.ResolutionOption] = []
+        self._downscale_mine = False
+
         # Poll for viser readiness (port 7007) once training has started.
         self._viser_poll = QTimer(self)
         self._viser_poll.setInterval(1000)
@@ -407,9 +476,21 @@ class _Form(QWidget):
         self.dataset_path.setProperty("role", "readout")
         v.addWidget(self.dataset_path)
 
+        meta_row = QHBoxLayout(); meta_row.setSpacing(10); meta_row.setContentsMargins(0, 0, 0, 0)
         self.dataset_meta = QLabel("")
         self.dataset_meta.setProperty("role", "caption")
-        v.addWidget(self.dataset_meta)
+        # Pose-recovery pill: how many extracted frames got a camera. Colour
+        # follows train_options.PoseRecovery.level (success/warning/error).
+        self.pose_pill = pill("Poses: —", "neutral")
+        meta_row.addWidget(self.dataset_meta, 1)
+        meta_row.addWidget(self.pose_pill, 0, Qt.AlignRight)
+        meta_wrap = QWidget(); meta_wrap.setLayout(meta_row)
+        v.addWidget(meta_wrap)
+
+        self.levels_caption = QLabel("")
+        self.levels_caption.setProperty("role", "caption")
+        self.levels_caption.setWordWrap(True)
+        v.addWidget(self.levels_caption)
         return c
 
     # ---- params card ----
@@ -447,8 +528,37 @@ class _Form(QWidget):
         self.method_combo.addItems(METHODS)
         grid.addWidget(self.method_combo, 0, 1)
 
+        # Training resolution — populated per dataset in _refresh_resolution().
+        grid.addWidget(labeled("Training resolution", *_HELP["resolution"]), 1, 0)
+        res_col = QVBoxLayout(); res_col.setSpacing(4); res_col.setContentsMargins(0, 0, 0, 0)
+        res_row = QHBoxLayout(); res_row.setSpacing(10); res_row.setContentsMargins(0, 0, 0, 0)
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.setMinimumWidth(320)
+        self.resolution_combo.currentIndexChanged.connect(self._on_resolution_changed)
+        self.add_levels_btn = QPushButton("Add downscale levels…")
+        self.add_levels_btn.setProperty("role", "secondary")
+        self.add_levels_btn.setCursor(Qt.PointingHandCursor)
+        self.add_levels_btn.setToolTip(
+            "Create images_2 / images_4 / images_8 next to images/ with "
+            "nerfstudio's own downscaler (ffmpeg, inside the container), so "
+            "the resolution entries above become folder-backed. One-off; "
+            "about 3 minutes for 266 4K frames."
+        )
+        self.add_levels_btn.clicked.connect(self._on_add_levels)
+        res_row.addWidget(self.resolution_combo, 1)
+        res_row.addWidget(self.add_levels_btn, 0)
+        res_wrap = QWidget(); res_wrap.setLayout(res_row)
+        # Live readout: frame cache size at this resolution + what Auto cache picks.
+        self.resolution_caption = QLabel("")
+        self.resolution_caption.setProperty("role", "caption")
+        self.resolution_caption.setWordWrap(True)
+        res_col.addWidget(res_wrap)
+        res_col.addWidget(self.resolution_caption)
+        res_col_wrap = QWidget(); res_col_wrap.setLayout(res_col)
+        grid.addWidget(res_col_wrap, 1, 1)
+
         # Max iterations
-        grid.addWidget(labeled("Max iterations", *_HELP["iters"]), 1, 0)
+        grid.addWidget(labeled("Max iterations", *_HELP["iters"]), 2, 0)
         it_row = QHBoxLayout(); it_row.setSpacing(10)
         self.iters_slider = QSlider(Qt.Horizontal)
         self.iters_slider.setRange(1000, 30000)
@@ -463,30 +573,34 @@ class _Form(QWidget):
         it_row.addWidget(self.iters_slider, 1)
         it_row.addWidget(self.iters_value)
         it_wrap = QWidget(); it_wrap.setLayout(it_row)
-        grid.addWidget(it_wrap, 1, 1)
+        grid.addWidget(it_wrap, 2, 1)
 
-        # Steps per save
-        grid.addWidget(labeled("Steps per save", *_HELP["save_step"]), 2, 0)
+        # Steps per save (+ inline warning above _SAVE_STEP_WARN)
+        grid.addWidget(labeled("Steps per save", *_HELP["save_step"]), 3, 0)
         self.save_step_spin = QSpinBox()
         self.save_step_spin.setRange(100, 10000)
         self.save_step_spin.setSingleStep(100)
         self.save_step_spin.setMaximumWidth(100)
-        ss_row = QHBoxLayout(); ss_row.addWidget(self.save_step_spin); ss_row.addStretch(1)
+        self.save_step_spin.valueChanged.connect(self._on_save_step_changed)
+        self.save_step_warn = QLabel("")
+        self.save_step_warn.setProperty("role", "caption")
+        ss_row = QHBoxLayout(); ss_row.setSpacing(10)
+        ss_row.addWidget(self.save_step_spin); ss_row.addWidget(self.save_step_warn, 1)
         ss_wrap = QWidget(); ss_wrap.setLayout(ss_row)
-        grid.addWidget(ss_wrap, 2, 1)
+        grid.addWidget(ss_wrap, 3, 1)
 
         # Visualization
-        grid.addWidget(labeled("Visualization", *_HELP["vis"]), 3, 0)
+        grid.addWidget(labeled("Visualization", *_HELP["vis"]), 4, 0)
         self.vis_combo = QComboBox()
         self.vis_combo.addItems(VIS_MODES)
-        grid.addWidget(self.vis_combo, 3, 1)
+        grid.addWidget(self.vis_combo, 4, 1)
 
         # Quit on completion
         qc_row = QHBoxLayout(); qc_row.setSpacing(6); qc_row.setContentsMargins(0, 0, 0, 0)
         self.quit_on_completion_cb = QCheckBox("Quit viewer when training finishes")
         qc_row.addWidget(self.quit_on_completion_cb); qc_row.addWidget(_hb("quit_on_completion")); qc_row.addStretch(1)
         qc_wrap = QWidget(); qc_wrap.setLayout(qc_row)
-        grid.addWidget(qc_wrap, 4, 1)
+        grid.addWidget(qc_wrap, 5, 1)
 
         v.addLayout(grid)
 
@@ -496,7 +610,50 @@ class _Form(QWidget):
         av = QVBoxLayout(self.advanced_wrap)
         av.setContentsMargins(0, 8, 0, 0); av.setSpacing(8)
 
-        adv_hdr = QHBoxLayout(); adv_hdr.setSpacing(6); adv_hdr.setContentsMargins(0, 0, 0, 0)
+        mem_hdr = QHBoxLayout(); mem_hdr.setSpacing(6); mem_hdr.setContentsMargins(0, 0, 0, 0)
+        mem_hdr.addWidget(section_title("ADVANCED · MEMORY & EVAL"))
+        mem_hdr.addStretch(1)
+        mem_wrap = QWidget(); mem_wrap.setLayout(mem_hdr)
+        av.addWidget(mem_wrap)
+
+        agrid = QGridLayout()
+        agrid.setHorizontalSpacing(14); agrid.setVerticalSpacing(12)
+        agrid.setColumnStretch(1, 1)
+
+        agrid.addWidget(labeled("Image cache", *_HELP["cache_images"]), 0, 0)
+        self.cache_combo = QComboBox()
+        for m in CACHE_MODES:
+            self.cache_combo.addItem(_CACHE_LABELS[m], userData=m)
+        self.cache_combo.currentIndexChanged.connect(lambda _i: self._refresh_resolution_caption())
+        agrid.addWidget(self.cache_combo, 0, 1)
+
+        agrid.addWidget(labeled("Eval cadence", *_HELP["eval_steps"]), 1, 0)
+        ev_row = QHBoxLayout(); ev_row.setSpacing(8); ev_row.setContentsMargins(0, 0, 0, 0)
+        self.eval_image_spin = QSpinBox()
+        self.eval_image_spin.setRange(50, 100000); self.eval_image_spin.setSingleStep(100)
+        self.eval_image_spin.setValue(topt.DEFAULT_STEPS_PER_EVAL_IMAGE)
+        self.eval_image_spin.setMaximumWidth(110)
+        self.eval_all_spin = QSpinBox()
+        self.eval_all_spin.setRange(100, 100000); self.eval_all_spin.setSingleStep(500)
+        self.eval_all_spin.setValue(topt.DEFAULT_STEPS_PER_EVAL_ALL_IMAGES)
+        self.eval_all_spin.setMaximumWidth(110)
+        lbl_a = QLabel("one image every"); lbl_a.setProperty("role", "caption")
+        lbl_b = QLabel("steps · all images every"); lbl_b.setProperty("role", "caption")
+        lbl_c = QLabel("steps"); lbl_c.setProperty("role", "caption")
+        for w in (lbl_a, self.eval_image_spin, lbl_b, self.eval_all_spin, lbl_c):
+            ev_row.addWidget(w)
+        ev_row.addStretch(1)
+        ev_wrap = QWidget(); ev_wrap.setLayout(ev_row)
+        agrid.addWidget(ev_wrap, 1, 1)
+
+        agrid.addWidget(labeled("Rasterize mode", *_HELP["rasterize_mode"]), 2, 0)
+        self.raster_combo = QComboBox()
+        for m in RASTER_MODES:
+            self.raster_combo.addItem(_RASTER_LABELS[m], userData=m)
+        agrid.addWidget(self.raster_combo, 2, 1)
+        av.addLayout(agrid)
+
+        adv_hdr = QHBoxLayout(); adv_hdr.setSpacing(6); adv_hdr.setContentsMargins(0, 8, 0, 0)
         adv_hdr.addWidget(section_title("ADVANCED · RAW CLI FLAGS"))
         adv_hdr.addWidget(_hb("extra_flags"))
         adv_hdr.addStretch(1)
@@ -604,13 +761,20 @@ class _Form(QWidget):
     def _load_project(self) -> None:
         p = self._project
         self.dataset_path.setText(p.processed_dir)
-        self.dataset_meta.setText(_dataset_meta_text(p))
+        self._refresh_dataset_card()
+        self._refresh_resolution()
 
         # Output path isn't knowable until _on_run mints a ULID. Show the
         # policy here so the user sees where the next run will land.
         self._refresh_next_target()
 
-        params = p.last_train_params or {}
+        self._apply_params(p.last_train_params or {})
+        self._refresh_presets()
+
+    def _apply_params(self, params: dict) -> None:
+        """Push a saved form dict (last-used params or a preset) into the
+        widgets. Unknown / missing keys fall back to the defaults, so presets
+        saved before the Tier-2 controls existed load unchanged."""
         method = params.get("method", "splatfacto")
         if method in METHODS:
             self.method_combo.setCurrentIndex(METHODS.index(method))
@@ -625,7 +789,174 @@ class _Form(QWidget):
         )
         self.extra_flags_edit.setText(params.get("extra_flags", ""))
 
-        self._refresh_presets()
+        res_idx = self.resolution_combo.findData(params.get("resolution", "auto"))
+        self.resolution_combo.setCurrentIndex(res_idx if res_idx >= 0 else 0)
+        cache_idx = self.cache_combo.findData(params.get("cache_images", "auto"))
+        self.cache_combo.setCurrentIndex(cache_idx if cache_idx >= 0 else 0)
+        self.eval_image_spin.setValue(
+            int(params.get("steps_per_eval_image", topt.DEFAULT_STEPS_PER_EVAL_IMAGE))
+        )
+        self.eval_all_spin.setValue(
+            int(params.get("steps_per_eval_all_images", topt.DEFAULT_STEPS_PER_EVAL_ALL_IMAGES))
+        )
+        raster_idx = self.raster_combo.findData(params.get("rasterize_mode", "default"))
+        self.raster_combo.setCurrentIndex(raster_idx if raster_idx >= 0 else 0)
+        self._refresh_resolution_caption()
+
+    # ---- dataset card / resolution helpers ----
+    def _refresh_dataset_card(self) -> None:
+        p = self._project
+        self.dataset_meta.setText(_dataset_meta_text(p))
+        pr = topt.pose_recovery(Path(p.processed_dir))
+        if pr.ratio is None:
+            set_pill(self.pose_pill, "Poses: unknown", "neutral")
+        else:
+            set_pill(
+                self.pose_pill,
+                f"Poses: {pr.registered} of {pr.extracted} frames ({pr.ratio:.0%})",
+                pr.level,
+            )
+        levels = topt.dataset_image_levels(Path(p.processed_dir))
+        if levels:
+            full = levels[1] if 1 in levels else None
+            names = ", ".join(f"images_{f} ({levels[f].width}×{levels[f].height})" for f in sorted(levels) if f > 1)
+            head = f"Frames {full.width}×{full.height}" if full else "Frames"
+            self.levels_caption.setText(
+                f"{head} · downscaled copies: {names if names else 'none — use Add downscale levels'}"
+            )
+        else:
+            self.levels_caption.setText("")
+
+    def _refresh_resolution(self) -> None:
+        """Rebuild the Training-resolution dropdown from what is on disk,
+        keeping the current selection when its key still exists."""
+        current = self.resolution_combo.currentData()
+        self._resolution_options = topt.resolution_options(Path(self._project.processed_dir))
+        self.resolution_combo.blockSignals(True)
+        self.resolution_combo.clear()
+        for o in self._resolution_options:
+            self.resolution_combo.addItem(o.label, userData=o.key)
+        idx = self.resolution_combo.findData(current) if current else -1
+        self.resolution_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.resolution_combo.blockSignals(False)
+        self.add_levels_btn.setVisible(
+            bool(topt.missing_levels(Path(self._project.processed_dir)))
+        )
+        self._refresh_resolution_caption()
+
+    def _current_resolution(self) -> topt.ResolutionOption | None:
+        return topt.find_option(self._resolution_options, self.resolution_combo.currentData())
+
+    def _frame_count(self) -> int:
+        n = _count_frames(self._project.processed_dir)
+        return int(n) if n else 0
+
+    def _refresh_resolution_caption(self) -> None:
+        opt = self._current_resolution()
+        if opt is None:
+            self.resolution_caption.setText("")
+            return
+        frames = self._frame_count()
+        gib = topt.estimate_cache_gib(frames, opt.width, opt.height)
+        mode = self.cache_combo.currentData() or "auto"
+        effective = topt.choose_cache_images(mode, frames, opt.width, opt.height) or "gpu"
+        where = "GPU" if effective == "gpu" else "host RAM (CPU cache)"
+        note = ""
+        if not opt.via_folder and not opt.is_auto and opt.factor > 1:
+            note = " · frames are resized while loading; Add downscale levels makes this a folder-backed copy"
+        self.resolution_caption.setText(
+            f"{frames} frames × {opt.width}×{opt.height} ≈ {gib:.2f} GiB of image cache → kept on {where}{note}"
+        )
+
+    def _on_resolution_changed(self, _idx: int) -> None:
+        self._refresh_resolution_caption()
+
+    def _on_save_step_changed(self, value: int) -> None:
+        if value > _SAVE_STEP_WARN:
+            self.save_step_warn.setText(
+                f"⚠ a crash before step {value} leaves no checkpoint — consider ≤ {_SAVE_STEP_WARN}"
+            )
+            self.save_step_warn.setStyleSheet("color: #8A5A00;")
+        else:
+            self.save_step_warn.setText("")
+            self.save_step_warn.setStyleSheet("")
+
+    def _resolved_params(self, params: dict) -> dict:
+        """Turn the dropdown choices into the effective values that go into
+        the command line and the TrainManifest. Kept separate from the raw
+        form dict so presets stay portable between datasets."""
+        opt = self._current_resolution()
+        frames = self._frame_count()
+        cache_eff = (
+            topt.choose_cache_images(params["cache_images"], frames, opt.width, opt.height)
+            if opt is not None else None
+        )
+        raster = params["rasterize_mode"]
+        return {
+            "resolution_label": opt.label if opt else "",
+            "train_width": opt.width if opt else None,
+            "train_height": opt.height if opt else None,
+            "downscale_factor": (
+                opt.factor if (opt and opt.via_folder and not opt.is_auto and opt.factor > 1) else None
+            ),
+            "camera_res_scale_factor": (
+                1.0 / opt.factor if (opt and not opt.via_folder and not opt.is_auto and opt.factor > 1) else None
+            ),
+            "cache_images_effective": cache_eff,
+            "rasterize_mode_effective": None if raster == "default" else raster,
+        }
+
+    def _on_add_levels(self) -> None:
+        """Run nerfstudio's own downscaler inside the container to create the
+        missing images_2/4/8 folders next to images/. A JobManager job (kind
+        'downscale') so it streams into the log drawer and can be cancelled."""
+        if self._jobs.is_running():
+            QMessageBox.information(self, "Busy", "Another job is already running. Cancel it first.")
+            return
+        state = dock.container_state(CONTAINER_NAME)
+        if state.status != "running":
+            QMessageBox.warning(self, "Container not running",
+                                f"The {CONTAINER_NAME} container isn't running. Start it from the Dashboard.")
+            return
+        processed = Path(self._project.processed_dir)
+        missing = topt.missing_levels(processed)
+        if not missing:
+            return
+        try:
+            c_data = wh.host_to_container_warehouse(processed)
+        except ValueError:
+            try:
+                from app.views.process import _host_to_container
+                c_data = _host_to_container(processed)
+            except Exception as e:
+                QMessageBox.warning(self, "Path translation failed", str(e))
+                return
+        # downscale_images(image_dir, num_downscales) writes images_2 .. images_2^n
+        # beside image_dir; 3 levels reaches images_8 (the deepest the Train
+        # tab offers). Existing folders are rewritten identically.
+        n_levels = max(1, int(round(__import__("math").log2(max(missing)))))
+        code = (
+            "from pathlib import Path; "
+            "from nerfstudio.process_data.process_data_utils import downscale_images; "
+            f"print(downscale_images(Path({c_data + '/images'!r}), {n_levels}, verbose=True))"
+        )
+        argv = ["python", "-c", code]
+        display = f"docker exec {CONTAINER_NAME} python -c '<downscale_images {c_data}/images, {n_levels} levels>'"
+        resp = QMessageBox.question(
+            self, "Add downscale levels",
+            f"Create {', '.join(f'images_{f}' for f in missing)} next to images/ for "
+            f"'{self._project.name}' using nerfstudio's downscaler (ffmpeg in the container)?\n\n"
+            "This is a one-off and typically takes a few minutes for ~250 4K frames.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        self._downscale_mine = True
+        self._jobs.start(JobSpec(
+            kind="downscale", display_cmd=display, container_argv=argv,
+            kill_pattern="downscale_images",
+            log_path=processed / "downscale.log",
+        ))
 
     def _refresh_presets(self) -> None:
         self.preset_combo.blockSignals(True)
@@ -642,19 +973,7 @@ class _Form(QWidget):
         preset = self._project.presets_train.get(name, {})
         if not preset:
             return
-        method = preset.get("method", "splatfacto")
-        if method in METHODS:
-            self.method_combo.setCurrentIndex(METHODS.index(method))
-        iters = int(preset.get("max_num_iterations", 7000))
-        self.iters_slider.setValue(iters); self.iters_value.setValue(iters)
-        self.save_step_spin.setValue(int(preset.get("steps_per_save", 2000)))
-        vis = preset.get("vis", "viewer+tensorboard")
-        if vis in VIS_MODES:
-            self.vis_combo.setCurrentIndex(VIS_MODES.index(vis))
-        self.quit_on_completion_cb.setChecked(
-            bool(preset.get("quit_on_train_completion", False))
-        )
-        self.extra_flags_edit.setText(preset.get("extra_flags", ""))
+        self._apply_params(preset)
 
     def _on_save_preset(self) -> None:
         name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
@@ -678,6 +997,12 @@ class _Form(QWidget):
             "vis": self.vis_combo.currentText(),
             "quit_on_train_completion": self.quit_on_completion_cb.isChecked(),
             "extra_flags": self.extra_flags_edit.text().strip(),
+            # Tier-2 controls (keys, not resolved values — see _resolved_params)
+            "resolution": self.resolution_combo.currentData() or "auto",
+            "cache_images": self.cache_combo.currentData() or "auto",
+            "steps_per_eval_image": self.eval_image_spin.value(),
+            "steps_per_eval_all_images": self.eval_all_spin.value(),
+            "rasterize_mode": self.raster_combo.currentData() or "default",
         }
 
     def _on_run(self) -> None:
@@ -758,6 +1083,63 @@ class _Form(QWidget):
 
             params = self._collect_params()
 
+            # ---- pre-flight (nothing written to disk yet) ----
+            try:
+                extras = shlex.split(params["extra_flags"]) if params["extra_flags"] else []
+            except ValueError as e:
+                QMessageBox.warning(self, "Bad extra flags", str(e))
+                return
+
+            colmap_rel: str | None = None
+            if params["method"] == "splatfacto-w":
+                # splatfacto-w's registered default is NerfWDataParser whose
+                # colmap_path defaults to "dense/sparse"; the Train tab
+                # overrides it via the splatfactow_dataparser subcommand.
+                # splatfacto-w-light is deliberately NOT routed that way: its
+                # upstream default is nerfstudio-data, which the author
+                # recommends for non-phototourism captures.
+                colmap_rel = detect_colmap_path(Path(self._project.processed_dir))
+                if not colmap_rel:
+                    QMessageBox.warning(
+                        self, "splatfacto-w needs a COLMAP sparse model",
+                        f"'{self._project.name}' has no "
+                        "sparse/0/cameras.bin or colmap/sparse/0/cameras.bin, "
+                        "so splatfacto-w's dataparser cannot load it.\n\n"
+                        "Use splatfacto-w-light (works on any processed "
+                        "dataset), or reprocess the source through the "
+                        "Process tab to get a COLMAP model.",
+                    )
+                    return
+            elif self._project.dataparser == "colmap":
+                # Always forward the stored path rather than relying on
+                # ColmapDataParserConfig's default ("colmap/sparse/0"), which
+                # doesn't match the plain-COLMAP ("sparse/0") layout.
+                colmap_rel = _colmap_rel(self._project)
+
+            # Pose-recovery gate: ns-process-data exits 0 even when COLMAP
+            # registered a handful of frames. Below POSE_RECOVERY_BLOCK_RATIO
+            # the result is not worth the GPU time without a conscious yes.
+            pr = topt.pose_recovery(Path(self._project.processed_dir))
+            if pr.ratio is not None and pr.ratio < topt.POSE_RECOVERY_BLOCK_RATIO:
+                resp = QMessageBox.question(
+                    self, "Few frames have poses",
+                    f"Only {pr.registered} of {pr.extracted} extracted frames "
+                    f"({pr.ratio:.0%}) received a camera pose during processing. "
+                    "A splat trained on this will cover a fraction of the scene.\n\n"
+                    "Usually fixable by reprocessing with more frames, exhaustive "
+                    "matching, or --sfm-tool hloc.\n\nTrain anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if resp != QMessageBox.Yes:
+                    return
+
+            resolution = self._current_resolution()
+            resolved = self._resolved_params(params)
+            # Everything the manifest needs: the raw form keys plus the
+            # effective values. Stored on the pending sidecar too, so a
+            # backfill reconstructs the same TrainParams.
+            form_params = {**params, **resolved}
+
             # If the viewer was requested, make sure nothing INSIDE the container
             # is already bound to viser's port. The host-side port is always held
             # by docker-proxy while splat-ns is running — that's the port mapping
@@ -804,66 +1186,24 @@ class _Form(QWidget):
                 QMessageBox.warning(self, "Path translation failed", str(e))
                 return
 
-            argv = [
-                "ns-train", params["method"],
-                "--experiment-name", self._project.id,
-                "--data", c_data,
-                "--output-dir", c_out,
-                "--max-num-iterations", str(params["max_num_iterations"]),
-                "--steps-per-save", str(params["steps_per_save"]),
-                "--vis", params["vis"],
-            ]
-            if "viewer" in params["vis"]:
-                argv.extend([
-                    "--viewer.websocket-host", "0.0.0.0",
-                    "--viewer.quit-on-train-completion",
-                    "True" if params["quit_on_train_completion"] else "False",
-                ])
-            if params["extra_flags"]:
-                try:
-                    extras = shlex.split(params["extra_flags"])
-                except ValueError as e:
-                    QMessageBox.warning(self, "Bad extra flags", str(e))
-                    return
-                argv.extend(extras)
-
-            # Dataparser subcommand goes last — tyro binds every subsequent
-            # flag to the dataparser, so method/pipeline flags have to precede
-            # it. The default (nerfstudio-data) is implicit when omitted, so
-            # we only emit non-default names to keep the generated command
-            # minimal.
-            if params["method"] == "splatfacto-w":
-                # splatfacto-w's registered default is NerfWDataParser whose
-                # colmap_path defaults to "dense/sparse". Override via the
-                # splatfactow_dataparser subcommand so it finds our layout.
-                # splatfacto-w-light is deliberately NOT routed here: its
-                # upstream default is nerfstudio-data, which the author
-                # recommends for non-phototourism captures, so it falls
-                # through to the same dataparser logic as the built-in
-                # methods (and keeps a proper train/eval split).
-                cp = detect_colmap_path(Path(self._project.processed_dir))
-                if not cp:
-                    QMessageBox.warning(
-                        self, "splatfacto-w needs a COLMAP sparse model",
-                        f"'{self._project.name}' has no "
-                        "sparse/0/cameras.bin or colmap/sparse/0/cameras.bin, "
-                        "so splatfacto-w's dataparser cannot load it.\n\n"
-                        "Use splatfacto-w-light (works on any processed "
-                        "dataset), or reprocess the source through the "
-                        "Process tab to get a COLMAP model.",
-                    )
-                    return
-                argv.extend([
-                    "splatfactow_dataparser", "--colmap-path", cp,
-                ])
-            elif self._project.dataparser == "colmap":
-                argv.append("colmap")
-                # Always forward the stored path rather than relying on
-                # ColmapDataParserConfig's default ("colmap/sparse/0"), which
-                # doesn't match the plain-COLMAP ("sparse/0") layout.
-                argv.extend(["--colmap-path", _colmap_rel(self._project)])
-            elif self._project.dataparser != "nerfstudio-data":
-                argv.append(self._project.dataparser)
+            argv = topt.build_train_argv(
+                method=params["method"],
+                data=c_data,
+                output_dir=c_out,
+                experiment_name=self._project.id,
+                max_num_iterations=int(params["max_num_iterations"]),
+                steps_per_save=int(params["steps_per_save"]),
+                vis=params["vis"],
+                quit_on_train_completion=bool(params["quit_on_train_completion"]),
+                steps_per_eval_image=int(params["steps_per_eval_image"]),
+                steps_per_eval_all_images=int(params["steps_per_eval_all_images"]),
+                cache_images=resolved["cache_images_effective"],
+                rasterize_mode=resolved["rasterize_mode_effective"],
+                resolution=resolution,
+                extra_flags=extras,
+                project_dataparser=self._project.dataparser,
+                colmap_path=colmap_rel,
+            )
 
             display = (
                 f"docker exec {CONTAINER_NAME} "
@@ -875,11 +1215,14 @@ class _Form(QWidget):
                 display_cmd=display,
                 container_argv=argv,
                 kill_pattern="ns-train",
+                # Every stdout line lands next to pending.json / manifest.json,
+                # so a failed or cancelled run leaves evidence on disk.
+                log_path=target / "job.log",
             )
             self._pending_target = target
             self._pending_run_id = train_run_id
             self._pending_parent_process_id = parent_manifest.run_id
-            self._pending_form_params = params
+            self._pending_form_params = form_params
             self._pending_command = display
             self._pending_start_time = datetime.now(timezone.utc)
             self._pending_display_name = self._project.name or self._project.id
@@ -898,7 +1241,7 @@ class _Form(QWidget):
                     started_at=self._pending_start_time,
                     command=display,
                     display_name=self._pending_display_name,
-                    form_params=params,
+                    form_params=form_params,
                     dataparser=self._project.dataparser,
                     experiment_name=self._project.id,
                 )
@@ -964,6 +1307,13 @@ class _Form(QWidget):
             set_pill(self.status_pill, "✓ Trained · viewer alive", "success")
 
     def _on_job_started(self, spec: JobSpec) -> None:
+        if spec.kind == "downscale" and self._downscale_mine:
+            self._running_mine = False
+            self.run_btn.setEnabled(False)
+            self.add_levels_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(True)
+            set_pill(self.status_pill, "● Adding downscale levels", "warning")
+            return
         if spec.kind != "train":
             self._running_mine = False
             self.run_btn.setEnabled(False)
@@ -1046,6 +1396,18 @@ class _Form(QWidget):
         return True
 
     def _on_job_finished(self, code: int) -> None:
+        if self._downscale_mine:
+            self._downscale_mine = False
+            self.add_levels_btn.setEnabled(True)
+            # New images_N folders exist now: rebuild the dropdown so the
+            # rescale-at-load entries turn into folder-backed ones.
+            self._refresh_dataset_card()
+            self._refresh_resolution()
+            self.run_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(False)
+            set_pill(self.status_pill, "Downscale levels added" if code == 0 else f"Downscale failed · exit {code}",
+                     "success" if code == 0 else "error")
+            return
         if not self._running_mine:
             self._reset_idle()
             return
@@ -1075,6 +1437,13 @@ class _Form(QWidget):
             set_pill(self.status_pill, f"Failed · exit {code}", "error")
 
     def _on_job_cancelled(self) -> None:
+        if self._downscale_mine:
+            self._downscale_mine = False
+            self.add_levels_btn.setEnabled(True)
+            self._refresh_resolution()
+            self._reset_idle()
+            set_pill(self.status_pill, "Downscale cancelled", "error")
+            return
         if not self._running_mine:
             self._reset_idle()
             return
@@ -1093,6 +1462,12 @@ class _Form(QWidget):
         self._clear_pending_state()
 
     def _on_job_failed(self, msg: str) -> None:
+        if self._downscale_mine:
+            self._downscale_mine = False
+            self.add_levels_btn.setEnabled(True)
+            self._reset_idle()
+            set_pill(self.status_pill, "Downscale failed to start", "error")
+            return
         if not self._running_mine:
             self._reset_idle()
             return

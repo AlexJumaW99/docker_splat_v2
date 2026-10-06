@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from app import docker_service as dock
 from app import live_jobs
+from app import train_options as topt
 from app import warehouse as wh
 from app.config import (
     CONTAINER_NAME, DATA_DIR, VIZER_CONTAINER, VIZER_VIEWER_PORT, WAREHOUSE_DIR,
@@ -978,17 +979,37 @@ class _Form(QWidget):
         self.ready_to_train = QFrame()
         self.ready_to_train.setProperty("role", "subcard")
         rtt = QHBoxLayout(self.ready_to_train)
-        rtt.setContentsMargins(14, 10, 14, 10)
-        ok = QLabel("✓ Processed dataset ready.")
-        ok.setStyleSheet("color: #22C55E; font-weight: 600;")
+        rtt.setContentsMargins(14, 10, 14, 10); rtt.setSpacing(10)
+        self.ready_lbl = QLabel("✓ Processed dataset ready.")
+        self.ready_lbl.setStyleSheet("color: #22C55E; font-weight: 600;")
+        # Pose recovery: frames that received a camera / frames extracted.
+        # ns-process-data exits 0 even at 2/75, so this pill is the real
+        # verdict on the run (green ≥ 90 %, amber 50–90 %, red < 50 %).
+        self.pose_pill = pill("Poses: —", "neutral")
         train_btn = QPushButton("Go to Train →")
         train_btn.setProperty("role", "primary")
         train_btn.setCursor(Qt.PointingHandCursor)
         train_btn.clicked.connect(self.request_train.emit)
-        rtt.addWidget(ok)
+        rtt.addWidget(self.ready_lbl)
+        rtt.addWidget(self.pose_pill)
         rtt.addStretch(1)
         rtt.addWidget(train_btn)
         self.ready_to_train.hide()
+
+        # Low pose-recovery warning — populated by _show_pose_recovery().
+        self.pose_warn = QFrame()
+        self.pose_warn.setProperty("role", "subcard")
+        pw = QVBoxLayout(self.pose_warn)
+        pw.setContentsMargins(14, 10, 14, 10); pw.setSpacing(4)
+        self.pose_warn_title = QLabel("Warning: most frames did not get a camera pose")
+        self.pose_warn_title.setStyleSheet("color: #B42318; font-weight: 600;")
+        self.pose_warn_body = QLabel("")
+        self.pose_warn_body.setWordWrap(True)
+        self.pose_warn_body.setProperty("role", "caption")
+        self.pose_warn_body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        pw.addWidget(self.pose_warn_title)
+        pw.addWidget(self.pose_warn_body)
+        self.pose_warn.hide()
 
         # Splinter warning — populated by _check_sparse_splinter() on success.
         # COLMAP's incremental mapper occasionally produces multiple disjoint
@@ -1044,6 +1065,7 @@ class _Form(QWidget):
         v.addLayout(vizer_row)
 
         v.addWidget(self.ready_to_train)
+        v.addWidget(self.pose_warn)
         v.addWidget(self.splinter_warn)
         return c
 
@@ -1492,6 +1514,9 @@ class _Form(QWidget):
                 display_cmd=display,
                 container_argv=argv,
                 kill_pattern="ns-process-data",
+                # COLMAP's own progress lines live here afterwards — the only
+                # record of a failed or splintered reconstruction.
+                log_path=target / "job.log",
             )
             self._pending_target = target
             self._pending_source_id = src_manifest.run_id
@@ -1509,6 +1534,7 @@ class _Form(QWidget):
             self._pending_display_name = self._project.name or source.name
             self.ready_to_train.hide()
             self.splinter_warn.hide()
+            self.pose_warn.hide()
             self.output_lbl.setText(str(target))
 
             # Branch on the live-viewing dropdown. "Run with vizer" hands the
@@ -1627,6 +1653,7 @@ class _Form(QWidget):
             self._clear_pending_state()
             set_pill(self.status_pill, "Done", "success")
             self.ready_to_train.show()
+            self._show_pose_recovery()
             self._check_sparse_splinter()
             # The just-completed target is now on disk; the next Run will
             # mint a fresh ULID anyway, but the caption shows the policy.
@@ -1686,6 +1713,48 @@ class _Form(QWidget):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         set_pill(self.status_pill, "Ready", "neutral")
+
+    # ---- pose recovery ----
+    def _show_pose_recovery(self) -> None:
+        """Fill the result row's pose pill from the just-finished dataset and
+        raise the warning panel when fewer than half the frames got a pose.
+        Reads manifest metrics (or transforms.json) through train_options, so
+        it works for GUI-run and vizer-run datasets alike."""
+        pr = topt.pose_recovery(Path(self._project.processed_dir))
+        if pr.ratio is None:
+            set_pill(self.pose_pill, "Poses: unknown", "neutral")
+            self.pose_warn.hide()
+            return
+        set_pill(
+            self.pose_pill,
+            f"Poses: {pr.registered} of {pr.extracted} frames ({pr.ratio:.0%})",
+            pr.level,
+        )
+        if pr.level == "error":
+            self.ready_lbl.setText("Processed — but only partially reconstructed.")
+            self.ready_lbl.setStyleSheet("color: #B42318; font-weight: 600;")
+            self.pose_warn_body.setText(
+                f"COLMAP registered {pr.registered} of {pr.extracted} extracted frames. "
+                "A splat trained on this covers only the posed part of the scene. "
+                "Usual fixes, in order of effort: raise Target frames so neighbouring "
+                "frames overlap more; switch Matching method to exhaustive (or "
+                "vocab_tree for long, looping captures); try learned features with "
+                "Raw CLI flags: --sfm-tool hloc --feature-type superpoint_max "
+                "--matcher-type superpoint+lightglue; and for a zoomed or long-focal "
+                "lens, set Camera type to simple_pinhole. The Train tab will ask "
+                "for confirmation before training on this dataset."
+            )
+            self.pose_warn.show()
+        else:
+            self.ready_lbl.setText(
+                "✓ Processed dataset ready." if pr.level == "success"
+                else "✓ Processed — some frames are missing poses."
+            )
+            self.ready_lbl.setStyleSheet(
+                "color: #22C55E; font-weight: 600;" if pr.level == "success"
+                else "color: #8A5A00; font-weight: 600;"
+            )
+            self.pose_warn.hide()
 
     # ---- splinter detection ----
     def _check_sparse_splinter(self) -> None:
@@ -1938,6 +2007,7 @@ class _Form(QWidget):
                 self.output_lbl.setText(self._project.processed_dir)
             set_pill(self.status_pill, "Done (vizer)", "success")
             self.ready_to_train.show()
+            self._show_pose_recovery()
         else:
             set_pill(self.status_pill, "Failed in vizer", "error")
             if error:

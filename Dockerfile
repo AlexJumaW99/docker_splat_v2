@@ -199,6 +199,26 @@ RUN sed -i \
         -e 's|self.viewer.control_panel.update_output_options(list(outputs.keys()))|self.viewer.control_panel.update_output_options([k for k in outputs.keys() if k != "gl_z_buf_depth"])|' \
         /usr/local/lib/python3.12/dist-packages/nerfstudio/viewer/render_state_machine.py
 
+# v4.8: cuDNN autotuning off by default in ns-train. nerfstudio's train.py
+# sets `torch.backends.cudnn.benchmark = True` at import. With that on, the
+# FIRST LPIPS evaluation of a run (torchmetrics AlexNet convolutions at full
+# eval resolution) makes cuDNN try every convolution algorithm, workspaces
+# included, and that single call was the VRAM high-water mark of every run
+# measured on 2026-10-05: +3.15 GiB at 960 px, +12.40 GiB at 1920 px (vs
+# +0.12 / +0.50 GiB with autotuning off or on the second call). Whole runs:
+# peak 11.15 -> 2.42 GiB at 1920 px, 3.72 -> 0.90 GiB at 960 px, with
+# identical wall time and identical 4.0 ms train-iteration time (splatfacto's
+# only hot convolution is the 11x11 SSIM window). CUDNN_CONV_WSCAP_DBG had
+# no effect in this cuDNN build. The patch keeps an escape hatch:
+# NS_CUDNN_BENCHMARK=1 restores upstream behaviour. `grep -c` fails the build
+# if the anchor line ever changes upstream.
+RUN sed -i \
+        's|^torch.backends.cudnn.benchmark = True  # type: ignore$|torch.backends.cudnn.benchmark = __import__("os").environ.get("NS_CUDNN_BENCHMARK", "0") == "1"  # docker_splat_v2 v4.8: default off, see Dockerfile|' \
+        /usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/train.py \
+    && test "$(grep -c 'NS_CUDNN_BENCHMARK' /usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/train.py)" = "1" \
+    && test "$(grep -c '^torch.backends.cudnn.benchmark = True' /usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/train.py)" = "0" \
+    && python -c "import py_compile; py_compile.compile('/usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/train.py', doraise=True)"
+
 # splatfacto-w (KevinXu02) is listed as an external method by nerfstudio. It
 # registers `splatfacto-w` and `splatfacto-w-light` via the
 # nerfstudio.method_configs entry point. We install with --no-deps because its

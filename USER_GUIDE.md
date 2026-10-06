@@ -150,6 +150,7 @@ docker create \
   --ulimit stack=67108864 \
   --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -v ~/docker-stacks/docker_splat_v2/data:/workspace \
   -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \
   -p 7007:7007 \
@@ -167,7 +168,7 @@ docker create \
 | `--ipc=host` | Shared memory for PyTorch multi-worker dataloaders |
 | `--ulimit memlock=-1 --ulimit stack=67108864` | Required by NGC PyTorch for proper memory management |
 | `--shm-size=16g` | Shared memory size for large tensors |
-| `-e PYTORCH_ALLOC_CONF=expandable_segments:True` | Memory allocator config; reduces fragmentation on long training runs |
+| `-e PYTORCH_ALLOC_CONF=…` **and** `-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Enables PyTorch's expandable allocator segments (fewer unusable slivers when tensors keep changing size, as gaussians do during densification). In the NGC 25.11 build the new variable name alone does *not* switch it on — measured with `torch.cuda.memory._snapshot()` — so both names are set; the old name alone works but prints a deprecation warning. |
 | `-v ~/docker-stacks/docker_splat_v2/data:/workspace` | Legacy artifact tree — still used by raw CLI workflows in this guide |
 | `-v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse` | Manifest-driven, ULID-keyed warehouse — where the GUI writes new sources, processed datasets, and training runs (see [Desktop GUI: lineage & manifests](#lineage--manifests)) |
 | `-p 7007:7007` | Viser web viewer port |
@@ -229,7 +230,7 @@ First launch creates `.venv/` and installs PySide6, pydantic, and pillow-heif (~
 |-----------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------|
 | Dashboard | live  | Polls Docker + `splat-ns-v2` + GPU. If the container is missing, shows the `docker build` / `docker create` commands with copy buttons — never runs them. |
 | Process   | live  | Form-driven `ns-process-data` (video or images). Per-project presets, advanced raw-flag passthrough, live ffprobe readout for video, live image count for image folders. Auto-converts HEIC/HEIF photos (iPhone) to maximum-quality JPEG with EXIF preserved before processing; originals are stashed in a `heic_originals/` subfolder. |
-| Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), iteration slider, viser + TensorBoard toggle. Detects when viser goes live and deep-links `http://localhost:7007`. |
+| Train     | live  | Form-driven `ns-train`. Method picker (`splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`), **Training resolution** dropdown built from the dataset's `images_N` copies (with an *Add downscale levels* action when they are missing), iteration slider, checkpoint cadence (flags values above 5000), viser + TensorBoard mode. Advanced: **Image cache** (Auto / GPU / CPU with a live size estimate), **Eval cadence** (default 1000 steps), **Rasterize mode**, raw CLI flags. The DATASET card shows how many frames received a pose and the tab asks before training below 50 %. Routes `splatfacto-w` through `splatfactow_dataparser` and refuses it without a COLMAP model; writes `job.log` next to the run's manifest. Detects when viser comes up and deep-links to `http://localhost:7007`. |
 | Exports   | live  | Form-driven PLY export and `ns-render camera-path` (video from viser keyframe JSON). Each artifact lands in its own ULID directory — `data_v2/exports/splat/<EXPORT_ULID>/<name>.ply` and `data_v2/renders/<RENDER_ULID>/<name>.mp4` — alongside a `manifest.json` whose `parent.run_id` is the train ULID; collisions are impossible by construction. Auto-routes to `ns-export-splatfactow` for `splatfacto-w` / `splatfacto-w-light` runs (upstream `ns-export gaussian-splat` doesn't handle them) and to `ns-export gaussian-splat` for everything else. |
 | Viewers   | live  | Live port-status cards for viser (port 7007) and TensorBoard (port 6006). Run picker scoped to the active project — launch `ns-viewer` against a finished checkpoint, start/stop TensorBoard, and open either in the browser. Shows per-run TensorBoard-event availability. |
 | Runs      | stub  | Placeholder for a training-run browser over `data/outputs/`.                                                                                  |
@@ -568,6 +569,19 @@ Step (% Done)
 ```
 
 Columns: step, iteration time, remaining time estimate, gaussian count. The gaussian count should grow steadily — doubling roughly every 2000 iterations in the densification phase.
+
+### Training resolution, image cache and eval cadence (GUI)
+
+Three controls on the Train tab (added 2026-10-05) encode what the benchmarks in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2 found:
+
+| Control | Default | What it emits | Why |
+|---|---|---|---|
+| **Training resolution** | Auto | `<dataparser> --downscale-factor N` for an existing `images_N` folder, or `--pipeline.datamanager.camera-res-scale-factor 1/N` when the folder is missing ("rescaled at load") | A splat is only sharp at the resolution it was trained at: trained at 960 px it scores PSNR 33.9 viewed at 960 but 28.2 at 1920; trained at 1920 it scores 32.5 at 1920 (2.4× the time). Nerfstudio's Auto rule trains 4K footage at 960 px. **Add downscale levels** creates `images_2/4/8` with nerfstudio's own downscaler (~3 min for 266 4K frames) so the entries become folder-backed. |
+| **Image cache** (Advanced) | Auto | `--pipeline.datamanager.cache-images cpu` when frames × W × H × 3 bytes exceed 3 GiB at the chosen resolution; nothing otherwise | 266 frames at 4K are 6.2 GiB on the GPU and drove splatfacto-big to 11.6 GiB by step 6500; with the CPU cache the same run peaked at 5.6 GiB (581 s → 781 s per 6500 steps). The caption under the resolution control shows the live estimate and the resulting placement. |
+| **Eval cadence** (Advanced) | one image every **1000** steps, all images every 1000 | `--steps-per-eval-image`, `--steps-per-eval-all-images` | nerfstudio's default of 100 renders a full-resolution eval image (with PSNR/SSIM/LPIPS) every 100 steps and writes ~180 MB of TensorBoard images per 1000 steps at 4K; 1000 keeps the metrics at a tenth of the cost. The first eval image used to be the VRAM high-water mark of every run (+12.4 GiB at 1920 px) because nerfstudio enables cuDNN autotuning and LPIPS's convolutions get autotuned at full resolution; image **v4.8** turns that off by default (`NS_CUDNN_BENCHMARK=1` restores it) — same wall time, peak 11.15 → 2.42 GiB at 1920 px. |
+| **Rasterize mode** (Advanced) | Method default | `--pipeline.model.rasterize-mode classic|antialiased` | `antialiased` measured PSNR 34.9 vs 33.9 at native resolution and 30.2 vs 28.2 when viewed at twice the training resolution — but nerfstudio warns the exported PLY does not match classic-mode web viewers, so keep `classic` when the PLY is the deliverable. |
+
+The effective values (downscale factor, rescale factor, cache placement, eval steps, rasterize mode) are recorded in the run's `manifest.json` under `params`, so a manifest alone reproduces the command.
 
 ### Splatfacto variants
 
@@ -1025,6 +1039,7 @@ docker images | grep splat-nerfstudio-v2
 docker create --name splat-ns-v2 --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=16g \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -v ~/docker-stacks/docker_splat_v2/data:/workspace \
   -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \
   -p 7007:7007 -p 6006:6006 -it splat-nerfstudio-v2

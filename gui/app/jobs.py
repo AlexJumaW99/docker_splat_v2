@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
@@ -35,6 +37,12 @@ class JobSpec:
     # A regex run against command lines that match this job's inner process.
     # Used by cancel() to pkill the right thing. Narrow by design.
     kill_pattern: str
+    # Optional host-side file that receives every output line (ANSI-stripped)
+    # plus a header (command, start time) and a footer (exit status). Views
+    # point this at the run's own warehouse directory (`<run>/job.log`) so a
+    # failed or cancelled run leaves evidence on disk — before this existed,
+    # six of seven unfinalized splatfacto-big runs had nothing to diagnose.
+    log_path: Path | None = None
 
 
 class JobManager(QObject):
@@ -49,6 +57,7 @@ class JobManager(QObject):
         self._proc: QProcess | None = None
         self._spec: JobSpec | None = None
         self._exit_handled = False
+        self._log = None  # open text file while a logged job runs
 
     # ---- state ----
     def is_running(self) -> bool:
@@ -68,6 +77,7 @@ class JobManager(QObject):
 
         self._spec = spec
         self._exit_handled = False
+        self._open_log(spec)
         self._proc = QProcess(self)
         self._proc.setProcessChannelMode(QProcess.MergedChannels)
         self._proc.readyReadStandardOutput.connect(self._drain_stdout)
@@ -80,6 +90,7 @@ class JobManager(QObject):
         if not self._proc.waitForStarted(3000):
             self._exit_handled = True
             err = self._proc.errorString() or "Failed to start docker exec."
+            self._close_log(f"failed to start: {err}")
             self._proc = None
             self._spec = None
             self.failed.emit(err)
@@ -111,7 +122,9 @@ class JobManager(QObject):
             return
         data = self._proc.readAllStandardOutput().data().decode("utf-8", "replace")
         for raw_line in data.splitlines():
-            self.line.emit(strip_ansi(raw_line))
+            clean = strip_ansi(raw_line)
+            self._log_line(clean)
+            self.line.emit(clean)
 
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         if self._exit_handled:
@@ -122,6 +135,7 @@ class JobManager(QObject):
         self._drain_stdout()
 
         crashed = (exit_status == QProcess.CrashExit)
+        self._close_log("cancelled / crashed" if crashed else f"exit code {exit_code}")
         self._proc = None
         self._spec = None
 
@@ -135,6 +149,41 @@ class JobManager(QObject):
             return
         self._exit_handled = True
         msg = self._proc.errorString() if self._proc else str(err)
+        self._close_log(f"docker exec error: {msg}")
         self._proc = None
         self._spec = None
         self.failed.emit(msg or "docker exec error")
+
+    # ---- log sink ----
+    def _open_log(self, spec: JobSpec) -> None:
+        """Best effort: a log that cannot be opened must never block a job."""
+        self._log = None
+        if spec.log_path is None:
+            return
+        try:
+            spec.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log = open(spec.log_path, "a", encoding="utf-8")
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._log.write(f"# {stamp}  kind={spec.kind}\n# {spec.display_cmd}\n")
+            self._log.flush()
+        except OSError:
+            self._log = None
+
+    def _log_line(self, line: str) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log.write(line + "\n")
+        except OSError:
+            self._log = None
+
+    def _close_log(self, status: str) -> None:
+        if self._log is None:
+            return
+        try:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._log.write(f"# {stamp}  {status}\n")
+            self._log.close()
+        except OSError:
+            pass
+        self._log = None

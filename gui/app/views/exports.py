@@ -778,6 +778,7 @@ class _Form(QWidget):
             display_cmd=display,
             container_argv=["/bin/sh", "-c", shell_cmd],
             kill_pattern="ns-export",
+            log_path=out_dir / "job.log",
         ))
 
     # ---- video render ----
@@ -854,6 +855,7 @@ class _Form(QWidget):
             display_cmd=display,
             container_argv=["/bin/sh", "-c", shell_cmd],
             kill_pattern="ns-render",
+            log_path=out_dir / "job.log",
         ))
 
     def _on_cancel(self) -> None:

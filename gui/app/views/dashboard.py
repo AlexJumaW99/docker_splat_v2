@@ -49,6 +49,7 @@ DOCKER_CREATE_CMD = """docker create \\
   --ulimit stack=67108864 \\
   --shm-size=16g \\
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \\
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
   -v ~/docker-stacks/docker_splat_v2/data:/workspace \\
   -v ~/docker-stacks/docker_splat_v2/data_v2:/warehouse \\
   -p 7007:7007 \\

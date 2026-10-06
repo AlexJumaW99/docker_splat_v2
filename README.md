@@ -24,7 +24,7 @@
 
 <br/>
 
-> A **fully reproducible Docker stack** that turns a video or a folder of photos into a **3D Gaussian Splat** on RTX 50-series GPUs. COLMAP and gsplat are compiled for `sm_120`, Nerfstudio is pinned to a known commit, every upstream patch is applied in the Dockerfile and asserted by a **76-check smoke test** — and a **PySide6 desktop app** drives the whole thing with a manifest-driven, lineage-tracked warehouse.
+> A **fully reproducible Docker stack** that turns a video or a folder of photos into a **3D Gaussian Splat** on RTX 50-series GPUs. COLMAP and gsplat are compiled for `sm_120`, Nerfstudio is pinned to a known commit, every upstream patch is applied in the Dockerfile and asserted by an **83-check smoke test** — and a **PySide6 desktop app** drives the whole thing with a manifest-driven, lineage-tracked warehouse.
 
 ---
 
@@ -49,7 +49,7 @@ Think of it as **the splat factory for one workstation** — build once, process
 &nbsp;&nbsp;🟢 COLMAP and gsplat compiled for **`sm_120`**; NGC PyTorch 25.11 base\
 &nbsp;&nbsp;🟢 Every dependency **pinned to a commit or version** (`COLMAP_COMMIT`, `NERFSTUDIO_COMMIT`, `SPLATFACTOW_COMMIT`, `HLOC_COMMIT`, `VOCAB_TREE_SHA256` …)\
 &nbsp;&nbsp;🟢 **Twelve upstream fixes** applied in the Dockerfile — flag renames, `torch.load` safety, viewer crash, submap promotion, splatfacto-w data loading, and more\
-&nbsp;&nbsp;🟢 `smoke_test.sh` asserts **76 checks** against the running container, from CUDA kernels to patch anchors\
+&nbsp;&nbsp;🟢 `smoke_test.sh` asserts **83 checks** against the running container, from CUDA kernels to patch anchors and the allocator mode\
 &nbsp;&nbsp;🟢 Warm rebuilds in **seconds** thanks to a 5-stage layout; `make fresh` for disaster recovery
 
 </td>
@@ -74,6 +74,7 @@ Think of it as **the splat factory for one workstation** — build once, process
 &nbsp;&nbsp;🌸 **Five methods**: `splatfacto`, `splatfacto-big`, `splatfacto-mcmc`, `splatfacto-w`, `splatfacto-w-light`\
 &nbsp;&nbsp;🌸 **viser** 3D viewer (`:7007`) and **TensorBoard** (`:6006`) at the same time\
 &nbsp;&nbsp;🌸 `splatfacto-w` works on **ordinary COLMAP datasets**, not just phototourism — dataparser v2 + colour-cache patch, verified end to end\
+&nbsp;&nbsp;🌸 **Training resolution** chosen per run (Auto · Full · ½ · ¼ · ⅛), image-cache placement decided from the frame budget, and a 12 GiB first-eval VRAM spike removed at the source\
 &nbsp;&nbsp;🌸 **PLY export** for every method, including a custom exporter that bakes splatfacto-w's appearance MLP into standard spherical harmonics\
 &nbsp;&nbsp;🌸 **Camera-path video** rendering from viser keyframes
 
@@ -84,7 +85,7 @@ Think of it as **the splat factory for one workstation** — build once, process
 
 &nbsp;&nbsp;🟣 PySide6 app: **Dashboard · Process · Train · Exports · Viewers** — the exact `ns-*` commands, as forms with presets and tooltips\
 &nbsp;&nbsp;🟣 **ULID-keyed warehouse** (`data_v2/`): source → process → train → export / render, each with a `manifest.json` that names its parent\
-&nbsp;&nbsp;🟣 JSON-Schema-validated manifests, SHA-256 checksums, a **write-ahead `pending.json`** so a closed GUI never strands a finished run\
+&nbsp;&nbsp;🟣 JSON-Schema-validated manifests, SHA-256 checksums, a **write-ahead `pending.json`** and a per-run `job.log`, so a closed GUI never strands a finished run and a failed one leaves evidence\
 &nbsp;&nbsp;🟣 Import already-processed folders (nerfstudio or COLMAP layout) or runs processed live in **vizer**\
 &nbsp;&nbsp;🟣 A narrow Docker allow-list: the app can `inspect`, `start` and `exec` — it can never build, remove or run containers
 
@@ -252,7 +253,7 @@ flowchart TB
 Each stage is buildable on its own with `docker build --target <stage>`. The upgrade ritual for any pinned component is: bump the `ARG`, rebuild, run `./smoke_test.sh`.
 
 <details>
-<summary><b>🔧 What's been fixed — twelve issues you would otherwise hit</b></summary>
+<summary><b>🔧 What's been fixed — thirteen issues you would otherwise hit</b></summary>
 <br/>
 
 | Issue | Root cause | Fix |
@@ -269,6 +270,7 @@ Each stage is buildable on its own with `docker build --target <stage>`. The upg
 | `splatfacto-w-light` fails at load with `AssertionError: The size of image (3840, 2160) loaded does not match the camera parameters ((3838, 2161))`; `splatfacto-w` floods `Image shape … does not match camera shape`, then dies with `CUDA out of memory` on 4K data. SIMPLE_PINHOLE datasets fail with `Only {'PINHOLE', 'OPENCV'} camera models are supported` | The v4.4 NerfW overlay built `Cameras` without width/height, so nerfstudio derived them as `int(2·cx) × int(2·cy)` — wrong once COLMAP's bundle adjuster has refined the principal point (13 of 14 OPENCV datasets in the warehouse). It also dropped the OPENCV distortion coefficients, accepted only PINHOLE/OPENCV and always read full-resolution `images/`. splatfacto-w's datamanager skips mismatched frames recursively, moving one 4K frame to the GPU per recursion, so the real error surfaced as an OOM. The GUI also routed `splatfacto-w-light` through this parser although its upstream default is `nerfstudio-data`. | v4.7 overlay reads intrinsics through nerfstudio's own `parse_colmap_camera_params` (real size, distortion, perspective-family models), rejects fisheye explicitly, and picks `images_<N>` with nerfstudio-data's ≤ 1600 px rule. The Train tab routes only `splatfacto-w` through `splatfactow_dataparser` and refuses to start it on a project without a COLMAP sparse model; `splatfacto-w-light` uses the standard dataparsers again. |
 | `splatfacto-w` training dies at a random step with `AssertionError: torch.Size([112061, 16, 3])` from `gsplat/rendering.py` | Upstream `splatfactow_model.py` reuses `cached_colors` in eval whenever the eval camera index equals the last *training* camera index, without checking the gaussian count; densify/cull and in-training eval both run every 100 steps, so the cache is one densification stale whenever the indices coincide ([upstream issue #14](https://github.com/KevinXu02/splatfacto-w/issues/14), open since 2024-08) | `patch`-applied 3-line change in Stage 5: only eval renders populate `cached_colors` / `cached_bg_sh`, and a cached tensor must match the live gaussian count. Applied with `patch --forward --batch` so the build fails if upstream drifts. |
 | `ns-process-data … --sfm-tool hloc` says `you must install hloc toolbox!!` after a rebuild | hloc, LightGlue, kornia and pycolmap had been installed by hand into the running container's writable layer only; `docker compose up --build` recreated the container without them | Stage 5 bakes hloc (`HLOC_COMMIT`), LightGlue (`LIGHTGLUE_COMMIT`), `pycolmap==3.13.0` and `kornia==0.8.3` into the image; `smoke_test.sh` §18 asserts the imports. |
+| Every training run's VRAM peak was the **first eval image**, far above anything training itself needed: +3.15 GiB at 960 px, +12.4 GiB at 1920 px, enough to OOM a 1920 px run on a 16 GB card whose training steps use 1.8 GiB | `nerfstudio/scripts/train.py` sets `torch.backends.cudnn.benchmark = True`; the first LPIPS evaluation (torchmetrics AlexNet convolutions at full eval resolution) then makes cuDNN benchmark every convolution algorithm, workspaces included. The second call costs 0.5 GiB. Eval cadence only moves the spike. | v4.8 `sed` patch makes autotuning opt-in (`NS_CUDNN_BENCHMARK=1`). Measured: peak 11.15 → 2.42 GiB at 1920 px, 3.72 → 0.90 GiB at 960 px, identical wall time and 4.0 ms train-iteration time. `smoke_test.sh` §20 asserts the anchor and the effective value. |
 
 </details>
 
@@ -276,11 +278,12 @@ Each stage is buildable on its own with `docker build --target <stage>`. The upg
 
 ## ✅ Verification Status
 
-All of the following were re-verified on 2026-10-05 against image `4bc97967` (v4.7).
+All of the following were re-verified on 2026-10-05 / 06 against images `4bc97967` (v4.7) and `55c12378` (v4.8).
 
 | Check | Result |
 | :--- | :--- |
-| Image build + `smoke_test.sh` | ✅ **76 / 76** — GPU passthrough, sm_120 kernels, cuDNN, COLMAP flags + commit pin, gsplat JIT rasterization, every Stage-5 patch anchor, hloc imports |
+| Image build + `smoke_test.sh` | ✅ **83 / 83** — GPU passthrough, sm_120 kernels, cuDNN, COLMAP flags + commit pin, gsplat JIT rasterization, every Stage-5 patch anchor, hloc imports, expandable allocator segments, cuDNN autotuning off |
+| Train-tab Tier 2 controls | ✅ GUI-generated commands ran end to end: `--downscale-factor 2` via `nerfstudio-data`, `colmap` and `splatfactow_dataparser`; `camera-res-scale-factor 0.5` on a dataset without `images_2`; auto CPU cache at native 4K; `antialiased`; *Add downscale levels* (16 frames → images_2/4/8 in 6 s). 1920 px run peak 11.15 → 2.42 GiB after v4.8 |
 | `ns-process-data` sequential / vocab_tree / exhaustive | ✅ 87 / 87 frames registered on an 87-frame set (vocab_tree 34 s, sequential 24 s); on a 61-frame set vocab_tree matched the same 1 830 pairs as exhaustive with the faiss tree |
 | `ns-process-data --camera-type equirectangular` | ✅ 42 frames → 336 perspective crops, 336 / 336 registered |
 | `ns-process-data --sfm-tool hloc` (SuperPoint + LightGlue) | ✅ 87 / 87 frames registered from the image-baked toolbox |
@@ -298,7 +301,7 @@ All of the following were re-verified on 2026-10-05 against image `4bc97967` (v4
 > **Blackwell only by design.** `TORCH_CUDA_ARCH_LIST=12.0` targets `sm_120` exclusively. For an Ada or Ampere card change it to `8.9` or `8.6` in the Dockerfile and rebuild.
 
 > [!WARNING]
-> **16 GB of VRAM is the assumption.** Training at native 4K can OOM on a 5070 Ti: `splatfacto-big` on 266 4K frames peaked at 11.6 GiB by step 6 500 with the default GPU image cache. The measured levers (`--pipeline.datamanager.cache-images cpu`, training resolution, `--steps-per-eval-image`) and their numbers are in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2. `PYTORCH_ALLOC_CONF=expandable_segments:True` alone does **not** enable expandable segments in the NGC 25.11 torch build.
+> **16 GB of VRAM is the assumption.** Training at native 4K can OOM on a 5070 Ti: `splatfacto-big` on 266 4K frames peaked at 11.6 GiB by step 6 500 with the default GPU image cache. The Train tab's **Training resolution** and **Image cache** controls are the levers (numbers in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2). Since v4.8 the image also disables cuDNN autotuning in `ns-train`, which removed a 12.4 GiB first-eval spike at 1920 px at no speed cost, and `docker-compose.yml` sets both allocator variables because `PYTORCH_ALLOC_CONF` alone does **not** enable expandable segments in the NGC 25.11 torch build.
 
 - **Container runs as root.** Files written under `data/outputs/` and inside `data_v2/trained/<ULID>/` are `root:root` on the host; `sudo chown -R $USER:$USER` them when needed.
 - **`ns-download-data` is broken upstream** (Google Drive rate limits, [nerfstudio#3134](https://github.com/nerfstudio-project/nerfstudio/issues/3134)). Use your own footage.
@@ -313,7 +316,7 @@ docker_splat_v2/
 ├── Dockerfile                    # 🐳 5-stage build; every pin and patch is an ARG or a commented RUN
 ├── docker-compose.yml            # 🧩 The runtime contract: GPU, ipc, shm, mounts, ports, cache volumes
 ├── Makefile                      # ⚡ build · up · shell · test · fresh · heal-net
-├── smoke_test.sh                 # ✅ 76 checks against the running container (18 sections)
+├── smoke_test.sh                 # ✅ 83 checks against the running container (20 sections)
 ├── image_bin/
 │   ├── colmap-shim               # 🔀 Promotes the largest COLMAP submap into sparse/0; snapshots for viser
 │   ├── nerfw_dataparser.py       # 🧭 splatfacto-w dataparser v2 (real sizes, distortion, images_<N>)
@@ -321,7 +324,8 @@ docker_splat_v2/
 │   └── ns-export-splatfactow     # 💾 PLY exporter that bakes splatfacto-w's appearance MLP into SH
 ├── gui/                          # 🖥️ PySide6 desktop app (see gui/README.md)
 │   ├── run.sh                    #    creates .venv and launches
-│   └── app/                      #    views/, warehouse.py, manifest.py (+ frozen JSON Schema), jobs.py …
+│   ├── app/                      #    views/, warehouse.py, manifest.py (+ JSON Schema), train_options.py, jobs.py …
+│   └── tests/                    #    unit tests for the Qt-free training-option logic
 ├── scan_catalog.py               # 🗂️ Rebuilds catalog.db over the legacy data/ tree
 ├── IMPROVEMENT_PLAN.md           # 🗺️ Measured backlog: Tier 1 (done) · Tier 2 · Tier 3
 ├── USER_GUIDE.md                 # 📚 Full walkthrough, flags, troubleshooting
@@ -333,7 +337,7 @@ docker_splat_v2/
 
 ## 🗺️ Roadmap
 
-The measured backlog lives in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md): **Tier 1** (splatfacto-w data loading, colour-cache crash, hloc in the image — landed in v4.7), **Tier 2** (training-resolution control, in-training eval cadence, CPU image cache, pose-recovery gate, persisted job logs, allocator env), **Tier 3** (defaults and hygiene).
+The measured backlog lives in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md): **Tier 1** (splatfacto-w data loading, colour-cache crash, hloc in the image — landed in v4.7), **Tier 2** (training-resolution control, in-training eval cadence, CPU image cache, pose-recovery gate, persisted job logs, allocator env — landed 2026-10-05), **Tier 3** (defaults and hygiene).
 
 <br/>
 

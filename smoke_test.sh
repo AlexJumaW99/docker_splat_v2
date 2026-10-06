@@ -587,6 +587,61 @@ out=$(dexec test -f /opt/hloc/third_party/SuperGluePretrainedNetwork/models/weig
     || fail "SuperPoint weights" "third_party/SuperGluePretrainedNetwork not initialised"
 
 # ============================================================================
+# 19. CUDA allocator: expandable segments actually enabled (Tier 2.6)
+#
+# docker-compose.yml sets both PYTORCH_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF
+# because, in the NGC 25.11 torch build, the new name alone does not switch
+# expandable segments on. The only reliable check is the allocator's own
+# snapshot after a real allocation: every segment must report is_expandable.
+# ============================================================================
+section "19. CUDA allocator (expandable segments)"
+
+env_out=$(dexec env 2>/dev/null | grep -E '^PYTORCH_(CUDA_)?ALLOC_CONF=' | sort | tr '\n' ' ')
+echo "$env_out" | grep -q 'PYTORCH_ALLOC_CONF=expandable_segments:True' \
+    && pass "PYTORCH_ALLOC_CONF set in the container" \
+    || fail "PYTORCH_ALLOC_CONF" "got: $env_out"
+echo "$env_out" | grep -q 'PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' \
+    && pass "PYTORCH_CUDA_ALLOC_CONF set in the container (the one this torch build honours)" \
+    || fail "PYTORCH_CUDA_ALLOC_CONF" "got: $env_out — recreate the container (docker compose up -d) after editing docker-compose.yml"
+
+out=$(dexec_in python - <<'PY' 2>&1 | grep -E '^(EXPANDABLE|ERR)' | tail -1
+import torch
+try:
+    x = torch.zeros(16 * 1024 * 1024, device="cuda")  # 64 MB -> at least one segment
+    segs = torch.cuda.memory._snapshot()["segments"]
+    print("EXPANDABLE", all(s.get("is_expandable") for s in segs), len(segs))
+except Exception as e:
+    print("ERR", type(e).__name__, str(e)[:120])
+PY
+)
+case "$out" in
+    "EXPANDABLE True"*) pass "allocator segments are expandable ($out)" ;;
+    *) fail "allocator expandable segments" "$out" ;;
+esac
+
+# ============================================================================
+# 20. cuDNN autotuning off in ns-train (Stage 5 sed, v4.8)
+#
+# nerfstudio's train.py sets torch.backends.cudnn.benchmark = True; the first
+# LPIPS eval then autotunes AlexNet convolutions at full resolution and that
+# single call peaked at +12.4 GiB (1920 px). The patch makes it opt-in via
+# NS_CUDNN_BENCHMARK=1. Verify the anchor, the compile, and the effective
+# value after importing the module both ways.
+# ============================================================================
+section "20. cuDNN autotuning patch (v4.8)"
+
+trf='/usr/local/lib/python3.12/dist-packages/nerfstudio/scripts/train.py'
+c_new=$(dexec grep -c 'NS_CUDNN_BENCHMARK' "$trf" | tr -d '[:space:]')
+c_old=$(dexec grep -c '^torch.backends.cudnn.benchmark = True' "$trf" | tr -d '[:space:]')
+[ "${c_new:-0}" = "1" ] && pass "train.py carries the NS_CUDNN_BENCHMARK switch" || fail "cudnn patch anchor" "got $c_new"
+[ "${c_old:-0}" = "0" ] && pass "unpatched 'cudnn.benchmark = True' absent"        || fail "unpatched cudnn line removed" "$c_old ref(s) remain"
+
+out=$(dexec bash -c 'CUDA_VISIBLE_DEVICES= python -c "import nerfstudio.scripts.train, torch; print(torch.backends.cudnn.benchmark)"' 2>&1 | tail -1)
+[ "$out" = "False" ] && pass "cudnn.benchmark is False after importing ns-train (default)" || fail "cudnn.benchmark default" "$out"
+out=$(dexec bash -c 'NS_CUDNN_BENCHMARK=1 CUDA_VISIBLE_DEVICES= python -c "import nerfstudio.scripts.train, torch; print(torch.backends.cudnn.benchmark)"' 2>&1 | tail -1)
+[ "$out" = "True" ] && pass "NS_CUDNN_BENCHMARK=1 restores upstream behaviour" || fail "cudnn override" "$out"
+
+# ============================================================================
 # Summary
 # ============================================================================
 section "Summary"

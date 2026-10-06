@@ -155,6 +155,30 @@ class TrainParams(BaseModel):
     dataparser: Literal["nerfstudio-data", "colmap"]
     extra_flags: list[str] = Field(default_factory=list)
 
+    # ---- added 2026-10-05 (Tier 2). All optional with defaults, so every
+    # manifest written before this date still validates under schema 1.0;
+    # `None` means "the GUI did not emit the flag and nerfstudio's own
+    # default applied". Measured rationale for each lives in
+    # IMPROVEMENT_PLAN.md §2.
+    downscale_factor: int | None = Field(default=None, ge=1)
+    """`<dataparser> --downscale-factor N`: train on the dataset's images_<N>
+    copies. None = nerfstudio's auto rule (smallest copy with the longest
+    side <= 1600 px)."""
+    camera_res_scale_factor: float | None = Field(default=None, gt=0.0, le=1.0)
+    """`--pipeline.datamanager.camera-res-scale-factor`: rescale at load time
+    when the dataset has no images_<N> copies."""
+    cache_images: Literal["gpu", "cpu"] | None = None
+    """`--pipeline.datamanager.cache-images`. None = nerfstudio default (gpu;
+    FullImageDatamanager itself falls back to cpu above 500 images)."""
+    steps_per_eval_image: int | None = Field(default=None, ge=1)
+    """`--steps-per-eval-image`. nerfstudio's default of 100 is the measured
+    VRAM high-water mark of every run (first eval render at step 100)."""
+    steps_per_eval_all_images: int | None = Field(default=None, ge=1)
+    """`--steps-per-eval-all-images` (nerfstudio default 1000)."""
+    rasterize_mode: Literal["classic", "antialiased"] | None = None
+    """`--pipeline.model.rasterize-mode`. None = the method's default
+    (classic for splatfacto*, antialiased for splatfacto-w*)."""
+
 
 class ExportParams(BaseModel):
     """Arguments handed to `ns-export gaussian-splat` or the custom

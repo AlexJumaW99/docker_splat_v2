@@ -88,19 +88,21 @@ Build took 27 s (all heavy layers cached). In the recreated container: splatfact
 
 ---
 
-## Tier 2 — VRAM behaviour and silent failures (all measured, not yet implemented)
+## Tier 2 — VRAM behaviour and silent failures (landed 2026-10-06, image v4.8)
 
-### 2.1 Raise `--steps-per-eval-image` / `--steps-per-eval-all-images` `[ ]`
-- Per-call tracing of `Trainer.train_iteration` / `eval_iteration`: the VRAM high-water
-  mark of every run is the **first eval render at step 100** (nerfstudio default, GUI does
-  not override), drawn at full eval resolution while the gaussians are still the large
-  initial SfM points. 3.7 GiB at 960 px, 11.1 GiB at 1920 px (two datasets), 5.4 GiB at
-  4K, against training steps of 0.6 / 1.8 / 0.8 GiB. With eval disabled the 1920 px run
-  never exceeded 1.79 GiB. The same cadence wrote 1.56 GB of TensorBoard images for an
-  8,500-step 4K run. Proposed default: 1000 for both flags (eval at step 1000 measured
-  2.45 GiB at 1920 px).
+### 2.1 Eval cadence `[x]`
+- Per-call tracing of `Trainer.train_iteration` / `eval_iteration` showed the VRAM
+  high-water mark of every run was the **first eval image**: 3.7 GiB at 960 px, 11.1 GiB at
+  1920 px (two datasets), 5.4 GiB at 4K, against training steps of 0.6 / 1.8 / 0.8 GiB.
+  **Correction (2026-10-06):** moving the first eval to step 1000 left the peak unchanged
+  (11.15 GiB) — the spike belongs to the first eval, not to step 100; its cause and fix are
+  item 2.7. What cadence does control is the other cost of evaluating every 100 steps:
+  one full-resolution render + PSNR/SSIM/LPIPS per 100 steps and ~180 MB of TensorBoard
+  images per 1000 steps at 4K (1.56 GB for an 8,500-step run). The GUI now emits
+  `--steps-per-eval-image 1000 --steps-per-eval-all-images 1000` (Advanced → Eval cadence)
+  and records both in `TrainParams`.
 
-### 2.2 Training-resolution control in the Train tab `[ ]`
+### 2.2 Training-resolution control in the Train tab `[x]`
 - nerfstudio's auto rule trains 4K sources at 960 px (`images_4`). A splat is only good
   at the resolution it was trained at (splatfacto, 30k, `buddha_v2`):
 
@@ -119,30 +121,82 @@ Build took 27 s (all heavy layers cached). In the recreated container: splatfact
   docstring warns the exported PLY is not compatible with classic-mode web viewers
   (*not verified* against SuperSplat).
 
-### 2.3 Auto-select `--pipeline.datamanager.cache-images cpu` for large frame sets `[ ]`
+### 2.3 Auto-select `--pipeline.datamanager.cache-images cpu` for large frame sets `[x]`
 - splatfacto-big at native 4K (`fort_garry`, 266 frames, 6,500 its): GPU cache peak
   11.64 GiB / 581 s; CPU cache peak 5.63 GiB / 781 s; same 1.97 M gaussians.
   *Not verified:* whether a full 30k native-4K splatfacto-big run then completes.
 
-### 2.4 Pose-recovery gate `[ ]`
+### 2.4 Pose-recovery gate `[x]`
 - Record `registered_frame_count = len(transforms.json frames)` in the ProcessManifest
   (no log parsing needed) and warn/block in the Train tab when the ratio to extracted
   frames is low. Three warehouse datasets have 2/16, 2/75 and 23/253 posed frames; test
   runs on a 61-frame set exited 0 with 2–3 frames registered; the existing splinter
   check only fires with ≥ 2 submaps.
 
-### 2.5 Persist job stdout per run `[ ]`
+### 2.5 Persist job stdout per run `[x]`
 - `JobManager` has no file sink: 6 of 7 unfinalized splatfacto-big runs left nothing to
   diagnose. Write `<run>/job.log` next to `pending.json`; keep it on failure. Also warn
   when `--steps-per-save` exceeds a few thousand (yesterday's 4K run lost 8,500 steps
   with `steps_per_save 10000`).
 
-### 2.6 docker-compose: add `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` `[ ]`
+### 2.6 docker-compose: add `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` `[x]`
 - `PYTORCH_ALLOC_CONF` alone is inert in the NGC 25.11 torch build (allocator snapshot
   `is_expandable=False`); setting both enables it without the deprecation warning.
   PyTorch documents expandable segments for "a job changing allocation sizes
   frequently". 4K run: peak reserved 12.34 → 11.92 GiB; wall time 581 → 667 s on
   single runs (first run's reserve was pinned at a test cap, so inconclusive).
+
+---
+
+### 2.7 cuDNN autotuning off in `ns-train` (found while validating 2.1) `[x]`
+- Isolated probe (torchmetrics LPIPS + pytorch_msssim SSIM + PSNR on a 1920×1080 pair):
+  with `cudnn.benchmark=True` — what `nerfstudio/scripts/train.py:71` sets — the **first**
+  LPIPS call costs +12.40 GiB (+3.15 GiB at 960×540); the second call, or any call with
+  autotuning off, costs +0.50 GiB. SSIM +0.27 GiB, PSNR +0.05 GiB. `CUDNN_CONV_WSCAP_DBG`
+  had no effect in this cuDNN build.
+- Whole runs, autotuning off vs on: 1920 px / 1200 its peak **2.42 vs 11.15 GiB**, 25 s both;
+  960 px / 3500 its peak **0.90 vs 3.72 GiB**, 34 s both; train-iteration 4.0 ms both.
+- Image v4.8 patches the line to `… = os.environ.get("NS_CUDNN_BENCHMARK", "0") == "1"`
+  (default off, upstream behaviour one env var away); `smoke_test.sh` §20 asserts anchor
+  and effective value. Verified through the real `ns-train` on v4.8: 2.42 GiB default,
+  11.16 GiB with the override.
+
+### Tier 2 validation (2026-10-06)
+- 20 unit tests for `gui/app/train_options.py` (`python -m unittest discover -s tests`).
+- Train form instantiated offscreen against three real datasets: option labels, pose
+  pills, cache estimate, resolved values, preset round-trip.
+- `JobManager` log sink verified end to end (header, both streams, exit footer).
+- GUI-generated commands run on the GPU: `--downscale-factor 2` via `nerfstudio-data`,
+  `colmap` and `splatfactow_dataparser` (no interactive prompt); `camera-res-scale-factor
+  0.5` on a 0-downscale dataset; auto CPU cache at native 4K; `antialiased`; the exact
+  *Add downscale levels* command (16 frames → images_2/4/8 in 6 s).
+- Container recreated with both allocator variables (`smoke_test.sh` §19 reads
+  `is_expandable=True`); image rebuilt to v4.8 (`smoke_test.sh` 83/83). Rollback tags:
+  `splat-nerfstudio-v2:pre-v4.7`, `:pre-v4.8`.
+- All existing 50 warehouse manifests still validate against the extended schema.
+
+## Tier 2 — implementation plan (written 2026-10-05 before coding)
+
+**Integration constraints found in the code**
+- `TrainParams` / `ProcessParams` use `extra="forbid"`; `manifest_schema.json` is generated by `python -m app.manifest`. New knobs are added as *optional fields with defaults* under schema 1.0 (additive: every existing manifest still validates; `load_manifest` keeps accepting 1.0). `ProcessManifest.metrics` is a free `dict[str, float]`, so `registered_frame_count` needs no schema change.
+- `JobSpec` has no log sink; `JobManager._drain_stdout` is the single place every line passes through. A `log_path` on the spec, opened in `start()` and closed in every terminal handler, persists stdout without touching the views' signal wiring.
+- The Train tab builds `argv` in `_Form._on_run`; dataparser flags must follow the subcommand (`nerfstudio-data` / `colmap` / `splatfactow_dataparser` all accept `--downscale-factor`). `FullImageDatamanagerConfig` and `SplatfactoWDatamanagerConfig` both expose `camera_res_scale_factor` and `cache_images`.
+- Theme vocabulary to reuse: `card()`, `section_title()`, `labeled(text, help_title, help_body)`, `pill()/set_pill()` with kinds `neutral | success | warning | error`, button roles `primary | secondary | ghost`, label roles `caption | readout`, `QFrame[role="subcard"]`.
+- Logic that decides options and argv goes into a Qt-free module (`gui/app/train_options.py`) so it can be unit-tested with `python -m unittest` (new `gui/tests/`).
+
+**2.1 Eval cadence** — new Advanced controls *Eval image every N steps* (default **1000**; nerfstudio's 100 is the measured VRAM spike) and *Eval all images every N steps* (default 1000, nerfstudio's own). Always emitted as `--steps-per-eval-image` / `--steps-per-eval-all-images`; recorded in `TrainParams`.
+
+**2.2 Training resolution** — a *Training resolution* dropdown in the PARAMETERS card, populated from the dataset: *Auto* (what nerfstudio would pick, shown with its pixel size), *Full*, and one entry per existing `images_<N>` folder (½ · ¼ · ⅛ with pixel sizes). Datasets processed with 0 downscale levels get the same ½ / ¼ / ⅛ entries implemented through `--pipeline.datamanager.camera-res-scale-factor` (labelled "rescaled at load"), plus an **Add downscale levels** action that runs nerfstudio's own `downscale_images()` in the container as a job and refreshes the list. Emitted as `<dataparser> --downscale-factor N` when a folder exists. Advanced: *Rasterize mode* (`classic` default, `antialiased` with the PLY-compatibility caveat in its help text). Both recorded in `TrainParams`.
+
+**2.3 Image cache** — Advanced control *Image cache*: Auto / GPU / CPU. Auto estimates frames × W × H × 3 bytes at the chosen training resolution and picks CPU above 3 GiB (the failed 4K runs carried 6.2 GiB); the estimate is shown live under the control. Emitted as `--pipeline.datamanager.cache-images`; recorded in `TrainParams`.
+
+**2.4 Pose-recovery gate** — `collect_process_metrics` records `registered_frame_count` from `transforms.json`. Process tab shows *Poses recovered: N of M (x %)* after a run, with a warning panel below 50 %. Train tab's DATASET card shows the same figure (falls back to counting `transforms.json` frames for manifests written elsewhere, e.g. vizer) with a success / warning / error pill, and asks for confirmation before training below 50 %.
+
+**2.5 Job logs** — `JobSpec.log_path`; Process, Train, Export and Render jobs write `job.log` into their ULID directory (header with the command and start time, every line, footer with exit status). The *Steps per save* help text gains the measured cost of a late save; values above 5000 are flagged inline.
+
+**2.6 Allocator** — `docker-compose.yml` sets `PYTORCH_CUDA_ALLOC_CONF` alongside `PYTORCH_ALLOC_CONF`; the Dashboard's copyable `docker create` and the USER_GUIDE flag table follow; `smoke_test.sh` gains an allocator probe (`torch.cuda.memory._snapshot()` → `is_expandable`).
+
+**Validation** — unit tests for the pure module; `py_compile` + offscreen import of every edited view; the exact GUI-generated commands run on real datasets (½ resolution, Auto cache, eval 1000; a 0-downscale dataset through the rescale path; *Add downscale levels* on a scratch copy); container recreated for the env change; `smoke_test.sh` all green.
 
 ---
 
@@ -200,3 +254,7 @@ registered). splatfacto / -big / -mcmc train, export and evaluate cleanly.
 | same, `cache-images cpu` | | peak 5.63 GiB, 781 s |
 | same, `camera-res-scale-factor 0.5` | | 1.02 M gaussians, 216 s |
 | VRAM trace @960 / @1920 / @4K | per-call peaks | eval@100: 3.72 / 11.12 / 5.43 GiB; train ≤ 0.59 / 1.83 / 0.80 GiB |
+| eval every 1000 instead of 100 | buddha_v2 @1920, 1200 its | peak still 11.15 GiB (spike = first eval, not step 100) |
+| LPIPS first call, cudnn.benchmark on / off | 1920×1080 pair | +12.40 GiB / +0.50 GiB (960×540: +3.15 / +0.12) |
+| ns-train with cuDNN autotuning off (v4.8) | buddha_v2 @1920 1200 its · @960 3500 its | peak 2.42 GiB · 0.90 GiB, same wall time; override restores 11.16 GiB |
+| GUI Tier-2 commands | 6 runs (see Tier 2 validation) | all exit 0 |
