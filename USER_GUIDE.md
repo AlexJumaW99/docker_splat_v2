@@ -273,6 +273,7 @@ data_v2/
 │   └── manifest.json                               # TrainManifest, parent.run_id = <process_ULID>
 ├── exports/<kind>/<export_ULID>/                   # ns-export output (kind: splat | pcd | mesh)
 │   ├── <name>.ply                                  # primary payload (renamed from ns-export's `splat.ply`)
+│   ├── <name>.cameras.json                         # splat exports: the training cameras, for SuperSplat
 │   └── manifest.json                               # ExportManifest, parent.run_id = <train_ULID>
 └── renders/<render_ULID>/                          # ns-render camera-path output
     ├── <name>.mp4                                  # rendered video
@@ -891,6 +892,32 @@ sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data/outputs
 For cleaning up stray gaussians, cropping the scene, applying post-processing effects, or publishing to the web:
 
 **[superspl.at/editor](https://superspl.at/editor)** — free, open-source, browser-based editor from PlayCanvas. Drag-and-drop your exported PLY to load it. Features: selection tools (rect/brush/lasso), cropping, timeline animations, WebXR export, and more.
+
+### Training cameras for SuperSplat (`<name>.cameras.json`)
+
+While a run trains, nerfstudio's viewer (viser, `:7007`) draws every training photo as a camera frustum with the photo on its far face. Each GUI export now writes the same cameras next to the PLY, so your own SuperSplat build (`~/docker-stacks/supersplat`, `localhost:3000`) can draw them on the splat:
+
+```
+data_v2/exports/splat/<EXPORT_ULID>/
+├── <name>.ply
+├── <name>.cameras.json    ← every training camera, its lens and a 384 px JPEG of its photo
+└── manifest.json          ← outputs.training_cameras + its checksum
+```
+
+- **Exactly the cameras training used.** The file is computed inside the container by nerfstudio's own dataparser (any dataparser: `nerfstudio-data`, `colmap`, splatfacto-w's), in the PLY's own coordinates — so a frustum points at the part of the splat its photo shows. The lens and the photos are the **undistorted** ones splatfacto trains on (its datamanager undistorts each image and replaces fx/fy/cx/cy — 21 % different from the raw values on a wide-angle phone video such as Assiniboine Park).
+- **Held-out cameras** (the eval split) are included and labelled; a dataparser that draws its eval images from the training images (splatfacto-w's) lists them as training cameras.
+- **Refuses a stale dataset.** If the dataset on disk no longer gives the transform the run recorded in `dataparser_transforms.json`, no file is written (the cameras would not line up).
+- **Non-fatal.** If the step fails, the PLY and its manifest are still written and the status pill says **Exported · no cameras**; `job.log` has the reason.
+- **Size and time.** ~6–20 MB and 5–20 s per export (a 4K dataset of ~300 frames: 10 MB, 18 s).
+
+For exports made before this existed:
+
+```bash
+cd gui && ./.venv/bin/python -m app.warehouse training-cameras --all          # every splat export without a cameras file
+./.venv/bin/python -m app.warehouse training-cameras ../data_v2/exports/splat/<EXPORT_ULID> --force   # rewrite one
+```
+
+In SuperSplat, drop the PLY and its `.cameras.json` together (or the whole export folder); the **Training Cameras** panel (right toolbar) shows, sizes, browses and flies to them.
 
 ---
 

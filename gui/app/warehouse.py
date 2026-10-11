@@ -1315,12 +1315,19 @@ def write_export_manifest(
     # Pick up any sidecar files (texture atlas, .obj/.mtl, point-cloud helper).
     # Skips the payload itself (recorded above), the manifest we're about to
     # write, and any leftover tmp files. Sorted for deterministic output.
+    # The training-cameras file is an artifact of its own, checksummed like
+    # the payload (see training_camera_outputs).
     for p in sorted(output_dir.iterdir()):
         if not p.is_file():
             continue
         if p.name in (payload_filename, "manifest.json"):
             continue
         if p.name.endswith(".tmp"):
+            continue
+        if p.name.endswith(TRAINING_CAMERAS_SUFFIX):
+            outputs, checksums = training_camera_outputs(
+                outputs, checksums, to_warehouse_relpath(p), sha256_file(p)
+            )
             continue
         outputs[f"sidecar:{p.name}"] = to_warehouse_relpath(p)
 
@@ -1344,6 +1351,134 @@ def write_export_manifest(
     )
     dump_manifest(manifest, output_dir / "manifest.json")
     return manifest
+
+
+# ---------------------------------------------------------------- training cameras
+
+
+# `<stem>.cameras.json` beside an exported splat: the cameras the splat was
+# trained from, for SuperSplat to draw as frustums (app/training_cameras.py
+# writes it inside the container). Recorded in the export manifest under
+# `outputs.training_cameras`, with a checksum.
+TRAINING_CAMERAS_SUFFIX = ".cameras.json"
+TRAINING_CAMERAS_OUTPUT_KEY = "training_cameras"
+# How long one export's cameras may take (a 4K dataset of ~300 frames takes
+# ~20 s; this is a hang guard, not an estimate).
+TRAINING_CAMERAS_TIMEOUT_S = 1800
+
+
+def training_cameras_path(ply_path: Path) -> Path:
+    return ply_path.with_name(ply_path.stem + TRAINING_CAMERAS_SUFFIX)
+
+
+def training_camera_outputs(
+    outputs: dict[str, str], checksums: dict[str, str], relpath: str, sha256: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """`outputs` / `checksums` with the cameras file recorded under its own
+    key (replacing a `sidecar:` entry an older manifest gave it, or a previous
+    cameras file). Pure — returns new dicts."""
+    outputs = {k: v for k, v in outputs.items() if v != relpath}
+    checksums = dict(checksums)
+    previous = outputs.get(TRAINING_CAMERAS_OUTPUT_KEY)
+    if previous is not None and previous != relpath:
+        checksums.pop(previous, None)
+    outputs[TRAINING_CAMERAS_OUTPUT_KEY] = relpath
+    checksums[relpath] = sha256
+    return outputs, checksums
+
+
+def training_cameras_lineage(export_run_id: str, train_run_id: str) -> dict[str, str]:
+    """Run ids (and what the train manifest says about the run) copied into
+    the cameras file, so it names the splat it belongs to."""
+    lineage: dict[str, str] = {"export": export_run_id, "train": train_run_id}
+    try:
+        train = load_manifest(run_dir("train", train_run_id) / "manifest.json")
+        lineage["process"] = train.parent.run_id
+        lineage["method"] = train.params.method
+        lineage["displayName"] = train.display_name
+    except Exception:  # noqa: BLE001 — lineage is informative, never fatal
+        pass
+    return lineage
+
+
+def training_cameras_command(*, config: str, ply: str, out: str, lineage: dict[str, str]) -> list[str]:
+    """Arguments after `python3 -c <script>` (container paths)."""
+    return ["--config", config, "--ply", ply, "--out", out, "--lineage", json.dumps(lineage)]
+
+
+def record_training_cameras(export_dir: Path) -> ExportManifest | None:
+    """Add (or refresh) `outputs.training_cameras` in an export's manifest
+    from the cameras file now beside its PLY. Keeps the previous manifest as
+    `manifest.json.bak-<UTC>` like `refresh_process_manifest`. Returns None
+    when there is no cameras file or nothing changed."""
+    export_dir = Path(export_dir)
+    path = export_dir / "manifest.json"
+    manifest = load_manifest(path)
+    if not isinstance(manifest, ExportManifest):
+        raise ValueError(f"{path} is a {manifest.stage!r} manifest, not an export manifest")
+    ply_rel = manifest.outputs.get(_EXPORT_PAYLOAD_KEY["splat"])
+    if not ply_rel:
+        raise ValueError(f"{path} records no splat PLY")
+    cameras = training_cameras_path(WAREHOUSE_DIR / ply_rel)
+    if not cameras.is_file():
+        return None
+    outputs, checksums = training_camera_outputs(
+        dict(manifest.outputs), dict(manifest.checksums), to_warehouse_relpath(cameras), sha256_file(cameras)
+    )
+    if outputs == manifest.outputs and checksums == manifest.checksums:
+        return None
+    updated = manifest.model_copy(update={"outputs": outputs, "checksums": checksums})
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    shutil.copy2(path, export_dir / f"manifest.json.bak-{stamp}")
+    dump_manifest(updated, path)
+    return updated
+
+
+def generate_training_cameras(export_dir: Path, *, force: bool = False) -> tuple[Path, dict] | None:
+    """Write `<stem>.cameras.json` for an existing splat export by running
+    app/training_cameras.py inside the container, then record it in the
+    manifest. Returns (path, summary), or None when the file already exists
+    and `force` is off (the manifest is still brought up to date)."""
+    from app.training_cameras import FAIL_SENTINEL, OK_SENTINEL, script_source
+
+    export_dir = Path(export_dir).resolve()
+    manifest = load_manifest(export_dir / "manifest.json")
+    if not isinstance(manifest, ExportManifest) or manifest.params.kind != "splat":
+        raise ValueError(f"{export_dir} is not a splat export")
+    ply_rel = manifest.outputs.get(_EXPORT_PAYLOAD_KEY["splat"])
+    if not ply_rel or not (WAREHOUSE_DIR / ply_rel).is_file():
+        raise FileNotFoundError(f"{export_dir}: the exported PLY is missing")
+    ply = WAREHOUSE_DIR / ply_rel
+    out = training_cameras_path(ply)
+    if out.is_file() and not force:
+        record_training_cameras(export_dir)
+        return None
+
+    train_id = manifest.parent.run_id
+    train = load_manifest(run_dir("train", train_id) / "manifest.json")
+    config_rel = train.outputs.get("config_yml")
+    if not config_rel:
+        raise FileNotFoundError(f"train run {train_id} records no config.yml")
+    args = training_cameras_command(
+        config=host_to_container_warehouse(WAREHOUSE_DIR / config_rel),
+        ply=host_to_container_warehouse(ply),
+        out=host_to_container_warehouse(out),
+        lineage=training_cameras_lineage(manifest.run_id, train_id),
+    )
+    proc = subprocess.run(
+        ["docker", "exec", CONTAINER_NAME, "env", "CUDA_VISIBLE_DEVICES=",
+         "python3", "-c", script_source(), *args],
+        capture_output=True, text=True, timeout=TRAINING_CAMERAS_TIMEOUT_S,
+    )
+    lines = [ln for ln in (proc.stdout or "").splitlines() if ln.startswith((OK_SENTINEL, FAIL_SENTINEL))]
+    last = lines[-1] if lines else ""
+    if proc.returncode != 0 or not last.startswith(OK_SENTINEL):
+        reason = last[len(FAIL_SENTINEL):].strip() if last.startswith(FAIL_SENTINEL) else \
+            ((proc.stderr or proc.stdout or "").strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+        raise RuntimeError(reason)
+    summary = json.loads(last[len(OK_SENTINEL):].strip())
+    record_training_cameras(export_dir)
+    return out, summary
 
 
 # ---------------------------------------------------------------- render manifest
@@ -1551,6 +1686,38 @@ def _cli_stale_pending(_argv: list[str]) -> int:
     return 0
 
 
+def _cli_training_cameras(argv: list[str]) -> int:
+    """`python -m app.warehouse training-cameras <export_dir>... | --all [--force]`"""
+    force = "--force" in argv
+    dirs = [a for a in argv if a not in ("--force", "--all")]
+    if "--all" in argv:
+        root = WAREHOUSE_DIR / _STAGE_DIRS["export"] / "splat"
+        dirs += [str(d) for d in sorted(root.iterdir()) if (d / "manifest.json").is_file()] if root.is_dir() else []
+    if not dirs:
+        print("usage: python -m app.warehouse training-cameras <export_dir> [...] | --all [--force]")
+        return 2
+    rc = 0
+    for raw in dirs:
+        d = Path(raw).expanduser().resolve()
+        t0 = time.monotonic()
+        try:
+            result = generate_training_cameras(d, force=force)
+        except Exception as e:  # noqa: BLE001 — report and continue
+            print(f"FAILED   {d}: {e}")
+            rc = 1
+            continue
+        if result is None:
+            print(f"EXISTS   {d}  (use --force to rewrite)")
+            continue
+        out, s = result
+        print(
+            f"WROTE    {out}  ({time.monotonic() - t0:.1f} s)\n"
+            f"  cameras = {s.get('cameras')} ({s.get('train')} train, {s.get('eval')} held out), "
+            f"{s.get('bytes', 0) / 1e6:.1f} MB, intrinsics {s.get('intrinsics')}"
+        )
+    return rc
+
+
 def _cli_orphans(_argv: list[str]) -> int:
     """List manifests whose parent.run_id doesn't resolve."""
     from app.manifest_index import get_index
@@ -1574,6 +1741,7 @@ if __name__ == "__main__":
         "verify": _cli_verify,
         "stale-pending": _cli_stale_pending,
         "orphans": _cli_orphans,
+        "training-cameras": _cli_training_cameras,
     }
     if len(sys.argv) >= 2 and sys.argv[1] in cmds:
         sys.exit(cmds[sys.argv[1]](sys.argv[2:]))
@@ -1591,6 +1759,10 @@ if __name__ == "__main__":
         "  stale-pending\n"
         "      List train runs with pending.json but no manifest (>24h old).\n"
         "  orphans\n"
-        "      List manifests whose parent.run_id doesn't resolve."
+        "      List manifests whose parent.run_id doesn't resolve.\n"
+        "  training-cameras <export_dir> [...] | --all [--force]\n"
+        "      Write <stem>.cameras.json beside a splat export (the cameras it was\n"
+        "      trained from, for SuperSplat) and record it in the manifest. Runs\n"
+        "      inside splat-ns-v2; existing files are kept unless --force."
     )
     sys.exit(2)

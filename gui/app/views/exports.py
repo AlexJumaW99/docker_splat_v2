@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import docker_service as dock
+from app import training_cameras as tc
 from app import warehouse as wh
 from app.config import CONTAINER_NAME, WAREHOUSE_DIR
 from app.jobs import JobManager, JobSpec
@@ -60,7 +61,10 @@ _HELP = {
         "Export filename",
         "Name for the exported <code>.ply</code>. Lands at "
         "<code>data_v2/exports/splat/&lt;EXPORT_ULID&gt;/&lt;name&gt;.ply</code> "
-        "next to a <code>manifest.json</code> recording lineage to the train run. "
+        "next to a <code>manifest.json</code> recording lineage to the train run "
+        "and <code>&lt;name&gt;.cameras.json</code> — the cameras the splat was "
+        "trained from, with a small image of each, for SuperSplat to draw as "
+        "frustums (drop it in with the .ply). "
         "Each export gets its own ULID directory, so collisions can't happen — "
         "the name is purely for human readability."
     ),
@@ -349,6 +353,7 @@ class _Form(QWidget):
         self._pending_export_payload: str | None = None   # filename in the ULID dir
         self._pending_export_params: ExportParams | None = None
         self._pending_export_command: str | None = None
+        self._pending_export_cameras: str | None = None   # <stem>.cameras.json
         self._pending_render_ulid: str | None = None
         self._pending_render_dir: Path | None = None
         self._pending_render_payload: str | None = None
@@ -739,17 +744,32 @@ class _Form(QWidget):
                 f"--output-dir {shlex.quote(c_out_dir)}"
             )
 
+        # Then the training cameras for SuperSplat (`<stem>.cameras.json`,
+        # app/training_cameras.py): the script's text rides in as the shell's
+        # $1 (JobManager has no stdin) and runs with nerfstudio's own
+        # dataparser. Non-fatal — a failure leaves the PLY and its manifest
+        # intact, and the pill says the cameras are missing.
+        cameras_name = f"{stem}{wh.TRAINING_CAMERAS_SUFFIX}"
+        cameras_args = " ".join(shlex.quote(a) for a in wh.training_cameras_command(
+            config=c_config,
+            ply=f"{c_out_dir}/{payload_name}",
+            out=f"{c_out_dir}/{cameras_name}",
+            lineage=wh.training_cameras_lineage(export_ulid, run.train_run_id),
+        ))
+
         # `set -e` so the rename failure surfaces as a non-zero exit (don't
         # write a manifest claiming the .ply landed when it didn't).
         shell_cmd = (
             "set -e; "
             f"{exporter_cmd}; "
             f"mv {shlex.quote(c_out_dir)}/splat.ply "
-            f"{shlex.quote(c_out_dir)}/{shlex.quote(payload_name)}"
+            f"{shlex.quote(c_out_dir)}/{shlex.quote(payload_name)}; "
+            f'CUDA_VISIBLE_DEVICES= python3 -c "$1" {cameras_args} '
+            '|| echo "training cameras: skipped (non-fatal, see above)"'
         )
         display = (
             f"docker exec {CONTAINER_NAME} {exporter_cmd}   "
-            f"# → {out_dir}/{payload_name}"
+            f"# → {out_dir}/{payload_name}  (+ {cameras_name})"
         )
 
         # Derive source_checkpoint_step from the parent train run's nested
@@ -772,12 +792,15 @@ class _Form(QWidget):
             params=params,
             command=display,
         )
+        self._pending_export_cameras = cameras_name
 
         self._jobs.start(JobSpec(
             kind="export",
             display_cmd=display,
-            container_argv=["/bin/sh", "-c", shell_cmd],
-            kill_pattern="ns-export",
+            # $0 names the shell (and is what Cancel's pattern finds), $1 is
+            # the cameras script
+            container_argv=["/bin/sh", "-c", shell_cmd, "splat-training-cameras", tc.script_source()],
+            kill_pattern="ns-export|splat-training-cameras",
             log_path=out_dir / "job.log",
         ))
 
@@ -905,6 +928,7 @@ class _Form(QWidget):
     def _clear_pending(self) -> None:
         self._pending_run = None
         self._pending_export_ulid = None
+        self._pending_export_cameras = None
         self._pending_export_dir = None
         self._pending_export_payload = None
         self._pending_export_params = None
@@ -1031,11 +1055,20 @@ class _Form(QWidget):
             return
         if code == 0:
             if kind == "export":
+                cameras = (
+                    self._pending_export_dir / self._pending_export_cameras
+                    if self._pending_export_dir is not None and self._pending_export_cameras else None
+                )
                 payload = self._finalize_export()
-                if payload is not None:
-                    set_pill(self.status_pill, "Exported", "success")
-                else:
+                if payload is None:
                     set_pill(self.status_pill, "Exported · manifest skipped", "warning")
+                elif cameras is None or not cameras.is_file():
+                    # the PLY is fine; only the SuperSplat cameras are missing
+                    # (job.log says why; `python -m app.warehouse
+                    # training-cameras <dir>` retries)
+                    set_pill(self.status_pill, "Exported · no cameras", "warning")
+                else:
+                    set_pill(self.status_pill, "Exported", "success")
                 self._refresh_ply_target()
             else:  # render
                 payload = self._finalize_render()

@@ -774,6 +774,44 @@ PY
         fail "ns-export-splatfactow / cache check" "no splatfacto-w config.yml"
     fi
 
+    # Training cameras for SuperSplat (gui/app/training_cameras.py, run by the
+    # GUI's Export step): the file is written for both exports, holds all 8
+    # synthetic cameras with proper rotations, and every camera looks at the
+    # synthetic scene's centre (the COLMAP origin, mapped through the run's
+    # recorded dataparser transform) — i.e. the poses are in the PLY's frame.
+    cams_script="$script_dir/gui/app/training_cameras.py"
+    for pair in "std:$cfg_std" "w:$cfg_w"; do
+        tag=${pair%%:*}; cfg=${pair#*:}
+        [ -n "$cfg" ] || { fail "training cameras ($tag)" "no config.yml"; continue; }
+        out=$(dexec env CUDA_VISIBLE_DEVICES= python3 -c "$(cat "$cams_script")" --config "$cfg" \
+              --ply "$SYN/exp_$tag/splat.ply" --out "$SYN/exp_$tag/splat.cameras.json" 2>&1 | grep -E '^SPLAT_TRAINING_CAMERAS' | tail -1)
+        if ! echo "$out" | grep -q '^SPLAT_TRAINING_CAMERAS_OK'; then
+            fail "training cameras ($tag)" "$out"; continue
+        fi
+        chk=$(dexec_in python - "$SYN/exp_$tag/splat.cameras.json" "$(dirname "$cfg")/dataparser_transforms.json" <<'PY' 2>&1 | grep -E '^(CAMS_|Traceback|.*Error)' | tail -1
+import json, math, sys
+import numpy as np
+doc = json.load(open(sys.argv[1])); dpt = json.load(open(sys.argv[2]))
+assert doc["format"] == "splat-training-cameras" and doc["version"] == 1, "format"
+cams = doc["cameras"]
+assert len(cams) == 8, f"{len(cams)} cameras, expected 8"
+D = np.eye(4); D[:3, :4] = np.asarray(dpt["transform"], float)
+target = (D @ np.array([0.0, 0.0, 0.0, 1.0]))[:3] * float(dpt["scale"])
+worst = 0.0
+for c in cams:
+    m = np.asarray(c["c2w"], float); R, t = m[:, :3], m[:, 3]
+    assert abs(np.linalg.det(R) - 1) < 1e-4, "det(R)"
+    assert c["image"].startswith("data:image/jpeg;base64,") and c["fx"] > 0 and c["width"] > 0, "fields"
+    to = target - t
+    cosang = float(np.clip((-R[:, 2]) @ to / np.linalg.norm(to), -1, 1))
+    worst = max(worst, math.degrees(math.acos(cosang)))
+print("CAMS_OK" if worst < 1.0 else "CAMS_BAD", len(cams), f"worst={worst:.3f}deg", doc["intrinsics"])
+PY
+)
+        echo "$chk" | grep -q '^CAMS_OK' && pass "training cameras ($tag): $chk — ${out#SPLAT_TRAINING_CAMERAS_OK }" \
+            || fail "training cameras ($tag) aim at the scene centre" "$chk"
+    done
+
     dexec rm -rf "$SYN" > /dev/null 2>&1
 fi
 

@@ -76,6 +76,7 @@ Think of it as **the splat factory for one workstation** — build once, process
 &nbsp;&nbsp;🌸 `splatfacto-w` works on **ordinary COLMAP datasets**, not just phototourism — dataparser v2 + colour-cache patch, verified end to end\
 &nbsp;&nbsp;🌸 **Training resolution** chosen per run (Auto · Full · ½ · ¼ · ⅛), image-cache placement decided from the frame budget, and a 12 GiB first-eval VRAM spike removed at the source\
 &nbsp;&nbsp;🌸 **PLY export** for every method, including a custom exporter that bakes splatfacto-w's appearance MLP into standard spherical harmonics\
+&nbsp;&nbsp;🌸 **Training cameras for SuperSplat** — every export writes `<name>.cameras.json`: the exact (undistorted) cameras nerfstudio trained with, so SuperSplat draws them as frustums on the splat like viser does\
 &nbsp;&nbsp;🌸 **Camera-path video** rendering from viser keyframes
 
 </td>
@@ -282,7 +283,7 @@ All of the following were re-verified on 2026-10-05 / 06 against images `4bc9796
 
 | Check | Result |
 | :--- | :--- |
-| Image build + `smoke_test.sh` | ✅ **92 / 92** — GPU passthrough, sm_120 kernels, cuDNN, COLMAP flags + commit pin, gsplat JIT rasterization, every Stage-5 patch anchor, hloc imports, expandable allocator segments, cuDNN autotuning off, and §21: all five methods train 300 iterations on a synthetic dataset, both exporters write a PLY, the splatfacto-w cache check passes |
+| Image build + `smoke_test.sh` | ✅ **94 / 94** (2026-10-11) — GPU passthrough, sm_120 kernels, cuDNN, COLMAP flags + commit pin, gsplat JIT rasterization, every Stage-5 patch anchor, hloc imports, expandable allocator segments, cuDNN autotuning off, and §21: all five methods train 300 iterations on a synthetic dataset, both exporters write a PLY, the splatfacto-w cache check passes, and both exports get a training-cameras file whose 8 cameras all aim at the scene centre (worst 0.009°) |
 | Train-tab Tier 2 controls | ✅ GUI-generated commands ran end to end: `--downscale-factor 2` via `nerfstudio-data`, `colmap` and `splatfactow_dataparser`; `camera-res-scale-factor 0.5` on a dataset without `images_2`; auto CPU cache at native 4K; `antialiased`; *Add downscale levels* (16 frames → images_2/4/8 in 6 s). 1920 px run peak 11.15 → 2.42 GiB after v4.8 |
 | `ns-process-data` sequential / vocab_tree / exhaustive | ✅ 87 / 87 frames registered on an 87-frame set with both COLMAP builds — 4.2.1: 16 / 28 / 21 s, 4.1.0.dev0: 23 / 33 / 35 s, same day, models within 2 % in point count; on a 61-frame set vocab_tree matched the same 1 830 pairs as exhaustive with the faiss tree |
 | `ns-process-data --camera-type equirectangular` | ✅ 42-frame sample → 376 perspective crops; COLMAP 4.2.1 registered 376 / 376 in 282 s (4.1.0.dev0: 336 of 375 in 321 s) |
