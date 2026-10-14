@@ -1580,13 +1580,12 @@ class _Form(QWidget):
             # parent (data_v2/processed/) to be present.
             proc_run_id = wh.mint_ulid()
             target = wh.run_dir("process", proc_run_id)
-            # Pre-create the run dir as the host user. The container runs
-            # as root and writes files INTO this dir; those files will be
-            # root-owned, but the directory itself stays user-owned, so
-            # the host-side manifest write in _on_job_finished succeeds.
-            # Without this we'd hit EACCES on manifest.json.tmp because
-            # the container's mkdir would land first and create the dir
-            # root-owned (755).
+            # Pre-create the run dir as the host user. Before image v4.10
+            # the container ran as root, so its mkdir would land first and
+            # create the dir root-owned (755), and the host-side manifest
+            # write in _on_job_finished hit EACCES on manifest.json.tmp.
+            # Since v4.10 it runs as uid 1000 (the host user); this still
+            # guards a container started with `-u root`.
             target.mkdir(parents=True, exist_ok=True)
 
             try:

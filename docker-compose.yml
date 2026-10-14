@@ -94,16 +94,24 @@ services:
       - ./data_v2:/warehouse
 
       # --- Named volumes: runtime-generated caches ---------------
-      # None of these exist in the image; they're populated on first
-      # use and survive `docker compose down`. PyTorch's extension
-      # loader detects version mismatch on image rebuild and
-      # recompiles, so stale caches are self-healing — but if one
-      # ever gets genuinely corrupted, nuke it with:
+      # Populated on first use; they survive `docker compose down`.
+      # PyTorch's extension loader detects version mismatch on image
+      # rebuild and recompiles, so stale caches are self-healing — but
+      # if one ever gets genuinely corrupted, nuke it with:
       #   docker volume rm docker_splat_v2_torch-extensions
-      - torch-extensions:/root/.cache/torch_extensions   # gsplat sm_120 JIT kernels (~27 MB, several minutes to recompile)
-      - torch-hub:/root/.cache/torch                     # LPIPS / AlexNet weights (~234 MB, one-time network download)
-      - nv-compute:/root/.nv                             # NVIDIA PTX→cubin JIT cache (warm CUDA startup)
-      - triton:/root/.triton                             # Triton kernel cache
+      #
+      # v4.10: the image runs as uid 1000 (`ubuntu`, HOME=/home/ubuntu;
+      # see the Dockerfile's last section), so files written to ./data
+      # and ./data_v2 are owned by the host user. The caches therefore
+      # live under /home/ubuntu, not /root. The image ships these
+      # directories owned by 1000 and Docker copies that ownership into
+      # a fresh volume. Volumes created before v4.10 hold root-owned
+      # files; chown them once (as root) with:
+      #   docker run --rm -u 0 --entrypoint chown -v docker_splat_v2_<name>:/v splat-nerfstudio-v2 -R 1000:1000 /v
+      - torch-extensions:/home/ubuntu/.cache/torch_extensions   # gsplat sm_120 JIT kernels (~27 MB, several minutes to recompile)
+      - torch-hub:/home/ubuntu/.cache/torch                     # LPIPS / AlexNet / hloc + LightGlue weights (one-time network download)
+      - nv-compute:/home/ubuntu/.nv                             # NVIDIA PTX→cubin JIT cache (warm CUDA startup)
+      - triton:/home/ubuntu/.triton                             # Triton kernel cache
 
     # --- GPU access (the Compose-spec equivalent of --gpus all) --
     deploy:

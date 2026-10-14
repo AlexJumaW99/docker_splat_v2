@@ -268,7 +268,11 @@ def _host_to_container(path: Path) -> str | None:
 
 
 def _docker_rm(container_path: str) -> bool:
-    """``docker exec <container> rm -rf <path>`` — returns True on success."""
+    """``docker exec -u 0 <container> rm -rf <path>`` — returns True on success.
+
+    Pinned to root: since image v4.10 the container's default user is uid
+    1000, and this fallback exists to remove root-owned leftovers.
+    """
     import subprocess
     from app.config import CONTAINER_NAME
     docker = shutil.which("docker")
@@ -276,7 +280,7 @@ def _docker_rm(container_path: str) -> bool:
         return False
     try:
         r = subprocess.run(
-            [docker, "exec", CONTAINER_NAME, "rm", "-rf", container_path],
+            [docker, "exec", "-u", "0", CONTAINER_NAME, "rm", "-rf", container_path],
             capture_output=True, text=True, timeout=60.0,
         )
         return r.returncode == 0

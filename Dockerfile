@@ -375,6 +375,58 @@ RUN git -c advice.detachedHead=false clone \
     && pip install --no-cache-dir --no-deps -e /opt/hloc \
     && python -c "import hloc, pycolmap, lightglue, kornia; from hloc import extract_features, match_features, pairs_from_exhaustive, pairs_from_retrieval, reconstruction; import nerfstudio.process_data.hloc_utils; print('hloc', hloc.__version__, 'pycolmap', pycolmap.__version__, 'kornia', kornia.__version__)"
 
+# v4.10: run as the host user (uid/gid 1000) instead of root.
+#
+# Until v4.9 the image had no USER, so every `docker exec` (the GUI's jobs,
+# smoke_test.sh, interactive shells) ran as root and everything written into
+# the ./data and ./data_v2 bind mounts was root:root on the host, where the
+# host user could not delete it without sudo. Counted 2026-10-14: 2,311
+# root-owned items in data/ and 41,704 of 41,952 in data_v2/.
+#
+# uid 1000 already exists in the NGC 25.11 base (Ubuntu 24.04) as `ubuntu`
+# with home /home/ubuntu, and matches the host user. Docker sets HOME from
+# /etc/passwd, so every HOME-relative path moves from /root to /home/ubuntu:
+#   - torch extensions, torch hub, CUDA ComputeCache and Triton caches: the
+#     compose named volumes are remounted there. The directories are created
+#     here owned by 1000 because Docker copies a directory's ownership into a
+#     fresh, empty named volume (checked 2026-10-14), so a
+#     `docker compose down -v` still yields writable caches.
+#   - nerfstudio's get_vocab_tree() looks in appdirs.user_data_dir("nerfstudio")
+#     and DOWNLOADS the broken FLANN tree when the file is missing there, so
+#     the faiss tree placed above is copied to the new location (9.5 MB) and
+#     re-verified against the same SHA-256.
+#   - /root/.gitconfig (the git:// -> https rewrite) is copied for parity.
+# The GPU, the NGC entrypoint and /dev/shm work unchanged as uid 1000
+# (checked in a throwaway container). Python can no longer refresh stale
+# __pycache__ files under dist-packages/ and /opt/hloc at runtime (the sed
+# patches above leave several stale), so they are compiled here once.
+#
+# `docker compose exec -u root nerfstudio bash` still gives a root shell for
+# one-off package installs. Keep this section LAST: every RUN after USER runs
+# as uid 1000. Rollback: `splat-nerfstudio-v2:pre-v4.10`.
+RUN test "$(getent passwd 1000 | cut -d: -f1,6)" = "ubuntu:/home/ubuntu" \
+    && install -d -o 1000 -g 1000 -m 755 \
+        /home/ubuntu/.cache \
+        /home/ubuntu/.cache/torch_extensions \
+        /home/ubuntu/.cache/torch \
+        /home/ubuntu/.nv \
+        /home/ubuntu/.triton \
+        /home/ubuntu/.local \
+        /home/ubuntu/.local/share \
+        /home/ubuntu/.local/share/nerfstudio \
+    && install -o 1000 -g 1000 -m 644 \
+        /root/.local/share/nerfstudio/vocab_tree.fbow \
+        /home/ubuntu/.local/share/nerfstudio/vocab_tree.fbow \
+    && echo "${VOCAB_TREE_SHA256}  /home/ubuntu/.local/share/nerfstudio/vocab_tree.fbow" \
+        | sha256sum -c - \
+    && install -o 1000 -g 1000 -m 644 /root/.gitconfig /home/ubuntu/.gitconfig \
+    && python -m compileall -q \
+        /usr/local/lib/python3.12/dist-packages/nerfstudio \
+        /usr/local/lib/python3.12/dist-packages/splatfactow \
+        /opt/hloc/hloc \
+        /opt/hloc/third_party/SuperGluePretrainedNetwork/models
+
 WORKDIR /workspace
 EXPOSE 7007 6006
+USER 1000:1000
 CMD ["/bin/bash"]

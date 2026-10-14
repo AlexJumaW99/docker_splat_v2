@@ -204,14 +204,14 @@ docker rm splat-ns-v2
 # then re-run the `docker create` block above
 ```
 
-Bind-mounted data at `~/docker-stacks/docker_splat_v2/data` is unaffected — only the container's writable layer is destroyed. Note: this will invalidate the gsplat JIT kernel cache at `/root/.cache/torch_extensions/`, so the first training in the new container will pause 60-120 seconds to recompile kernels.
+Bind-mounted data at `~/docker-stacks/docker_splat_v2/data` is unaffected — only the container's writable layer is destroyed. Note: this will invalidate the gsplat JIT kernel cache at `/home/ubuntu/.cache/torch_extensions/`, so the first training in the new container will pause 60-120 seconds to recompile kernels. (`docker compose` keeps it in a named volume, so `docker compose down` / `up` does not.)
 
-### File ownership housekeeping
+### File ownership
 
-The container runs as root, so files it writes to `/workspace/` will be root-owned on the host. Every so often:
+Since image v4.10 the container runs as uid 1000 (the host user), so files it writes to `/workspace/` and `/warehouse/` are owned by you on the host. Files written by older images are `root:root`; give them back once, without sudo, through the container's root:
 
 ```bash
-sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data
+docker exec -u 0 splat-ns-v2 find /workspace /warehouse -user root -exec chown 1000:1000 {} +
 ```
 
 ---
@@ -561,7 +561,7 @@ Times scale with frame count, training resolution and gaussian count: training t
 
 On the **first** ns-train invocation inside a container, gsplat JIT-compiles its CUDA kernels for sm_120. This takes 60–120 seconds during which the terminal looks stuck. Do not Ctrl+C.
 
-Subsequent runs are instant — the compiled kernels cache at `/root/.cache/torch_extensions/` and persist across `docker stop`/`docker start`, but are lost if you `docker rm` and recreate the container.
+Subsequent runs are instant — the compiled kernels cache at `/home/ubuntu/.cache/torch_extensions/` and persist across `docker stop`/`docker start`. With `docker compose` they live in the `torch-extensions` named volume and also survive recreating the container; with the bare `docker create` flow they are lost on `docker rm`.
 
 ### What healthy training output looks like
 
@@ -879,13 +879,9 @@ Key flag: `--appearance-mode` controls which appearance embedding is baked in.
 
 Output: `splat.ply` in the specified directory; same 62-property layout (`x y z · nx ny nz · f_dc_{0..2} · f_rest_{0..44} · opacity · scale_{0..2} · rot_{0..3}`) as `ns-export gaussian-splat`, so downstream 3DGS viewers (SuperSplat, Blender 3DGS Render, etc.) open it identically.
 
-### Fixing host-side ownership
+### Host-side ownership
 
-The PLY will be written as root inside the container. To open it on the host:
-
-```bash
-sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data/outputs
-```
+Since image v4.10 the PLY is written as uid 1000, so it is yours on the host as-is. Exports from older images are root-owned; see [File ownership](#file-ownership).
 
 ### Recommended post-training editor: SuperSplat
 
@@ -1089,8 +1085,8 @@ docker rm splat-ns-v2
 # Verify port mappings
 docker port splat-ns-v2
 
-# Fix host ownership
-sudo chown -R $USER:$USER ~/docker-stacks/docker_splat_v2/data
+# Give root-owned files from pre-v4.10 images back to the host user (no sudo)
+docker exec -u 0 splat-ns-v2 find /workspace /warehouse -user root -exec chown 1000:1000 {} +
 ```
 
 ### Container-side (inside `docker exec -it splat-ns-v2 bash`)

@@ -304,7 +304,7 @@ All of the following were re-verified on 2026-10-05 / 06 against images `4bc9796
 > [!WARNING]
 > **16 GB of VRAM is the assumption.** Training at native 4K can OOM on a 5070 Ti: `splatfacto-big` on 266 4K frames peaked at 11.6 GiB by step 6 500 with the default GPU image cache. The Train tab's **Training resolution** and **Image cache** controls are the levers (numbers in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) §2). Since v4.8 the image also disables cuDNN autotuning in `ns-train`, which removed a 12.4 GiB first-eval spike at 1920 px at no speed cost, and `docker-compose.yml` sets both allocator variables because `PYTORCH_ALLOC_CONF` alone does **not** enable expandable segments in the NGC 25.11 torch build.
 
-- **Container runs as root.** Files written under `data/outputs/` and inside `data_v2/trained/<ULID>/` are `root:root` on the host; `sudo chown -R $USER:$USER` them when needed.
+- **Container runs as uid 1000.** Since v4.10 the image's `USER` is `1000:1000` (`ubuntu` in the base image, the host user here), so everything written into `data/` and `data_v2/` is owned by the host user. A host whose user is not uid 1000 needs that line and the `/home/ubuntu` cache directories in the Dockerfile changed. `docker compose exec -u root nerfstudio bash` gives a root shell for one-off installs.
 - **`ns-download-data` is broken upstream** (Google Drive rate limits, [nerfstudio#3134](https://github.com/nerfstudio-project/nerfstudio/issues/3134)). Use your own footage.
 - **Not verified here:** fisheye captures end to end (no fisheye footage on this machine), the original phototourism layout with the v2 dataparser, and the compatibility of `antialiased`-mode PLYs with external viewers.
 

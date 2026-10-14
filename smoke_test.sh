@@ -3,7 +3,8 @@
 # Verifies every feature built by the Dockerfile: GPU passthrough, PyTorch +
 # sm_120, cuDNN, COLMAP (with 4.1 flag rename), ffmpeg, gsplat rasterizer,
 # nerfstudio CLI, the colmap_utils.py patch, TensorBoard/viser stack,
-# the splatfacto-w external method, workspace bind mount, and env vars.
+# the splatfacto-w external method, workspace bind mount, env vars, and the
+# uid-1000 runtime user (host-side ownership of container-written files).
 #
 # Usage:
 #   ./smoke_test.sh                                   # all tests
@@ -25,7 +26,7 @@ for arg in "$@"; do
     case "$arg" in
         --skip-jit) SKIP_JIT=1 ;;
         --skip-train) SKIP_TRAIN=1 ;;
-        -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,16p' "$0"; exit 0 ;;
     esac
 done
 
@@ -475,7 +476,9 @@ else
     [ "${ref_total:-0}" -ge 3 ] && { pass "gl_z_buf_depth still referenced ($ref_total refs; depth compositing intact)"; info "expected >= 3: 2 writers + 1 reader + our 2 filter mentions"; } \
                                 || fail "gl_z_buf_depth referenced" "only $ref_total ref(s); depth compositing may be broken"
 
-    py_ok=$(dexec python -c "import py_compile; py_compile.compile('$rsm', doraise=True); print('OK')" 2>&1)
+    # cfile= in /tmp: since v4.10 the exec user (uid 1000) cannot write
+    # __pycache__ under dist-packages, and the check only needs the compile.
+    py_ok=$(dexec python -c "import os, py_compile; c='/tmp/smoke_rsm_$$.pyc'; py_compile.compile('$rsm', cfile=c, doraise=True); os.remove(c); print('OK')" 2>&1)
     [ "$py_ok" = "OK" ] && pass "render_state_machine.py py_compile clean" || fail "render_state_machine.py py_compile" "$py_ok"
 fi
 
@@ -524,7 +527,13 @@ c_radii=$(dexec grep -c -F 'info["radii"][0].amax(dim=-1)'                      
 [ "${c_old:-0}"   = "0" ] && pass "unpatched 'self.cached_colors = colors' absent"     || fail "unpatched cache line removed" "$c_old ref(s) remain"
 [ "${c_radii:-0}" = "1" ] && pass "v4.4b radii fix still present"                     || fail "radii fix present" "got $c_radii"
 
-py_ok=$(dexec python -c "import py_compile; py_compile.compile('$sfw/splatfactow_model.py', doraise=True); py_compile.compile('$sfw/nerfw_dataparser.py', doraise=True); print('OK')" 2>&1 | tail -1)
+py_ok=$(dexec python -c "
+import os, py_compile
+for f in ('splatfactow_model.py', 'nerfw_dataparser.py'):
+    c = '/tmp/smoke_sfw_$$_' + f + 'c'
+    py_compile.compile('$sfw/' + f, cfile=c, doraise=True)
+    os.remove(c)
+print('OK')" 2>&1 | tail -1)
 [ "$py_ok" = "OK" ] && pass "splatfactow patched files py_compile clean" || fail "splatfactow py_compile" "$py_ok"
 
 # Functional probe: real size must survive (3840x2160 with cx=1919.5 would have
@@ -813,6 +822,82 @@ PY
     done
 
     dexec rm -rf "$SYN" > /dev/null 2>&1
+fi
+
+# ============================================================================
+# 22. Runtime user (v4.10)
+#
+# Up to v4.9 the container ran as root, so everything written into the ./data
+# and ./data_v2 bind mounts was root:root on the host and could not be deleted
+# without sudo. The image now runs as uid/gid 1000. Checks: the default exec
+# user and HOME; that a directory + file created by the container in each bind
+# mount is owned by, and deletable by, the host user; that the HOME-relative
+# caches are writable and hold nothing root-owned (pre-v4.10 volumes need the
+# one-time chown in docker-compose.yml); and that nerfstudio resolves the
+# faiss vocab tree in the new HOME rather than downloading the FLANN one.
+# ============================================================================
+section "22. Runtime user (v4.10)"
+
+who=$(dexec sh -c 'echo "$(id -u):$(id -g) $HOME"')
+[ "$who" = "1000:1000 /home/ubuntu" ] && pass "docker exec runs as 1000:1000, HOME=/home/ubuntu" \
+    || fail "default exec user is 1000:1000 with HOME=/home/ubuntu" "got '$who'"
+
+host_uid=$(id -u)
+for dest in /workspace /warehouse; do
+    src=$(docker inspect "$CONTAINER" --format "{{range .Mounts}}{{if eq .Destination \"$dest\"}}{{.Source}}{{end}}{{end}}")
+    if [ -z "$src" ]; then
+        warn "$dest ownership" "no bind mount for $dest"
+        continue
+    fi
+    tok=".smoke_owner_$(date +%s)_$$"
+    dexec sh -c "mkdir '$dest/$tok' && touch '$dest/$tok/f'" > /dev/null
+    owner=$(stat -c '%u:%g' "$src/$tok" "$src/$tok/f" 2>/dev/null | sort -u | tr '\n' ' ')
+    if rm -r "$src/$tok" 2>/dev/null; then
+        deleted=yes
+    else
+        deleted=no
+        docker exec -u 0 "$CONTAINER" rm -rf "$dest/$tok" > /dev/null 2>&1
+    fi
+    [ "$owner" = "$host_uid:$(id -g) " ] && pass "$dest: container-created files are owned by the host user ($host_uid:$(id -g))" \
+        || fail "$dest: container-created file ownership" "host sees '${owner:-?}', expected $host_uid:$(id -g)"
+    [ "$deleted" = "yes" ] && pass "$dest: host user can delete them without sudo" \
+        || fail "$dest: host user can delete container-created files" "rm -r $src/$tok failed"
+done
+
+cache_out=$(dexec sh -c '
+for d in "$HOME/.cache/torch_extensions" "$HOME/.cache/torch" "$HOME/.nv" "$HOME/.triton"; do
+    [ -w "$d" ] && w=writable || w=NOT-writable
+    n=$(find "$d" ! -uid 1000 2>/dev/null | wc -l)
+    echo "$d $w foreign=$n"
+done')
+while read -r d w n; do
+    [ -z "$d" ] && continue
+    if [ "$w" = "writable" ] && [ "$n" = "foreign=0" ]; then
+        pass "cache $d writable, nothing root-owned"
+    else
+        fail "cache $d writable with no root-owned files" "$w, $n — see the chown line in docker-compose.yml"
+    fi
+done <<< "$cache_out"
+
+vt_sha=$(sed -n 's/^ARG VOCAB_TREE_SHA256=//p' "$(dirname "$0")/Dockerfile" 2>/dev/null)
+out=$(dexec python -c "
+import appdirs, hashlib, pathlib
+p = pathlib.Path(appdirs.user_data_dir('nerfstudio')) / 'vocab_tree.fbow'
+if not p.is_file():
+    print('MISSING', p)
+else:
+    from nerfstudio.process_data.colmap_utils import get_vocab_tree
+    print('OK' if get_vocab_tree() == p else 'WRONG_PATH', p, hashlib.sha256(p.read_bytes()).hexdigest())
+" | tail -1)
+read -r vt_status vt_path vt_actual <<< "$out"
+if [ "$vt_status" != "OK" ]; then
+    fail "vocab tree present where get_vocab_tree() looks" "$out"
+elif [ -z "$vt_sha" ]; then
+    warn "vocab tree SHA-256" "could not read ARG VOCAB_TREE_SHA256 from $(dirname "$0")/Dockerfile"
+elif [ "$vt_actual" = "$vt_sha" ]; then
+    pass "get_vocab_tree() -> $vt_path (faiss tree, SHA-256 matches the Dockerfile)"
+else
+    fail "vocab tree SHA-256" "got $vt_actual, expected $vt_sha"
 fi
 
 # ============================================================================
